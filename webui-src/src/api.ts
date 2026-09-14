@@ -123,6 +123,15 @@ export interface PingInfo {
   data_dir: string;
   db_path: string;
   server_time: number;
+  /** 好友/群同步状态 */
+  sync?: { last_at: number; running: boolean; ok: boolean; error: string };
+  /** 内存中已加载的规则数量（确认改动是否真的生效） */
+  rules?: {
+    effect_users: number;
+    effect_groups: number;
+    quota_users: number;
+    quota_groups: number;
+  };
 }
 
 export interface SummaryTotals {
@@ -161,6 +170,7 @@ export interface FriendRow {
   quota_limit: number | null;
   quota_used: number | null;
   quota_mode: "enforce" | "observe" | null;
+  today_tokens: number;
   updated_at: number;
 }
 
@@ -175,6 +185,7 @@ export interface GroupRow {
   quota_limit: number | null;
   quota_used: number | null;
   quota_mode: "enforce" | "observe" | null;
+  today_tokens: number;
   updated_at: number;
 }
 
@@ -183,6 +194,7 @@ export interface Paged<T> {
   rows: T[];
   page: number;
   size: number;
+  sort?: string;
 }
 
 export interface QuotaRow {
@@ -194,6 +206,57 @@ export interface QuotaRow {
   mode: "enforce" | "observe";
   reset_at: number | null;
   updated_at: number;
+}
+
+export interface SubjectTotals {
+  events: number;
+  calls: number;
+  denied: number;
+  tok_in_other: number;
+  tok_in_cached: number;
+  tok_out: number;
+  tok_total: number;
+  estimated: number;
+  avg_latency: number;
+}
+
+export interface SubjectDayPoint {
+  day: string;
+  tokens: number;
+  calls: number;
+  denied: number;
+}
+
+export interface SubjectDetail {
+  type: "user" | "group";
+  id: string;
+  info: FriendRow | GroupRow | null;
+  effect: "allow" | "deny" | "inherit";
+  quotas: QuotaRow[];
+  days: number;
+  stats: {
+    totals: SubjectTotals;
+    series: SubjectDayPoint[];
+    by_model: { model: string; tokens: number }[];
+  };
+  today: SubjectTotals;
+  recent: Record<string, any>[];
+}
+
+/** 单个对象（好友/群）的详情：基础信息 + 权限 + 额度 + 区间用量与曲线。 */
+export function apiSubject(type: "user" | "group", id: string, days = 7) {
+  return apiGet<SubjectDetail>(`/subject?type=${type}&id=${encodeURIComponent(id)}&days=${days}`);
+}
+
+/** 手动同步好友 / 群列表（协议端往返，给足超时）。 */
+export function apiSync() {
+  return apiPost<{
+    ok: boolean;
+    total_friends: number;
+    total_groups: number;
+    platforms: { platform_id: string; ok: boolean; friends: number; groups: number; error?: string }[];
+    error?: string;
+  }>("/sync", {}, 60000);
 }
 
 export interface ConfigPayload {

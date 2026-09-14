@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -133,8 +134,8 @@ def _quota_index(rows: list[dict]) -> dict[str, dict]:
     return out
 
 
-def _fmt_group(row: dict, policy: dict[str, str], quota: dict[str, dict]) -> dict:
-    """把群缓存行补上权限状态与额度，供前端表格直接渲染。"""
+def _fmt_group(row: dict, policy: dict[str, str], quota: dict[str, dict], usage: dict[str, int]) -> dict:
+    """把群缓存行补上权限状态、额度与今日用量，供前端表格直接渲染。"""
     gid = str(row.get("group_id") or "")
     q = quota.get(gid) or {}
     return {
@@ -143,11 +144,12 @@ def _fmt_group(row: dict, policy: dict[str, str], quota: dict[str, dict]) -> dic
         "quota_limit": q.get("limit_tokens"),
         "quota_used": q.get("used_tokens"),
         "quota_mode": q.get("mode"),
+        "today_tokens": int(usage.get(gid, 0)),
     }
 
 
-def _fmt_friend(row: dict, policy: dict[str, str], quota: dict[str, dict]) -> dict:
-    """把好友缓存行补上权限状态与额度。"""
+def _fmt_friend(row: dict, policy: dict[str, str], quota: dict[str, dict], usage: dict[str, int]) -> dict:
+    """把好友缓存行补上权限状态、额度与今日用量。"""
     uin = str(row.get("uin") or "")
     q = quota.get(uin) or {}
     return {
@@ -158,7 +160,15 @@ def _fmt_friend(row: dict, policy: dict[str, str], quota: dict[str, dict]) -> di
         "quota_limit": q.get("limit_tokens"),
         "quota_used": q.get("used_tokens"),
         "quota_mode": q.get("mode"),
+        "today_tokens": int(usage.get(uin, 0)),
     }
+
+
+def _today_bounds() -> tuple[int, int]:
+    """今日（本地 0 点 → 现在）的时间戳区间。"""
+    now = datetime.now()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp()), int(now.timestamp())
 
 
 # ---------------------------------------------------------------------- #
@@ -174,6 +184,20 @@ async def h_ping(plugin) -> dict:
             "data_dir": str(getattr(plugin, "data_dir", "")),
             "db_path": str(getattr(plugin, "store", None).db_path) if plugin.store else "",
             "server_time": int(time.time()),
+            # 同步状态（控制台顶部据此提示「尚未同步 / 同步失败」）
+            "sync": {
+                "last_at": int(getattr(plugin.scheduler, "last_at", 0) or 0),
+                "running": bool(getattr(plugin.scheduler, "running", False)),
+                "ok": bool((getattr(plugin.scheduler, "last_result", {}) or {}).get("ok")),
+                "error": str((getattr(plugin.scheduler, "last_result", {}) or {}).get("error") or ""),
+            },
+            # 内存里已加载的规则数量（便于确认改动是否真的生效）
+            "rules": {
+                "effect_users": len(getattr(plugin, "_effect_user", {}) or {}),
+                "effect_groups": len(getattr(plugin, "_effect_group", {}) or {}),
+                "quota_users": len(getattr(plugin, "_quota_user", {}) or {}),
+                "quota_groups": len(getattr(plugin, "_quota_group", {}) or {}),
+            },
         },
     )
 
@@ -250,39 +274,165 @@ async def h_overview(plugin) -> dict:
 
 
 async def h_friends(plugin) -> dict:
-    """好友列表（含权限状态与额度）。"""
+    """好友列表（含权限状态、额度与今日用量）。
+
+    排序支持：``active``（默认，按同步时间）/ ``usage``（今日 token 降序）/
+    ``name``（昵称升序）/ ``qq``（QQ 号升序）。除 ``active`` 外都需要**先取全量再排序分页**，
+    好友量级通常只有数百，整表取回是可接受的（上限 5000 条防爆）。
+    """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
-    res = await plugin.store.list_friends(
-        platform_id=_q("platform") or None,
-        keyword=_q("q"),
-        limit=_qi("size", 50, 1, 500),
-        offset=_qi("page", 1, 1, 10**6) - 1,
-    )
+    sort = _q("sort", "active") or "active"
+    page = _qi("page", 1, 1, 10**6)
+    size = _qi("size", 50, 1, 500)
+    platform = _q("platform") or None
+    kw = _q("q")
+
+    if sort in ("usage", "name", "qq"):
+        res = await plugin.store.list_friends(platform_id=platform, keyword=kw, limit=5000, offset=0)
+    else:
+        res = await plugin.store.list_friends(
+            platform_id=platform, keyword=kw, limit=size, offset=(page - 1) * size
+        )
+
+    from_ts, to_ts = _today_bounds()
+    try:
+        usage = await plugin.store.usage_sums("sender_id", from_ts, to_ts)
+    except Exception as e:
+        logger.warning(f"[UserGateway] 聚合今日用量失败（忽略）: {e}")
+        usage = {}
+
     policy = await plugin.store.effect_map("user")
     quotas = _quota_index(await plugin.store.list_quotas("user"))
-    res["rows"] = [_fmt_friend(r, policy, quotas) for r in res["rows"]]
-    res["page"] = _qi("page", 1, 1, 10**6)
-    res["size"] = _qi("size", 50, 1, 500)
-    return ok(res)
+    rows = [_fmt_friend(r, policy, quotas, usage) for r in res["rows"]]
+
+    total = res["total"]
+    if sort == "usage":
+        rows.sort(key=lambda r: int(r.get("today_tokens") or 0), reverse=True)
+    elif sort == "name":
+        rows.sort(key=lambda r: str(r.get("display_name") or ""))
+    elif sort == "qq":
+        rows.sort(key=lambda r: str(r.get("uin") or ""))
+    if sort in ("usage", "name", "qq"):
+        total = len(rows)
+        rows = rows[(page - 1) * size : page * size]
+
+    return ok({"total": total, "rows": rows, "page": page, "size": size, "sort": sort})
 
 
 async def h_groups(plugin) -> dict:
-    """群列表（含权限状态与额度）。"""
+    """群列表（含权限状态、额度与今日用量）。排序语义同好友列表。"""
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
-    res = await plugin.store.list_groups(
-        platform_id=_q("platform") or None,
-        keyword=_q("q"),
-        limit=_qi("size", 50, 1, 500),
-        offset=_qi("page", 1, 1, 10**6) - 1,
-    )
+    sort = _q("sort", "active") or "active"
+    page = _qi("page", 1, 1, 10**6)
+    size = _qi("size", 50, 1, 500)
+    platform = _q("platform") or None
+    kw = _q("q")
+
+    if sort in ("usage", "name", "group", "size"):
+        res = await plugin.store.list_groups(platform_id=platform, keyword=kw, limit=5000, offset=0)
+    else:
+        res = await plugin.store.list_groups(
+            platform_id=platform, keyword=kw, limit=size, offset=(page - 1) * size
+        )
+
+    from_ts, to_ts = _today_bounds()
+    try:
+        usage = await plugin.store.usage_sums("group_id", from_ts, to_ts)
+    except Exception as e:
+        logger.warning(f"[UserGateway] 聚合今日用量失败（忽略）: {e}")
+        usage = {}
+
     policy = await plugin.store.effect_map("group")
     quotas = _quota_index(await plugin.store.list_quotas("group"))
-    res["rows"] = [_fmt_group(r, policy, quotas) for r in res["rows"]]
-    res["page"] = _qi("page", 1, 1, 10**6)
-    res["size"] = _qi("size", 50, 1, 500)
+    rows = [_fmt_group(r, policy, quotas, usage) for r in res["rows"]]
+
+    total = res["total"]
+    if sort == "usage":
+        rows.sort(key=lambda r: int(r.get("today_tokens") or 0), reverse=True)
+    elif sort == "name":
+        rows.sort(key=lambda r: str(r.get("name") or ""))
+    elif sort == "group":
+        rows.sort(key=lambda r: str(r.get("group_id") or ""))
+    elif sort == "size":
+        rows.sort(key=lambda r: int(r.get("member_count") or 0), reverse=True)
+    if sort in ("usage", "name", "group", "size"):
+        total = len(rows)
+        rows = rows[(page - 1) * size : page * size]
+
+    return ok({"total": total, "rows": rows, "page": page, "size": size, "sort": sort})
+
+
+async def h_sync(plugin) -> dict:
+    """手动同步好友与群列表（与定时同步共用同一条路径，内部有互斥锁）。"""
+    try:
+        res = await plugin.scheduler.sync_once()
+    except Exception as e:
+        logger.exception("[UserGateway] 手动同步异常")
+        return err(f"同步失败: {e}")
+    if not res.get("ok"):
+        return err(str(res.get("error") or "同步失败"))
     return ok(res)
+
+
+async def h_subject(plugin) -> dict:
+    """单个对象（好友 / 群）的详情：基础信息 + 权限 + 额度 + 区间用量与曲线。
+
+    ``type=user`` 按 sender_id 聚合（含该用户在任意群里的用量）；
+    ``type=group`` 按 group_id 聚合。
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    subject_type = _q("type", "user") or "user"
+    subject_id = _q("id")
+    if subject_type not in ("user", "group"):
+        return err("type 必须是 user 或 group")
+    if not subject_id:
+        return err("缺少 id")
+
+    days = _qi("days", 7, 1, 90)
+    now = int(time.time())
+    from_ts, to_ts = now - days * 86400, now
+
+    info: dict | None = None
+    try:
+        info = (
+            await plugin.store.get_group(subject_id)
+            if subject_type == "group"
+            else await plugin.store.get_friend(subject_id)
+        )
+    except Exception as e:
+        logger.warning(f"[UserGateway] 读取对象缓存失败（忽略）: {e}")
+
+    effect = await plugin.store.get_effect(subject_type, subject_id)
+    quotas = await plugin.store.list_quotas_of(subject_type, subject_id)
+    stats = await plugin.store.subject_stats(subject_type, subject_id, from_ts, to_ts)
+
+    from_ts_today, to_ts_today = _today_bounds()
+    today = await plugin.store.subject_stats(subject_type, subject_id, from_ts_today, to_ts_today)
+
+    recent = await plugin.store.query_usage(
+        from_ts=from_ts,
+        to_ts=to_ts,
+        sender_id=subject_id if subject_type == "user" else None,
+        limit=50,
+        offset=0,
+    )
+
+    return ok(
+        {
+            "type": subject_type,
+            "id": subject_id,
+            "info": info,
+            "effect": effect or "inherit",
+            "quotas": quotas,
+            "days": days,
+            "stats": stats,
+            "today": today.get("totals", {}),
+            "recent": recent.get("rows", []),
+        },
+    )
 
 
 async def h_get_policy(plugin) -> dict:
@@ -465,6 +615,8 @@ def register_apis(plugin) -> None:
         ("/overview", h_overview, ["GET"]),
         ("/friends", h_friends, ["GET"]),
         ("/groups", h_groups, ["GET"]),
+        ("/sync", h_sync, ["POST"]),
+        ("/subject", h_subject, ["GET"]),
         ("/policy", h_get_policy, ["GET"]),
         ("/policy", h_set_policy, ["POST"]),
         ("/quota", h_get_quota, ["GET"]),

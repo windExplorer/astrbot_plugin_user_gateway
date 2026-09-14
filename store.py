@@ -323,16 +323,27 @@ class Store:
             )
         await db.commit()
 
-    async def add_used(self, scope_type: str, scope_id: str, period: str, tokens: int) -> None:
-        """累加已用量（只更新已存在的额度行，未配置额度则忽略）。"""
+    async def add_used(
+        self,
+        scope_type: str,
+        scope_id: str,
+        tokens: int,
+        period: Optional[str] = None,
+    ) -> None:
+        """累加已用量（只更新已存在的额度行，未配置额度则忽略）。
+
+        ``period=None`` 时对该对象的**所有周期**一起累加（一条 SQL 搞定，
+        避免每次 LLM 调用按周期发多条 UPDATE）。
+        """
         if tokens <= 0:
             return
+        sql = "UPDATE llm_quota SET used_tokens = used_tokens + ?, updated_at = ? WHERE scope_type = ? AND scope_id = ?"
+        args: list[Any] = [int(tokens), now_ts(), scope_type, str(scope_id)]
+        if period:
+            sql += " AND period = ?"
+            args.append(period)
         db = self._conn()
-        await db.execute(
-            "UPDATE llm_quota SET used_tokens = used_tokens + ?, updated_at = ? "
-            "WHERE scope_type = ? AND scope_id = ? AND period = ?",
-            (int(tokens), now_ts(), scope_type, str(scope_id), period),
-        )
+        await db.execute(sql, args)
         await db.commit()
 
     async def reset_used(
@@ -522,6 +533,106 @@ class Store:
             "deny_reasons": deny_reasons,
         }
 
+    async def usage_sums(self, column: str, from_ts: int, to_ts: int) -> dict[str, int]:
+        """按某个维度列聚合区间内的 token 总量，返回 ``{值: tokens}``。
+
+        ``column`` 只允许白名单内的固定列名（防注入）：``sender_id`` / ``group_id`` / ``scope_id``。
+        用于列表页「今日用量」排序与展示。
+        """
+        if column not in ("sender_id", "group_id", "scope_id"):
+            raise ValueError(f"不支持的聚合列: {column}")
+        async with self._conn().execute(
+            f"""SELECT {column} AS k,
+                       COALESCE(SUM(tok_in_other + tok_in_cached + tok_out), 0) AS tokens
+                FROM usage_log
+                WHERE ts >= ? AND ts <= ? AND {column} <> ''
+                GROUP BY {column}""",
+            (int(from_ts), int(to_ts)),
+        ) as cur:
+            return {str(r["k"]): int(r["tokens"] or 0) for r in await cur.fetchall()}
+
+    async def subject_stats(self, subject_type: str, subject_id: str, from_ts: int, to_ts: int) -> dict[str, Any]:
+        """单个对象（人 / 群）在区间内的用量总览与按天曲线。
+
+        - ``user``：按 ``sender_id`` 聚合（这样该用户在**任意群**里的用量都能算进来）
+        - ``group``：按 ``group_id`` 聚合
+        """
+        col = "group_id" if subject_type == "group" else "sender_id"
+        where = f"WHERE {col} = ? AND ts >= ? AND ts <= ?"
+        args = [str(subject_id), int(from_ts), int(to_ts)]
+        db = self._conn()
+
+        async with db.execute(
+            f"""SELECT COUNT(*) AS events,
+                       SUM(CASE WHEN kind = 'llm' THEN 1 ELSE 0 END) AS calls,
+                       SUM(CASE WHEN status = 'denied' THEN 1 ELSE 0 END) AS denied,
+                       COALESCE(SUM(tok_in_other), 0)  AS tok_in_other,
+                       COALESCE(SUM(tok_in_cached), 0) AS tok_in_cached,
+                       COALESCE(SUM(tok_out), 0)       AS tok_out,
+                       SUM(estimated)                  AS estimated,
+                       COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END), 0) AS avg_latency
+                FROM usage_log {where}""",
+            args,
+        ) as cur:
+            totals = dict(await cur.fetchone() or {})
+        totals["tok_total"] = (
+            int(totals.get("tok_in_other") or 0)
+            + int(totals.get("tok_in_cached") or 0)
+            + int(totals.get("tok_out") or 0)
+        )
+
+        async with db.execute(
+            f"""SELECT strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime') AS day,
+                       COALESCE(SUM(tok_in_other + tok_in_cached + tok_out), 0) AS tokens,
+                       SUM(CASE WHEN kind = 'llm' THEN 1 ELSE 0 END) AS calls,
+                       SUM(CASE WHEN status = 'denied' THEN 1 ELSE 0 END) AS denied
+                FROM usage_log {where}
+                GROUP BY day ORDER BY day""",
+            args,
+        ) as cur:
+            series = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            f"""SELECT COALESCE(NULLIF(model, ''), '(未知)') AS model,
+                       COALESCE(SUM(tok_in_other + tok_in_cached + tok_out), 0) AS tokens
+                FROM usage_log {where} AND kind = 'llm'
+                GROUP BY model ORDER BY tokens DESC LIMIT 10""",
+            args,
+        ) as cur:
+            by_model = [dict(r) for r in await cur.fetchall()]
+
+        return {"totals": totals, "series": series, "by_model": by_model}
+
+    async def get_friend(self, uin: str, platform_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+        """取单个好友缓存行。"""
+        sql = "SELECT * FROM friend_cache WHERE uin = ?"
+        args: list[Any] = [str(uin)]
+        if platform_id:
+            sql += " AND platform_id = ?"
+            args.append(platform_id)
+        async with self._conn().execute(sql + " LIMIT 1", args) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_group(self, group_id: str, platform_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+        """取单个群缓存行。"""
+        sql = "SELECT * FROM group_cache WHERE group_id = ?"
+        args: list[Any] = [str(group_id)]
+        if platform_id:
+            sql += " AND platform_id = ?"
+            args.append(platform_id)
+        async with self._conn().execute(sql + " LIMIT 1", args) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_quotas_of(self, scope_type: str, scope_id: str) -> list[dict[str, Any]]:
+        """取某个对象的所有周期额度。"""
+        async with self._conn().execute(
+            "SELECT * FROM llm_quota WHERE scope_type = ? AND scope_id = ? ORDER BY period",
+            (scope_type, str(scope_id)),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
     async def purge_old_usage(self, retention_days: int) -> int:
         """清理超期明细；``retention_days<=0`` 表示永久保留。返回删除行数。"""
         if retention_days <= 0:
@@ -627,7 +738,7 @@ class Store:
             row = await cur.fetchone()
             total = int(row["c"]) if row else 0
         async with db.execute(
-            f"SELECT * FROM group_cache{where} ORDER BY member_count DESC, group_id LIMIT ? OFFSET ?",
+            f"SELECT * FROM group_cache{where} ORDER BY updated_at DESC, group_id LIMIT ? OFFSET ?",
             [*args, int(limit), int(offset)],
         ) as cur:
             rows = [dict(r) for r in await cur.fetchall()]

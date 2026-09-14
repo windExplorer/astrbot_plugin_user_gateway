@@ -10,30 +10,50 @@ import {
   NInput,
   NPagination,
   NProgress,
+  NSelect,
   NSpace,
   NTag,
   useMessage,
   type DataTableColumns,
 } from "naive-ui";
 
-import { apiGet, apiPost, type GroupRow, type Paged } from "../api";
+import { apiGet, apiPost, apiSync, type GroupRow, type Paged } from "../api";
 import EffectTag from "../components/EffectTag.vue";
+import SubjectDrawer from "../components/SubjectDrawer.vue";
 
 const message = useMessage();
 const loading = ref(false);
+const syncing = ref(false);
 const rows = ref<GroupRow[]>([]);
 const total = ref(0);
 const page = ref(1);
 const size = ref(50);
 const keyword = ref("");
 const effectFilter = ref("");
+const sort = ref("active");
 const checked = ref<string[]>([]);
+
+// 详情抽屉
+const drawerShow = ref(false);
+const drawerId = ref("");
+
+function openDetail(row: GroupRow) {
+  drawerId.value = row.group_id;
+  drawerShow.value = true;
+}
+
+const sortOptions = [
+  { label: "最近同步", value: "active" },
+  { label: "今日用量", value: "usage" },
+  { label: "人数", value: "size" },
+  { label: "群名", value: "name" },
+];
 
 async function load() {
   loading.value = true;
   try {
     const res = await apiGet<Paged<GroupRow>>(
-      `/groups?page=${page.value}&size=${size.value}&q=${encodeURIComponent(keyword.value)}`,
+      `/groups?page=${page.value}&size=${size.value}&sort=${sort.value}&q=${encodeURIComponent(keyword.value)}`,
     );
     rows.value = res.rows || [];
     total.value = res.total || 0;
@@ -41,6 +61,19 @@ async function load() {
     message.error(e?.message || String(e));
   } finally {
     loading.value = false;
+  }
+}
+
+async function syncNow() {
+  syncing.value = true;
+  try {
+    const res = await apiSync();
+    message.success(`同步完成：好友 ${res.total_friends} 个 / 群 ${res.total_groups} 个`);
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e), { duration: 6000 });
+  } finally {
+    syncing.value = false;
   }
 }
 
@@ -81,10 +114,24 @@ const columns: DataTableColumns<GroupRow> = [
     title: "群",
     key: "name",
     render: (row) =>
-      h("div", { style: "line-height:1.3" }, [
-        h("div", { style: "font-weight:500" }, row.name || row.group_id),
-        h("div", { style: "font-size:12px;opacity:.65" }, `群号 ${row.group_id}`),
-      ]),
+      h(
+        "div",
+        {
+          style: "line-height:1.3;cursor:pointer",
+          title: "点击查看详情",
+          onClick: () => openDetail(row),
+        },
+        [
+          h("div", { style: "font-weight:500" }, row.name || row.group_id),
+          h("div", { style: "font-size:12px;opacity:.65" }, `群号 ${row.group_id}`),
+        ],
+      ),
+  },
+  {
+    title: "今日用量",
+    key: "today_tokens",
+    width: 110,
+    render: (row) => (row.today_tokens ? `${(row.today_tokens / 1000).toFixed(1)}K` : "-"),
   },
   {
     title: "人数",
@@ -152,7 +199,15 @@ onMounted(load);
           <option value="deny">禁止</option>
           <option value="inherit">继承</option>
         </select>
+        <n-select
+          v-model:value="sort"
+          size="small"
+          style="width: 118px"
+          :options="sortOptions"
+          @update:value="search"
+        />
         <n-button size="small" @click="search">搜索</n-button>
+        <n-button size="small" :loading="syncing" @click="syncNow">同步列表</n-button>
         <n-button size="small" type="primary" :disabled="!checked.length" @click="applyEffect(checked.map((id) => ({ scope_id: id, effect: 'allow' })))">
           批量放行
         </n-button>
@@ -164,9 +219,9 @@ onMounted(load);
 
     <n-empty v-if="!loading && !total" description="还没有群数据" style="padding: 40px 0">
       <template #extra>
-        <n-space vertical align="center" :size="6">
-          <span style="font-size: 12px; opacity: 0.65">群列表从协议端同步（需要在 AstrBot 里配置 aiocqhttp 适配器）。</span>
-          <n-tag size="small" type="info" :bordered="false">同步能力随 M1 上线</n-tag>
+        <n-space vertical align="center" :size="8">
+          <span style="font-size: 12px; opacity: 0.65">群列表从协议端同步（需要在 AstrBot 里配置并启用 aiocqhttp 适配器）。</span>
+          <n-button size="small" type="primary" :loading="syncing" @click="syncNow">立即同步</n-button>
         </n-space>
       </template>
     </n-empty>
@@ -194,6 +249,8 @@ onMounted(load);
       </n-space>
     </template>
   </n-card>
+
+  <subject-drawer v-model:show="drawerShow" type="group" :id="drawerId" @changed="load" />
 </template>
 
 <style scoped>

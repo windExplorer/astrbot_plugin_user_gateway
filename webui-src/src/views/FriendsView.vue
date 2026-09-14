@@ -10,32 +10,51 @@ import {
   NInput,
   NPagination,
   NProgress,
+  NSelect,
   NSpace,
   NTag,
-  NTooltip,
   useMessage,
   type DataTableColumns,
 } from "naive-ui";
 
-import { apiGet, apiPost, type FriendRow, type Paged } from "../api";
+import { apiGet, apiPost, apiSync, type FriendRow, type Paged } from "../api";
 import EffectTag from "../components/EffectTag.vue";
 import SubjectAvatar from "../components/SubjectAvatar.vue";
+import SubjectDrawer from "../components/SubjectDrawer.vue";
 
 const message = useMessage();
 const loading = ref(false);
+const syncing = ref(false);
 const rows = ref<FriendRow[]>([]);
 const total = ref(0);
 const page = ref(1);
 const size = ref(50);
 const keyword = ref("");
 const effectFilter = ref("");
+const sort = ref("active");
 const checked = ref<string[]>([]);
+
+// 详情抽屉
+const drawerShow = ref(false);
+const drawerId = ref("");
+
+function openDetail(row: FriendRow) {
+  drawerId.value = row.uin;
+  drawerShow.value = true;
+}
+
+const sortOptions = [
+  { label: "最近活跃", value: "active" },
+  { label: "今日用量", value: "usage" },
+  { label: "昵称", value: "name" },
+  { label: "QQ 号", value: "qq" },
+];
 
 async function load() {
   loading.value = true;
   try {
     const res = await apiGet<Paged<FriendRow>>(
-      `/friends?page=${page.value}&size=${size.value}&q=${encodeURIComponent(keyword.value)}`,
+      `/friends?page=${page.value}&size=${size.value}&sort=${sort.value}&q=${encodeURIComponent(keyword.value)}`,
     );
     rows.value = res.rows || [];
     total.value = res.total || 0;
@@ -43,6 +62,19 @@ async function load() {
     message.error(e?.message || String(e));
   } finally {
     loading.value = false;
+  }
+}
+
+async function syncNow() {
+  syncing.value = true;
+  try {
+    const res = await apiSync();
+    message.success(`同步完成：好友 ${res.total_friends} 个 / 群 ${res.total_groups} 个`);
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e), { duration: 6000 });
+  } finally {
+    syncing.value = false;
   }
 }
 
@@ -89,23 +121,37 @@ const columns: DataTableColumns<FriendRow> = [
     title: "好友",
     key: "display_name",
     render: (row) =>
-      h("div", { style: "display:flex;align-items:center;gap:10px" }, [
-        h(SubjectAvatar, { qq: row.uin, name: row.display_name }),
-        h("div", { style: "line-height:1.3" }, [
-          h("div", { style: "font-weight:500" }, row.display_name || row.uin),
-          h(
-            "div",
-            { style: "font-size:12px;opacity:.65" },
-            `${row.uin}${row.remark ? " · 备注：" + row.remark : ""}`,
-          ),
-        ]),
-      ]),
+      h(
+        "div",
+        {
+          style: "display:flex;align-items:center;gap:10px;cursor:pointer",
+          title: "点击查看详情",
+          onClick: () => openDetail(row),
+        },
+        [
+          h(SubjectAvatar, { qq: row.uin, name: row.display_name }),
+          h("div", { style: "line-height:1.3" }, [
+            h("div", { style: "font-weight:500" }, row.display_name || row.uin),
+            h(
+              "div",
+              { style: "font-size:12px;opacity:.65" },
+              `${row.uin}${row.remark ? " · 备注：" + row.remark : ""}`,
+            ),
+          ]),
+        ],
+      ),
   },
   {
     title: "LLM 权限",
     key: "effect",
     width: 110,
     render: (row) => h(EffectTag, { effect: row.effect }),
+  },
+  {
+    title: "今日用量",
+    key: "today_tokens",
+    width: 110,
+    render: (row) => (row.today_tokens ? `${(row.today_tokens / 1000).toFixed(1)}K` : "-"),
   },
   {
     title: "今日额度",
@@ -164,7 +210,15 @@ onMounted(load);
           <option value="deny">禁止</option>
           <option value="inherit">继承</option>
         </select>
+        <n-select
+          v-model:value="sort"
+          size="small"
+          style="width: 118px"
+          :options="sortOptions"
+          @update:value="search"
+        />
         <n-button size="small" @click="search">搜索</n-button>
+        <n-button size="small" :loading="syncing" @click="syncNow">同步列表</n-button>
         <n-button size="small" type="primary" :disabled="!checked.length" @click="applyEffect(checked.map((id) => ({ scope_id: id, effect: 'allow' })))">
           批量放行
         </n-button>
@@ -180,11 +234,11 @@ onMounted(load);
       style="padding: 40px 0"
     >
       <template #extra>
-        <n-space vertical align="center" :size="6">
+        <n-space vertical align="center" :size="8">
           <span style="font-size: 12px; opacity: 0.65">
-            好友列表从协议端同步（需要在 AstrBot 里配置 aiocqhttp 适配器）。
+            好友列表从协议端同步（需要在 AstrBot 里配置并启用 aiocqhttp 适配器）。
           </span>
-          <n-tag size="small" type="info" :bordered="false">同步能力随 M1 上线</n-tag>
+          <n-button size="small" type="primary" :loading="syncing" @click="syncNow">立即同步</n-button>
         </n-space>
       </template>
     </n-empty>
@@ -212,6 +266,8 @@ onMounted(load);
       </n-space>
     </template>
   </n-card>
+
+  <subject-drawer v-model:show="drawerShow" type="user" :id="drawerId" @changed="load" />
 </template>
 
 <style scoped>

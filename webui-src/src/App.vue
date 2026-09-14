@@ -11,6 +11,7 @@ import {
   NTag,
   NButton,
   NSpace,
+  NTooltip,
   darkTheme,
   zhCN,
   dateZhCN,
@@ -77,6 +78,13 @@ const menuOptions = [
 
 const activeKey = computed(() => route.path);
 
+/** 上次同步时间（0 表示还没同步过）。 */
+const syncTime = computed(() => {
+  const ts = ping.value?.sync?.last_at || 0;
+  return ts ? new Date(ts * 1000).toLocaleString() : "";
+});
+const syncError = computed(() => ping.value?.sync?.error || "");
+
 function toggleTheme() {
   themeDark.value = !themeDark.value;
   userPickedTheme.value = true;
@@ -107,6 +115,13 @@ onMounted(pingBackend);
             <n-tag size="small" type="info" :bordered="false">v{{ backendVersion }}</n-tag>
             <n-tag v-if="ping && !ping.db_ready" size="small" type="error" :bordered="false">数据库未就绪</n-tag>
             <n-tag v-else-if="pingError" size="small" type="warning" :bordered="false">后端未连接</n-tag>
+            <n-tooltip v-else-if="syncError" trigger="hover">
+              <template #trigger>
+                <n-tag size="small" type="warning" :bordered="false">同步失败</n-tag>
+              </template>
+              {{ syncError }}
+            </n-tooltip>
+            <n-tag v-else-if="syncTime" size="small" :bordered="false">同步于 {{ syncTime }}</n-tag>
           </div>
           <n-space align="center" :size="10">
             <n-button size="small" quaternary @click="pingBackend">刷新连接</n-button>

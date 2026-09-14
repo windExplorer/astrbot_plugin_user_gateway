@@ -63,21 +63,39 @@ async def main() -> int:
         await st.upsert_quota("user", "10001", "day", 10000)
         q = await st.get_quota("user", "10001", "day")
         check(q is not None and q["limit_tokens"] == 10000 and q["used_tokens"] == 0, "新建额度")
-        await st.add_used("user", "10001", "day", 350)
-        await st.add_used("user", "10001", "day", 150)
-        q = await st.get_quota("user", "10001", "day")
-        check(q["used_tokens"] == 500, "累加已用量 = 500")
+        await st.add_used("user", "10001", 350)
+        await st.add_used("user", "10001", 150)
+        check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 500, "累加已用量 = 500")
+        # period 省略 → 该对象所有周期一起累加（main.py 每次 LLM 调用只发一条 SQL）
+        await st.upsert_quota("user", "10001", "month", 100000)
+        await st.add_used("user", "10001", 20)
+        check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 520, "省略 period → 日额度 +20")
+        check((await st.get_quota("user", "10001", "month"))["used_tokens"] == 20, "省略 period → 月额度 +20")
+        # 指定周期 → 只影响那一个
+        await st.add_used("user", "10001", 5, "month")
+        check((await st.get_quota("user", "10001", "month"))["used_tokens"] == 25, "指定 period → 只加该周期")
+        check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 520, "指定 period → 不影响其它周期")
+        # 改额度保留已用量
         await st.upsert_quota("user", "10001", "day", 20000)
         q = await st.get_quota("user", "10001", "day")
-        check(q["limit_tokens"] == 20000 and q["used_tokens"] == 500, "改额度保留已用量")
+        check(q["limit_tokens"] == 20000 and q["used_tokens"] == 520, "改额度保留已用量")
         await st.upsert_quota("user", "10001", "day", 20000, keep_used=False)
         check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 0, "keep_used=False 清零")
-        await st.add_used("user", "10001", "day", 0)
+        await st.add_used("user", "10001", 0)
         check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 0, "add_used(0) 不写库")
-        n = await st.reset_used(scope_type="user")
-        check(n == 1, "reset_used 影响 1 行")
+        # 到期重置：reset_used 带上新的 reset_at
+        await st.add_used("user", "10001", 777)
+        n = await st.reset_used(scope_type="user", reset_at=123456)
+        check(n == 2, f"reset_used 影响 2 行（day + month，实得 {n}）")
+        check((await st.get_quota("user", "10001", "month"))["used_tokens"] == 0, "reset 后月额度归零")
+        check((await st.get_quota("user", "10001", "day"))["reset_at"] == 123456, "reset_at 已更新")
+        # 单对象额度查询与删除
+        check(len(await st.list_quotas_of("user", "10001")) == 2, "list_quotas_of 返回 2 个周期")
         await st.delete_quota("user", "10001", "day")
-        check(await st.get_quota("user", "10001", "day") is None, "删除额度")
+        check(await st.get_quota("user", "10001", "day") is None, "按周期删除额度")
+        check(await st.get_quota("user", "10001", "month") is not None, "只删了 day，month 仍在")
+        await st.delete_quota("user", "10001")
+        check(len(await st.list_quotas_of("user", "10001")) == 0, "不传 period → 删除该对象全部额度")
 
         print("\n[5] 用量日志与统计")
         now = int(time.time())
@@ -127,6 +145,26 @@ async def main() -> int:
         check(any(r["reason"] == "quota" for r in s["deny_reasons"]), "拒绝原因含 quota")
         check(any(r["model"] == "gpt-4o" for r in s["by_model"]), "模型占比含 gpt-4o")
 
+        # 按维度聚合（控制台列表页的「今日用量」就靠它）
+        sums = await st.usage_sums("sender_id", now - 3600, now + 60)
+        check(sums.get("10001") == 540, f"sender_id 聚合 10001 = 540（实得 {sums.get('10001')}）")
+        check(sums.get("10002") == 1, "sender_id 聚合 10002 = 1")
+        gsums = await st.usage_sums("group_id", now - 3600, now + 60)
+        check(gsums.get("88888") == 0, "group_id 聚合 88888 = 0（只记了拒绝事件）")
+        try:
+            await st.usage_sums("tok_out; DROP TABLE usage_log", now - 3600, now + 60)
+            check(False, "非白名单列应被拒绝")
+        except ValueError:
+            check(True, "非白名单列被拒绝（防注入）")
+
+        # 单对象统计（详情抽屉用）
+        su = await st.subject_stats("user", "10001", now - 3600, now + 60)
+        check(su["totals"]["calls"] == 4, f"用户统计 calls = 4（实得 {su['totals']['calls']}）")
+        check(su["totals"]["tok_total"] == 540, "用户统计 tok_total = 540")
+        check(len(su["series"]) == 1, "用户统计曲线按天 1 个点")
+        sg = await st.subject_stats("group", "88888", now - 3600, now + 60)
+        check(sg["totals"]["events"] == 1 and sg["totals"]["denied"] == 1, "群统计：1 个事件且为拒绝")
+
         print("\n[6] 好友 / 群缓存")
         await st.upsert_friends("aiocqhttp", [
             {"user_id": "10001", "nickname": "小明", "remark": "同事"},
@@ -152,6 +190,13 @@ async def main() -> int:
         check(gr["total"] == 2, "群数 = 2")
         check(gr["rows"][0]["group_id"] == "88888", "按人数倒序，88888 在前")
         check((await st.list_groups(keyword="摸鱼"))["total"] == 1, "按群名搜索")
+
+        # 单个对象查询（详情抽屉的基础信息）
+        f1 = await st.get_friend("10001")
+        check(f1 is not None and f1["nickname"] == "小明改名" and f1["remark"] == "同事", "get_friend 取到改名后的记录")
+        check(await st.get_friend("77777") is None, "不存在的 QQ → None")
+        g1 = await st.get_group("88888")
+        check(g1 is not None and g1["name"] == "测试群" and g1["owner"] == "10001", "get_group 字段完整")
 
         print("\n[7] 超期清理与审计")
         await st.log_usage(ts=now - 400 * 86400, scope_type="user", scope_id="10001", status="ok")
