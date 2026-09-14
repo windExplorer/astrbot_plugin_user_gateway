@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -33,18 +35,37 @@ except ImportError:  # pragma: no cover
     LLMResponse = Any  # type: ignore
     ProviderRequest = Any  # type: ignore
 
+# 插件目录加进 sys.path：本地直接跑 main.py 调试时，平铺导入才能生效
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+
 try:  # 包内相对导入（AstrBot 正常加载路径）
     from . import quota as quota_mod
     from .gate import Cooldown, Gate, Subject
     from .store import Store
     from .sync import SyncScheduler
     from .webui_api import register_apis
-except ImportError:  # pragma: no cover - 兼容非包环境（本地调试直接运行本模块）
-    import quota as quota_mod  # type: ignore
-    from gate import Cooldown, Gate, Subject  # type: ignore
-    from store import Store  # type: ignore
-    from sync import SyncScheduler  # type: ignore
-    from webui_api import register_apis  # type: ignore
+except ImportError as _rel_err:
+    # 相对导入失败必须区分两种原因，否则会抛出误导性的错误：
+    #   1) 本模块不是以「包」的形式被加载（本地直接 `python main.py`）→ 平铺导入兜底即可；
+    #   2) **发布包缺文件**（build_zip.ps1 的 $includeList 漏了新模块）→ 平铺导入必然报
+    #      "No module named 'quota'"，看起来像代码问题，其实是打包漏了文件。
+    # v0.2.0 就真的这么翻车过，所以这里把两种错误都原样带出来。
+    try:
+        import quota as quota_mod  # type: ignore
+        from gate import Cooldown, Gate, Subject  # type: ignore
+        from store import Store  # type: ignore
+        from sync import SyncScheduler  # type: ignore
+        from webui_api import register_apis  # type: ignore
+    except ImportError as _flat_err:
+        raise ImportError(
+            "萌萌权限控制台：子模块导入失败。"
+            f"相对导入报错 {_rel_err!r}；平铺导入报错 {_flat_err!r}。"
+            "若报错是 No module named 'gate' / 'quota' / 'sync'，说明**安装包少了文件**"
+            "（打包脚本 build_zip.ps1 的 $includeList 未同步新增模块），"
+            "请用仓库里最新的 zip 重新安装，或把缺失的 .py 补进插件目录。"
+        ) from _flat_err
 
 PLUGIN_NAME = "astrbot_plugin_user_gateway"
 

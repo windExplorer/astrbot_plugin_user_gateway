@@ -2,6 +2,26 @@
 
 本文件记录插件各版本的改动。版本号与 `metadata.yaml` 保持一致。
 
+## v0.2.1（修复：v0.2.0 的安装包缺文件，导致插件加载即报 No module named 'quota'）
+
+现象：装上 v0.2.0 后插件报 `No module named 'quota'`，无法加载。
+
+根因（**发布包缺文件**，不是代码问题）：`build_zip.ps1` 用的是**显式包含清单** `$includeList`，
+v0.2.0 新增了三个顶层模块（`gate.py` / `quota.py` / `sync.py`）却忘了加进清单，
+于是打出的 zip 里只有 `main.py` / `store.py` / `webui_api.py`。
+`main.py` 的相对导入 `from . import quota` 因此失败，而它的 `except ImportError` 兜底
+（为「本地直接跑 main.py」准备的平铺导入）又必然再失败一次，
+最终把真因掩盖成了看起来像代码问题的 `No module named 'quota'`。
+
+修复：
+
+- `build_zip.ps1`：补进 `gate.py` / `quota.py` / `sync.py`；并新增**打包前自检** ——
+  仓库里任何顶层 `.py` 没进 `$includeList` 就直接报错退出，杜绝同类漏包
+  （这类问题静默于构建期、暴露于安装期、且错误信息误导，必须让它早期失败）。
+- `main.py`：导入段不再吞掉真因。插件目录先加进 `sys.path`（本地调试用），
+  相对导入失败时若平铺导入也失败，则抛出同时包含两个原始错误的异常，
+  并明确提示「若是 No module named 'gate'/'quota'/'sync' 则说明安装包少了文件」。
+
 ## v0.2.0（M1：LLM 权限内核、好友群同步、真实数据）
 
 需求与设计见工作区 `docs/astrbot_plugin_user_gateway_PRD.md`。

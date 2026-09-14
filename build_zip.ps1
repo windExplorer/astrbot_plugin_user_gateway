@@ -65,6 +65,9 @@ $includeList = @(
     "main.py",
     "store.py",
     "webui_api.py",
+    "gate.py",
+    "quota.py",
+    "sync.py",
     "_conf_schema.json",
     "metadata.yaml",
     "requirements.txt",
@@ -73,6 +76,20 @@ $includeList = @(
     "LICENSE",
     "pages"
 )
+
+# --- self-check: every top-level .py in the repo MUST be listed above ---
+# This guards a trap that was hit for real in v0.2.0: three new modules (gate/quota/sync)
+# were added to the repo but not to this list, so the released zip shipped without them
+# and users saw "No module named 'quota'" instead of an obvious packaging error.
+# The failure is silent at build time and confusing at install time - so fail loudly here.
+$topPy = @(Get-ChildItem $root -Filter *.py -File | Select-Object -ExpandProperty Name)
+$notListed = @($topPy | Where-Object { $includeList -notcontains $_ })
+if ($notListed.Count -gt 0) {
+    Write-Host ("ERROR: top-level module(s) missing from includeList: " + ($notListed -join ", ")) -ForegroundColor Red
+    Write-Host "       Add them to the list at the top of this script before packaging." -ForegroundColor Red
+    exit 1
+}
+Write-Host ("includeList check OK: all " + $topPy.Count + " top-level .py files are listed")
 
 # Built console must exist before packaging (run build_webui.ps1 first).
 $consoleIndex = Join-Path $root "pages/permission-console/index.html"
