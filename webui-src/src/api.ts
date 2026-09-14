@@ -1,43 +1,13 @@
-// API 封装：通过 AstrBot 官方插件 Page 桥接（window.AstrBotPluginPage）调用插件后端。
+// API 封装：通过 AstrBot 官方插件 Page 桥接调用插件后端。
 // 桥接会正确处理 /api/plug/ 路由与 asset_token 鉴权；**不能**用裸 fetch 相对路径（会 CORS 失败）。
 //
 // 后端统一返回信封 {code, data, message}：code !== 0 时抛错，页面只需 try/catch 展示 e.message。
+//
+// bridge 的发现/等待逻辑统一放在 ./bridge（那里同时处理 sandbox iframe 的存储限制）。
+
+import { getPageBridge } from "./bridge";
 
 const PAGE_PLUGIN_NAME = "astrbot_plugin_user_gateway";
-
-interface Bridge {
-  apiGet(endpoint: string, params?: Record<string, any>): Promise<any>;
-  apiPost(endpoint: string, body?: Record<string, any>): Promise<any>;
-}
-
-function getBridge(): Bridge | null {
-  const w = window as any;
-  if (w.AstrBotPluginPage) return w.AstrBotPluginPage;
-  try {
-    if (w.parent && w.parent !== w && w.parent.AstrBotPluginPage) {
-      return w.parent.AstrBotPluginPage;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-function isUsable(b: Bridge | null | undefined): b is Bridge {
-  return Boolean(b && typeof b.apiGet === "function" && typeof b.apiPost === "function");
-}
-
-async function getPageBridge(timeoutMs = 3000): Promise<Bridge> {
-  const start = Date.now();
-  while (true) {
-    const b = getBridge();
-    if (isUsable(b)) return b;
-    if (Date.now() - start > timeoutMs) {
-      throw new Error("未检测到 AstrBot 插件 Page 桥接，请从 AstrBot 后台的插件拓展页打开本页面");
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-}
 
 // 不同 AstrBot 版本对端点前缀的处理略有差异，逐个候选尝试（首个成功即返回）。
 function endpointCandidates(routePath: string): string[] {
@@ -62,17 +32,28 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
+/**
+ * 解析后端返回。正常情况下 Dashboard 已经吃掉一层信封
+ * （成功时只把 `data` 转发过来），这里做防御式解包：
+ * 若仍是 `{status:"ok"|"error", data}` / `{code, data}` 形态则再脱一层。
+ */
 function unwrap(payload: any): any {
-  if (payload && typeof payload === "object" && Object.prototype.hasOwnProperty.call(payload, "code")) {
-    if (payload.code !== 0) throw new Error(payload.message || "请求失败");
-    return payload.data;
-  }
-  // 兼容 {success, data} 风格的旧响应
-  if (payload && typeof payload === "object" && Object.prototype.hasOwnProperty.call(payload, "success")) {
-    if (payload.success === false) throw new Error(payload.error || "请求失败");
-    return payload.data !== undefined ? payload.data : payload;
+  if (payload && typeof payload === "object") {
+    if (payload.status === "error") throw new Error(payload.message || "请求失败");
+    if (payload.status === "ok" && "data" in payload) return payload.data;
+    if (Object.prototype.hasOwnProperty.call(payload, "code")) {
+      if (payload.code !== 0) throw new Error(payload.message || "请求失败");
+      return payload.data;
+    }
   }
   return payload;
+}
+
+/** 只有「路由不存在」才值得换下一种端点写法重试；业务错误必须立刻抛出。 */
+function isRouteMissingError(e: any): boolean {
+  if (isRouteMissing(e)) return true;
+  const text = String(e?.message || e?.toString?.() || e || "");
+  return /未找到.*路由|route.*not.*found|not.*found.*route|404|not found/i.test(text);
 }
 
 async function request(path: string, method: "GET" | "POST", body?: unknown, timeoutMs?: number): Promise<any> {
@@ -93,6 +74,8 @@ async function request(path: string, method: "GET" | "POST", body?: unknown, tim
         }
         return unwrap(p);
       } catch (e: any) {
+        // 业务错误（如参数校验失败）直接抛出，避免把同一个请求打到 4 种端点上
+        if (!isRouteMissingError(e)) throw e;
         errors.push(e?.message || String(e));
       }
     }
@@ -114,6 +97,8 @@ async function request(path: string, method: "GET" | "POST", body?: unknown, tim
       }
       return unwrap(r);
     } catch (e: any) {
+      // 同上：POST 绝不能因为业务错误被重试多次（会出现重复写库）
+      if (!isRouteMissingError(e)) throw e;
       errors.push(e?.message || e?.toString?.() || String(e));
     }
   }

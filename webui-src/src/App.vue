@@ -19,14 +19,43 @@ import {
 } from "naive-ui";
 
 import { apiGet, type PingInfo } from "./api";
+import { getContext, onContext, storageGet, storageSet } from "./bridge";
 import { PLUGIN_VERSION } from "./version";
 
 const route = useRoute();
 
-const themeDark = ref(localStorage.getItem("usergw.theme") === "dark");
+// 主题：优先用户本次的手动选择，否则跟随 AstrBot 面板下发的 context.isDark。
+// ⚠️ 页面运行在 sandbox iframe 里，localStorage 不可直接访问（会抛 SecurityError），
+//    storageGet/storageSet 已做兜底（不可用时退回内存）。
+const userPickedTheme = ref(false);
+const themeDark = ref(false);
 const ping = ref<PingInfo | null>(null);
 const pingError = ref("");
 const backendVersion = ref(PLUGIN_VERSION);
+
+function initTheme() {
+  const saved = storageGet("usergw.theme");
+  if (saved) {
+    themeDark.value = saved === "dark";
+    userPickedTheme.value = true;
+    return;
+  }
+  // AstrBot 会把面板主题直接写在 <html data-theme="dark|light"> 上，这是最可靠的初值
+  const attr = document.documentElement.getAttribute("data-theme");
+  if (attr === "dark" || attr === "light") {
+    themeDark.value = attr === "dark";
+    return;
+  }
+  const ctx = getContext();
+  if (typeof ctx?.isDark === "boolean") themeDark.value = ctx.isDark;
+}
+initTheme();
+
+// 面板切换主题 / 语言时会推送新 context
+onContext((ctx) => {
+  if (ctx.pageTitle) document.title = ctx.pageTitle;
+  if (!userPickedTheme.value && typeof ctx.isDark === "boolean") themeDark.value = ctx.isDark;
+});
 
 const theme = computed(() => (themeDark.value ? darkTheme : null));
 const themeOverrides: GlobalThemeOverrides = {
@@ -50,7 +79,8 @@ const activeKey = computed(() => route.path);
 
 function toggleTheme() {
   themeDark.value = !themeDark.value;
-  localStorage.setItem("usergw.theme", themeDark.value ? "dark" : "light");
+  userPickedTheme.value = true;
+  storageSet("usergw.theme", themeDark.value ? "dark" : "light");
 }
 
 async function pingBackend() {

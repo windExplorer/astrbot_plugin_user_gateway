@@ -3,7 +3,17 @@
 路由前缀 ``/astrbot_plugin_user_gateway``（AstrBot 约定：带插件名、不带 /page），
 前端通过 ``window.AstrBotPluginPage.apiGet/apiPost`` 调用，由 Dashboard 转发。
 
-统一返回信封：``{"code": 0, "data": ..., "message": ""}``；``code != 0`` 时前端展示 ``message``。
+⚠️ 返回信封必须遵循 AstrBot 的桥接约定，不能自创格式。Dashboard 侧的处理是
+（见 ``dashboard/src/views/PluginPagePage.vue`` 的 ``handleBridgeRequest``）：
+
+```js
+if (response.data?.status === "error") throw new Error(response.data.message);
+sendBridgeResponse(requestId, true, response.data?.data ?? response.data);
+```
+
+也就是说：
+  - 成功 → ``{"status": "ok", "data": <payload>}``（Dashboard 只把 ``data`` 转发给前端）
+  - 失败 → ``{"status": "error", "message": "..."}``（Dashboard 直接抛错，前端拿到 rejected promise）
 
 M0 阶段已实现：健康检查、配置读写、总览统计、好友/群缓存列表、额度增删改查、权限规则读写、明细查询。
 好友/群同步（``/sync``）依赖协议端调用，在 M1 随权限内核一起接入。
@@ -33,13 +43,13 @@ _RANGE_SECONDS = {"1d": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 # 工具
 # ---------------------------------------------------------------------- #
 def ok(data: Any = None) -> dict:
-    """成功信封。"""
-    return {"code": 0, "data": data, "message": ""}
+    """成功信封（AstrBot 桥接约定）。"""
+    return {"status": "ok", "data": data}
 
 
-def err(message: str, code: int = 1) -> dict:
-    """失败信封。"""
-    return {"code": code, "data": None, "message": message}
+def err(message: str) -> dict:
+    """失败信封（AstrBot 桥接约定：Dashboard 会据此抛错）。"""
+    return {"status": "error", "message": message}
 
 
 def _q(name: str, default: str = "") -> str:
