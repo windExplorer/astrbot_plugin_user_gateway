@@ -205,3 +205,23 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 打包产物（本地安装用，不入库）
+dist/
+
+# 插件运行时数据（调试时若落在插件目录内，不入库）
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# ===== Vue3 WebUI 开发（webui-src/） =====
+# 源码进 git，但 node_modules / 构建缓存 / 构建时注入的版本常量不入库。
+# 注意：pages/permission-console/（构建产物）必须进 git（zip 打包依赖它），勿忽略。
+webui-src/node_modules/
+webui-src/dist/
+webui-src/.vite/
+webui-src/src/version.ts
+*.local
+npm-debug.log*
+yarn-error.log*

@@ -1,0 +1,118 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "hint": "总开关。关闭后本插件对所有消息完全放行（不拦截、不判定），但仍会记录用量统计。排查问题时可以先关它。",
+    "type": "bool",
+    "default": true
+  },
+  "llm_guard_enabled": {
+    "description": "启用 LLM 权限管控",
+    "hint": "开启后，按「用户级 > 群级 > 全局默认」的规则判定谁可以使用对话功能。关闭则只有统计生效。",
+    "type": "bool",
+    "default": true
+  },
+  "quota_enabled": {
+    "description": "启用 token 限额",
+    "hint": "开启后按限额配置拦截超额会话。具体是「只记账」还是「真拦截」由下方的「限额模式」决定。",
+    "type": "bool",
+    "default": true
+  },
+  "stats_enabled": {
+    "description": "启用用量统计",
+    "hint": "记录每次 LLM 调用的 token 用量、模型、耗时与拒绝事件，供控制台展示。关闭后控制台图表将没有数据。",
+    "type": "bool",
+    "default": true
+  },
+  "default_effect": {
+    "description": "全局默认策略",
+    "hint": "未单独配置的对象采用的策略。allow=默认放行（推荐，先放行再逐个限制）；deny=默认禁止（白名单模式，只有显式放行的对象能用）。",
+    "type": "string",
+    "options": ["allow", "deny"],
+    "default": "allow"
+  },
+  "admin_exempt": {
+    "description": "管理员豁免",
+    "hint": "开启后，AstrBot 全局配置 admins_id 里的管理员永远不受权限与限额限制（推荐开启，避免把自己锁在外面）。",
+    "type": "bool",
+    "default": true
+  },
+  "deny_notice": {
+    "description": "被拒绝时的提示文案",
+    "hint": "用户被拦截时收到的消息内容。留空则等于静默拒绝。",
+    "type": "text",
+    "default": "你已被限制使用对话功能。"
+  },
+  "silent": {
+    "description": "静默拒绝",
+    "hint": "开启后不再发送任何提示（用户会感觉机器人没反应）。默认关闭，建议保留提示便于用户理解。",
+    "type": "bool",
+    "default": false
+  },
+  "notice_cooldown_sec": {
+    "description": "提示冷却（秒）",
+    "hint": "同一对象在这么多秒内只提示一次，避免连续触发时刷屏。默认 60；设 0 表示每次都提示。",
+    "type": "int",
+    "default": 60
+  },
+  "notify_admin": {
+    "description": "拒绝时通知管理员",
+    "hint": "开启后每次拦截都会给 admins_id 里的管理员发一条说明（含对象与原因）。适合调试期，长期开启会比较吵。",
+    "type": "bool",
+    "default": false
+  },
+  "quota_mode": {
+    "description": "限额模式",
+    "hint": "observe=只记账不拦截（推荐首次安装先用它跑一周，看清用量再切 enforce）；enforce=超过额度直接拦截。",
+    "type": "string",
+    "options": ["observe", "enforce"],
+    "default": "observe"
+  },
+  "count_cached_tokens": {
+    "description": "缓存 token 计入额度",
+    "hint": "开启后，命中提示词缓存的 token 也计入已用量（额度口径 = 输入+缓存+输出）。关闭则只算实际新增的输入与输出，会更省额度。",
+    "type": "bool",
+    "default": true
+  },
+  "warn_ratio": {
+    "description": "额度预警比例",
+    "hint": "已用量达到额度的这个比例时给管理员发预警通知（配合「拒绝时通知管理员」使用）。默认 0.8 即 80%；设 0 关闭预警。",
+    "type": "float",
+    "default": 0.8
+  },
+  "sync_interval_min": {
+    "description": "好友/群自动同步周期（分钟）",
+    "hint": "定期从协议端拉取好友与群列表并缓存，供控制台展示头像与昵称。默认 30 分钟；设 0 关闭自动同步（只保留手动同步按钮）。",
+    "type": "int",
+    "default": 30
+  },
+  "sync_timeout_sec": {
+    "description": "同步超时（秒）",
+    "hint": "单次拉取好友/群列表的等待上限。协议端无响应时到点放弃并使用缓存数据。默认 15。",
+    "type": "int",
+    "default": 15
+  },
+  "load_avatars": {
+    "description": "加载 QQ 头像",
+    "hint": "控制台前端会按 QQ 号从腾讯 CDN 拉取头像。内网 / 离线环境下建议关闭，列表会退化为首字母色块。",
+    "type": "bool",
+    "default": true
+  },
+  "retention_days": {
+    "description": "统计数据保留天数",
+    "hint": "超过该天数的用量明细会自动清理。默认 180 天；设 0 表示永久保留（数据量大时注意磁盘占用）。",
+    "type": "int",
+    "default": 180
+  },
+  "guard_priority": {
+    "description": "拦截优先级",
+    "hint": "本插件 LLM 闸门钩子的优先级，数值越大越先执行。默认 100；若发现拦截不生效（被其它插件抢先），可调大。",
+    "type": "int",
+    "default": 100
+  },
+  "debug_log": {
+    "description": "调试日志",
+    "hint": "开启后打印每次判定的详细过程（命中哪条规则、额度剩余多少）。排查「为什么被拦 / 为什么没拦」时打开。",
+    "type": "bool",
+    "default": false
+  }
+}
