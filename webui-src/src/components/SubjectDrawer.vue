@@ -23,9 +23,9 @@ import {
   useMessage,
 } from "naive-ui";
 
-import { apiPost, apiSubject, type SubjectDetail } from "../api";
+import { apiLevels, apiPost, apiSetSubjectLevel, apiSubject, type LevelRow, type SubjectDetail } from "../api";
 import EChart from "../EChart.vue";
-import EffectTag from "./EffectTag.vue";
+import EffectSegment from "./EffectSegment.vue";
 import SubjectAvatar from "./SubjectAvatar.vue";
 
 const props = defineProps<{
@@ -44,6 +44,11 @@ const loading = ref(false);
 const saving = ref(false);
 const detail = ref<SubjectDetail | null>(null);
 const effect = ref<string>("inherit");
+
+// 等级
+const levels = ref<LevelRow[]>([]);
+const levelId = ref(0);
+const levelOptions = ref<{ label: string; value: number }[]>([{ label: "未分组", value: 0 }]);
 
 // 额度快捷编辑
 const qPeriod = ref<"day" | "month" | "total">("day");
@@ -101,6 +106,7 @@ async function load() {
     const d = await apiSubject(props.type, props.id, 7);
     detail.value = d;
     effect.value = d.effect || "inherit";
+    levelId.value = d.level_id || 0;
     // 额度的初值：优先日额度，否则月、累计
     const rows = d.quotas || [];
     const pick = rows.find((q) => q.period === "day") || rows.find((q) => q.period === "month") || rows[0];
@@ -118,6 +124,49 @@ async function load() {
   } finally {
     loading.value = false;
   }
+}
+
+async function loadLevels() {
+  try {
+    const res = await apiLevels();
+    const mine = (res.items || []).filter((l) => l.kind === props.type);
+    levels.value = mine;
+    levelOptions.value = [
+      { label: "未分组", value: 0 },
+      ...mine.map((l) => ({ label: `${l.name}（${l.members}）`, value: l.id })),
+    ];
+  } catch {
+    /* 等级加载失败不影响其它面板 */
+  }
+}
+
+async function saveLevel(v: number) {
+  levelId.value = v;
+  saving.value = true;
+  try {
+    await apiSetSubjectLevel([{ scope_type: props.type, scope_id: props.id, level_id: v || null }]);
+    message.success(v ? "等级已更新" : "已取消等级");
+    emit("changed");
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    saving.value = false;
+  }
+}
+
+/** 档位链一行的展示文案。 */
+function chainText(c: { limits: Record<string, any>; usage: Record<string, number>; effective: boolean }): string {
+  const entries = Object.entries(c.limits || {});
+  if (!entries.length) return "未配置";
+  return entries
+    .map(([period, row]) => {
+      const label = period === "day" ? "每日" : period === "month" ? "每月" : "累计";
+      const limit = Number(row?.limit_tokens || 0);
+      const used = Number(c.usage?.[period] || 0);
+      return `${label} ${fmtNum(used)}/${limit === 0 ? "不限" : fmtNum(limit)}${row?.mode === "observe" ? "（观察）" : ""}`;
+    })
+    .join("；");
 }
 
 async function saveEffect(next: string) {
@@ -150,7 +199,27 @@ async function saveQuota() {
       limit_tokens: Number(qLimit.value || 0),
       mode: qMode.value,
     });
-    message.success(qLimit.value > 0 ? "额度已保存" : "额度已删除");
+    // 0 = 明确「不限」并占住档位（更粗的额度层不再参与），不是删除
+    message.success(qLimit.value > 0 ? "额度已保存" : "已设为「不限」（占住档位）");
+    emit("changed");
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function deleteQuota() {
+  saving.value = true;
+  try {
+    await apiPost("/quota", {
+      scope_type: props.type,
+      scope_id: props.id,
+      period: qPeriod.value,
+      limit_tokens: null,
+    });
+    message.success("已删除该周期的专属额度（恢复继承）");
     emit("changed");
     await load();
   } catch (e: any) {
@@ -230,7 +299,10 @@ const recentData = computed(() =>
 watch(
   () => [props.show, props.id, props.type],
   () => {
-    if (props.show) load();
+    if (props.show) {
+      loadLevels();
+      load();
+    }
   },
   { immediate: true },
 );
@@ -248,7 +320,8 @@ watch(
         <n-space align="center" :size="10">
           <subject-avatar
             v-if="isUser"
-            :qq="props.id"
+            kind="user"
+            :id="props.id"
             :name="displayName"
             :size="30"
           />
@@ -274,23 +347,56 @@ watch(
           </n-card>
 
           <n-card size="small" title="LLM 权限">
-            <n-space align="center" :size="10">
-              <n-radio-group :value="effect" :disabled="saving" @update:value="saveEffect">
-                <n-radio-button value="allow">放行</n-radio-button>
-                <n-radio-button value="deny">禁止</n-radio-button>
-                <n-radio-button value="inherit">继承</n-radio-button>
-              </n-radio-group>
-              <span style="font-size: 12px; opacity: 0.6">
-                「继承」= 走群级或全局默认策略
+            <n-space vertical :size="10">
+              <n-space align="center" :size="10">
+                <effect-segment :effect="effect" :disabled="saving" @change="saveEffect" />
+                <span style="font-size: 12px; opacity: 0.6">
+                  三者是同一个开关的互斥状态；「继承」= 不写专属规则，跟随等级 / 群 / 全局默认
+                </span>
+              </n-space>
+              <n-space align="center" :size="10">
+                <span style="font-size: 13px">所属等级</span>
+                <n-select
+                  :value="levelId"
+                  size="small"
+                  style="width: 200px"
+                  :options="levelOptions"
+                  :disabled="saving"
+                  @update:value="saveLevel"
+                />
+                <span style="font-size: 12px; opacity: 0.6">等级可带默认权限与额度模板</span>
+              </n-space>
+              <span v-if="detail?.bot?.ts" style="font-size: 12px; opacity: 0.65">
+                最后回复：{{ new Date(detail.bot.ts * 1000).toLocaleString() }}（{{ detail.bot.kind === "llm" ? "LLM 回复" : detail.bot.kind === "command" ? "指令回复" : "普通消息" }}）
               </span>
             </n-space>
           </n-card>
 
           <n-card size="small" title="token 额度">
             <n-space vertical :size="10">
+              <div v-if="detail?.quota_chain?.length">
+                <div style="font-size: 12px; opacity: 0.6; margin-bottom: 4px">
+                  额度档位链（命中最具体的一层即止，更粗的层不再参与）：
+                </div>
+                <div
+                  v-for="c in detail.quota_chain"
+                  :key="c.layer"
+                  :style="{ opacity: c.effective ? 1 : 0.55, lineHeight: 1.6 }"
+                >
+                  <n-space justify="space-between" :size="8">
+                    <span style="font-size: 12.5px">
+                      {{ c.label }}
+                      <n-tag v-if="c.effective" size="tiny" type="info" :bordered="false">生效</n-tag>
+                      <n-tag v-if="c.exceeded" size="tiny" type="error" :bordered="false">已超限</n-tag>
+                    </span>
+                    <span style="font-size: 12px; opacity: 0.75">{{ chainText(c) }}</span>
+                  </n-space>
+                </div>
+              </div>
+
               <n-empty
                 v-if="!detail?.quotas?.length"
-                description="未配置额度（不限量）"
+                description="该对象没有专属额度（按等级 / 全局档位算，见上）"
                 style="padding: 8px 0"
               />
               <div v-for="q in detail?.quotas || []" :key="q.period">
@@ -302,7 +408,7 @@ watch(
                     </n-tag>
                   </span>
                   <span style="font-size: 12px; opacity: 0.75">
-                    {{ fmtNum(q.used_tokens) }} / {{ fmtNum(q.limit_tokens) }}
+                    {{ fmtNum(q.used_tokens) }} / {{ q.limit_tokens === 0 ? "不限" : fmtNum(q.limit_tokens) }}
                   </span>
                 </n-space>
                 <n-progress
@@ -342,10 +448,11 @@ watch(
                   ]"
                 />
                 <n-button size="small" type="primary" :loading="saving" @click="saveQuota">保存</n-button>
+                <n-button size="small" :loading="saving" @click="deleteQuota">删除该周期</n-button>
                 <n-button size="small" :loading="saving" @click="resetQuota">清零用量</n-button>
               </n-space>
               <span style="font-size: 12px; opacity: 0.55">
-                上限填 0 表示删除该周期额度（不限量）。口径见配置页「缓存 token 是否计入」。
+                上限填 0 = 明确「不限」（占住档位）；要恢复继承请用「删除该周期」。口径见配置页「缓存 token 是否计入」。
               </span>
             </n-space>
           </n-card>

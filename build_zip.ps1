@@ -68,6 +68,7 @@ $includeList = @(
     "gate.py",
     "quota.py",
     "sync.py",
+    "avatar.py",
     "_conf_schema.json",
     "metadata.yaml",
     "requirements.txt",

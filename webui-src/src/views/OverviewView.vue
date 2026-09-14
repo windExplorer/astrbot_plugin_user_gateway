@@ -50,6 +50,12 @@ function setRange(v: "1d" | "7d" | "30d") {
   load();
 }
 
+/** bot 最后消息的类型分布（有多少会话最后一条是 LLM / 指令 / 普通消息）。 */
+function kindCount(kind: string): number {
+  const kinds = (data.value?.bot as any)?.kinds as { kind: string; cnt: number }[] | undefined;
+  return Number(kinds?.find((k) => k.kind === kind)?.cnt || 0);
+}
+
 onMounted(load);
 
 // ------ 图表 option ------
@@ -175,6 +181,9 @@ const scopeColumns = [
           <n-radio-button value="30d">近 30 日</n-radio-button>
         </n-radio-group>
         <n-space align="center" :size="8">
+          <n-tag v-if="data?.bot?.sessions" size="small" :bordered="false">
+            最近回复 {{ data.bot.sessions }} 个会话 · LLM {{ kindCount("llm") }} / 指令 {{ kindCount("command") }} / 普通 {{ kindCount("normal") }}
+          </n-tag>
           <n-tag v-if="totals?.estimated" size="small" type="warning" :bordered="false">
             含 {{ totals.estimated }} 条估算用量
           </n-tag>

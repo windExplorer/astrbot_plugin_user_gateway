@@ -3,8 +3,9 @@
 用法：
     uv run --no-project --with aiosqlite python tests/test_store.py
 
-覆盖：建表 / 权限规则（含 inherit 语义）/ 额度累加与重置 / 用量日志与统计聚合 /
-好友群缓存与模糊搜索 / 超期清理 / 审计日志。
+覆盖：建表 / 权限规则（含 inherit 语义）/ 限额与用量分离 / 等级与归级 /
+bot 最后消息 / 用量日志与统计聚合 / 好友群缓存与模糊搜索 / 超期清理 / 审计 /
+v1 → v2 结构迁移。
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ async def main() -> int:
         check(Path(db_path).exists(), "数据库文件已创建")
 
         print("\n[2] settings")
-        check(await st.get_setting("schema_version") == "1", "schema_version 已写入")
+        check(await st.get_setting("schema_version") == "2", "schema_version 已写入 2")
         check(await st.get_setting("nope", "d") == "d", "缺省值回退")
         await st.set_setting("sync_last_at", "123")
         check(await st.get_setting("sync_last_at") == "123", "写入后可读")
@@ -59,43 +60,50 @@ async def main() -> int:
         await st.set_policy("user", "10001", "inherit")
         check(await st.get_effect("user", "10001") is None, "inherit 等价于删除")
 
-        print("\n[4] 额度")
+        print("\n[4] 限额与用量（v2 起两者分离）")
         await st.upsert_quota("user", "10001", "day", 10000)
         q = await st.get_quota("user", "10001", "day")
-        check(q is not None and q["limit_tokens"] == 10000 and q["used_tokens"] == 0, "新建额度")
-        await st.add_used("user", "10001", 350)
+        check(q is not None and q["limit_tokens"] == 10000, "新建限额")
+        check("used_tokens" not in q, "限额行不再自带用量（用量在 usage_counter）")
+        await st.add_used("user", "10001", 350, reset_at_map={"day": 999999})
         await st.add_used("user", "10001", 150)
-        check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 500, "累加已用量 = 500")
-        # period 省略 → 该对象所有周期一起累加（main.py 每次 LLM 调用只发一条 SQL）
-        await st.upsert_quota("user", "10001", "month", 100000)
-        await st.add_used("user", "10001", 20)
-        check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 520, "省略 period → 日额度 +20")
-        check((await st.get_quota("user", "10001", "month"))["used_tokens"] == 20, "省略 period → 月额度 +20")
-        # 指定周期 → 只影响那一个
-        await st.add_used("user", "10001", 5, "month")
-        check((await st.get_quota("user", "10001", "month"))["used_tokens"] == 25, "指定 period → 只加该周期")
-        check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 520, "指定 period → 不影响其它周期")
-        # 改额度保留已用量
+        u = await st.get_usage("user", "10001")
+        check(u["day"]["used_tokens"] == 500, f"用量累加 = 500（实得 {u['day']['used_tokens']}）")
+        check(u["month"]["used_tokens"] == 500 and u["total"]["used_tokens"] == 500, "日/月/累计三个周期一起累加")
+        check(u["day"]["reset_at"] == 999999, "首次写入时记录 reset_at")
+        check(u["month"]["reset_at"] is None, "未指定 reset_at 的周期留空")
+        # reset_at 不该被后续累加覆盖（否则重置时间会被一直往后推）
+        await st.add_used("user", "10001", 10, reset_at_map={"day": 111})
+        check((await st.get_usage("user", "10001"))["day"]["reset_at"] == 999999, "后续累加不覆盖已有 reset_at")
+        # 改限额不影响用量
         await st.upsert_quota("user", "10001", "day", 20000)
-        q = await st.get_quota("user", "10001", "day")
-        check(q["limit_tokens"] == 20000 and q["used_tokens"] == 520, "改额度保留已用量")
-        await st.upsert_quota("user", "10001", "day", 20000, keep_used=False)
-        check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 0, "keep_used=False 清零")
-        await st.add_used("user", "10001", 0)
-        check((await st.get_quota("user", "10001", "day"))["used_tokens"] == 0, "add_used(0) 不写库")
-        # 到期重置：reset_used 带上新的 reset_at
-        await st.add_used("user", "10001", 777)
-        n = await st.reset_used(scope_type="user", reset_at=123456)
-        check(n == 2, f"reset_used 影响 2 行（day + month，实得 {n}）")
-        check((await st.get_quota("user", "10001", "month"))["used_tokens"] == 0, "reset 后月额度归零")
-        check((await st.get_quota("user", "10001", "day"))["reset_at"] == 123456, "reset_at 已更新")
-        # 单对象额度查询与删除
+        check((await st.get_usage("user", "10001"))["day"]["used_tokens"] == 510, "改额度不清零用量")
+        check((await st.get_quota("user", "10001", "day"))["limit_tokens"] == 20000, "上限已更新")
+        # 未配额度的对象也必须记账（等级/全局模板要用它自己的用量判定）
+        await st.add_used("user", "20002", 77)
+        check((await st.get_usage("user", "20002"))["day"]["used_tokens"] == 77, "未配额度也记账")
+        check(await st.add_used("user", "20002", 0) == 0, "add_used(0) 不写库")
+        um = await st.usage_map("user")
+        check(set(um) == {"10001", "20002"}, f"usage_map 覆盖全部对象（实得 {sorted(um)}）")
+        # 清零
+        await st.reset_used(scope_type="user", scope_id="10001", period="day", reset_at=123456)
+        u = await st.get_usage("user", "10001")
+        check(u["day"]["used_tokens"] == 0 and u["day"]["reset_at"] == 123456, "按周期清零并写回新的 reset_at")
+        check(u["month"]["used_tokens"] == 510, "只清了日周期")
+        due = await st.counters_due(123456)
+        check(len(due) == 1 and due[0]["scope_id"] == "10001" and due[0]["period"] == "day",
+              f"counters_due 只列出到期的用量行（实得 {len(due)} 条）")
+        check(await st.counters_due(123455) == [], "未到点的不出现在 counters_due")
+        check(await st.counters_due(10**12) == due, "远期时间点结果一致（其它行 reset_at 为空）")
+        # 删除限额
+        await st.upsert_quota("user", "10001", "month", 100000)
         check(len(await st.list_quotas_of("user", "10001")) == 2, "list_quotas_of 返回 2 个周期")
         await st.delete_quota("user", "10001", "day")
-        check(await st.get_quota("user", "10001", "day") is None, "按周期删除额度")
+        check(await st.get_quota("user", "10001", "day") is None, "按周期删除限额")
         check(await st.get_quota("user", "10001", "month") is not None, "只删了 day，month 仍在")
         await st.delete_quota("user", "10001")
-        check(len(await st.list_quotas_of("user", "10001")) == 0, "不传 period → 删除该对象全部额度")
+        check(len(await st.list_quotas_of("user", "10001")) == 0, "不传 period → 删除该对象全部限额")
+        check((await st.get_usage("user", "10001"))["month"]["used_tokens"] == 510, "删限额不影响用量")
 
         print("\n[5] 用量日志与统计")
         now = int(time.time())
@@ -210,14 +218,131 @@ async def main() -> int:
         au = await st.list_audit()
         check(au["total"] == 1 and au["rows"][0]["action"] == "set_policy", "审计日志")
 
-        print("\n[8] 生命周期")
+        print("\n[8] 等级与归级")
+        lv_normal = await st.upsert_level("user", "普通", description="默认档", effect="inherit", sort_order=1)
+        lv_vip = await st.upsert_level("user", "VIP", effect="allow", sort_order=2)
+        lv_group = await st.upsert_level("group", "主群", effect="deny")
+        check(len(await st.list_levels()) == 3, "等级数 = 3")
+        check(len(await st.list_levels("user")) == 2, "按 kind 过滤")
+        check(await st.upsert_level("user", "VIP", effect="allow") == lv_vip, "同名等级重复 upsert 返回同一 id")
+        lv = await st.get_level(lv_vip)
+        check(lv["kind"] == "user" and lv["effect"] == "allow", "get_level 字段正确")
+        check(await st.get_level(99999) is None, "不存在的等级 → None")
+
+        await st.upsert_quota("level", str(lv_vip), "day", 500000)
+        check(len(await st.list_quotas_of("level", str(lv_vip))) == 1, "等级额度模板可写")
+        levels_lim = await st.list_quotas("level")
+        check(len(levels_lim) == 1 and levels_lim[0]["scope_id"] == str(lv_vip), "list_quotas('level') 能取到模板")
+        glob = await st.list_quotas("global")
+        await st.upsert_quota("global", "*", "day", 50000)
+        check(len(await st.list_quotas("global")) == 1 and glob == [], "全局模板独立成一层")
+
+        await st.set_subject_level("user", "10001", lv_vip)
+        check(await st.get_subject_level("user", "10001") == lv_vip, "归级写入")
+        check(await st.subject_level_map("user") == {"10001": lv_vip}, "subject_level_map")
+        check((await st.level_counts()).get(lv_vip) == 1, "level_counts 统计成员数")
+        await st.set_subject_level("user", "10001", lv_vip)  # 幂等
+        check((await st.level_counts()).get(lv_vip) == 1, "重复归级不重复计数")
+        await st.set_subject_level("user", "10001", None)
+        check(await st.get_subject_level("user", "10001") is None, "取消归级")
+
+        await st.upsert_level("user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9)
+        lv = await st.get_level(lv_vip)
+        check(lv["name"] == "VIP改名" and lv["effect"] == "deny" and lv["sort_order"] == 9, "按 id 更新等级")
+        check(len(await st.list_levels()) == 3, "更新不会多出等级")
+
+        await st.set_subject_level("group", "88888", lv_group)
+        await st.delete_level(lv_group)
+        check(await st.get_level(lv_group) is None, "删除等级")
+        check(await st.get_subject_level("group", "88888") is None, "删除等级后归级记录一并清除")
+        check((await st.level_counts()).get(lv_group) is None, "删除等级后成员统计同步清空")
+
+        print("\n[9] bot 最后消息")
+        await st.set_bot_message("user", "10001", "llm", ts=1000, preview="你好呀", platform_id="p1")
+        await st.set_bot_message("group", "88888", "command", ts=2000, command="help", preview="/help")
+        b1 = await st.get_bot_message("user", "10001")
+        check(b1["kind"] == "llm" and b1["preview"] == "你好呀" and b1["platform_id"] == "p1", "写入后读取")
+        await st.set_bot_message("user", "10001", "normal", ts=3000, preview="覆盖")
+        b1 = await st.get_bot_message("user", "10001")
+        check(b1["ts"] == 3000 and b1["kind"] == "normal" and b1["preview"] == "覆盖",
+              "同一会话覆盖式更新（只留最新一条）")
+        m = await st.bot_message_map("group")
+        check(m["88888"]["command"] == "help", "bot_message_map 按作用域取")
+        check(len(await st.bot_message_map("user")) == 1, "bot_message_map(user) 只有 1 个会话")
+        sm = await st.bot_message_summary(0, 4000)
+        check(sm["sessions"] == 2, f"会话数 = {sm['sessions']}（期望 2）")
+        check(any(k["kind"] == "normal" and k["cnt"] == 1 for k in sm["kinds"]), "类型分布含 normal")
+        check(sm["latest_ts"] == 3000, "最新时间 = 3000")
+        await st.set_bot_message("user", "", "llm")  # 空 scope_id 应被忽略
+        check((await st.bot_message_summary(0, 10**12))["sessions"] == 2, "空 id 不产生记录")
+
+        print("\n[10] 生命周期")
         await st.close()
         check(not st.ready, "close 后 ready=False")
         await st.close()  # 幂等
         st2 = Store(db_path)
         await st2.open()
         check((await st2.list_friends())["total"] == 2, "重新打开后数据仍在")
+        check((await st2.get_usage("user", "10001"))["month"]["used_tokens"] == 510, "重新打开后用量计数仍在")
         await st2.close()
+
+    print("\n[11] v1 → v2 迁移")
+    with tempfile.TemporaryDirectory() as tmp2:
+        v1_path = str(Path(tmp2) / "v1.db")
+        import aiosqlite
+
+        raw = await aiosqlite.connect(v1_path)
+        await raw.executescript(
+            """
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL);
+            CREATE TABLE llm_quota (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope_type   TEXT    NOT NULL,
+                scope_id     TEXT    NOT NULL,
+                period       TEXT    NOT NULL,
+                limit_tokens INTEGER NOT NULL,
+                used_tokens  INTEGER NOT NULL DEFAULT 0,
+                mode         TEXT    NOT NULL DEFAULT 'enforce',
+                reset_at     INTEGER,
+                updated_at   INTEGER NOT NULL,
+                UNIQUE (scope_type, scope_id, period)
+            );
+            CREATE INDEX idx_quota_scope ON llm_quota(scope_type, scope_id);
+            """,
+        )
+        await raw.execute("INSERT INTO settings(key, value, updated_at) VALUES('schema_version', '1', 0)")
+        await raw.execute(
+            "INSERT INTO llm_quota(scope_type, scope_id, period, limit_tokens, used_tokens, mode, reset_at, updated_at) "
+            "VALUES('user', '10001', 'day', 1000, 600, 'enforce', 555, 0)"
+        )
+        await raw.execute(
+            "INSERT INTO llm_quota(scope_type, scope_id, period, limit_tokens, used_tokens, mode, updated_at) "
+            "VALUES('user', '10001', 'month', 50000, 0, 'observe', 0)"
+        )
+        await raw.commit()
+        await raw.close()
+
+        st3 = Store(v1_path)
+        await st3.open()
+        check(await st3.get_setting("schema_version") == "2", "版本号升到 2")
+        q = await st3.get_quota("user", "10001", "day")
+        check(q is not None and q["limit_tokens"] == 1000 and "used_tokens" not in q,
+              "限额保留、用量的列已移除")
+        check((await st3.get_usage("user", "10001"))["day"]["used_tokens"] == 600, "v1 已用量迁入 usage_counter")
+        check((await st3.get_usage("user", "10001"))["day"]["reset_at"] == 555, "reset_at 一并迁移")
+        check((await st3.get_usage("user", "10001")).get("month") is None, "用量为 0 的行不迁移")
+        check(await st3.get_quota("user", "10001", "month") is not None, "另一个周期限额也在")
+        check(await st3.get_quota("user", "10001", "month") is not None
+              and (await st3.get_quota("user", "10001", "month"))["mode"] == "observe", "模式保留")
+        async with st3._conn().execute("PRAGMA index_list(llm_quota)") as cur:
+            idx = {str(r["name"]) for r in await cur.fetchall()}
+        check("idx_quota_scope" in idx, f"重建后索引仍存在（实得 {sorted(idx)}）")
+        # 二次打开不应重复迁移
+        await st3.close()
+        st4 = Store(v1_path)
+        await st4.open()
+        check((await st4.get_usage("user", "10001"))["day"]["used_tokens"] == 600, "重开不会重复累加迁移用量")
+        await st4.close()
 
     print()
     if _failures:

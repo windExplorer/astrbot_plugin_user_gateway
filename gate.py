@@ -1,21 +1,31 @@
 """权限与额度的判定内核。
 
 **纯逻辑、零 IO、不依赖 AstrBot** —— 便于单测，也保证闸门热路径极快：
-插件在启动时把 ``policy`` / ``llm_quota`` 加载进内存字典，每来一次 LLM 请求只做几次
+插件在启动时把规则加载进内存快照（:class:`Rules`），每来一次 LLM 请求只做几次
 dict 查表与整数比较。
 
-判定顺序（PRD §4.1）：
+判定顺序：
 
-    管理员豁免 → 用户级 → 群级 → 全局默认
+    总开关 → 管理员豁免 → 权限 → 额度
 
-额度按「对象 × 周期」逐条比对；一个对象同时配了日/月/累计额度时**全部生效**，
-命中任一即超限（报告最紧凑的那个周期）。``mode=observe`` 时超限只记录不拦截。
+权限与额度共用同一套**档位优先级**（越靠前越具体，命中即生效）：
+
+    好友专属 → 好友等级 → 群专属 → 群等级 → 全局默认
+
+两个关键设计（都是 v0.3.0 引入等级时定下的，勿轻易改动）：
+
+1. **额度「最具体的一层生效」**，而不是「所有层都参与」。
+   否则「全局每人 5 万」会把「VIP 等级每人 50 万」直接废掉 —— 等级就失去了档位意义。
+   命中的那一层内部，日 / 月 / 累计多个周期仍然全部参与（命中任一即超限）。
+2. **等级额度是「每个对象各自的上限」**，不是整组合计。
+   所以判定时用的一定是**该对象自己的**用量计数（``usage_counter``），
+   而不是额度行的已用量（v2 起额度行不再存用量）。
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
 # 周期顺序：越靠前越"紧凑"，超限时优先报告它
@@ -27,6 +37,26 @@ REASON_DISABLED = "disabled"
 REASON_ADMIN = "admin"
 REASON_PERMISSION = "permission"
 REASON_QUOTA = "quota"
+
+# 档位名（与 store.LAYERS 对应）
+LAYER_USER = "user"
+LAYER_USER_LEVEL = "user_level"
+LAYER_GROUP = "group"
+LAYER_GROUP_LEVEL = "group_level"
+LAYER_GLOBAL = "global"
+
+LAYER_LABELS: dict[str, str] = {
+    LAYER_USER: "好友专属",
+    LAYER_USER_LEVEL: "好友等级",
+    LAYER_GROUP: "群专属",
+    LAYER_GROUP_LEVEL: "群等级",
+    LAYER_GLOBAL: "全局默认",
+}
+
+
+def layer_label(layer: str) -> str:
+    """档位的中文名（控制台与日志共用）。"""
+    return LAYER_LABELS.get(layer, layer or "未知")
 
 
 @dataclass(frozen=True)
@@ -40,14 +70,64 @@ class Subject:
     platform_id: str = ""
 
 
+@dataclass(frozen=True)
+class Rules:
+    """判定所需的规则快照。插件在 ``reload_rules()`` 里**整体重建**（不做原地修改）。
+
+    Args:
+        effect_user: ``{uin: allow|deny}`` —— 好友专属权限。
+        effect_group: ``{group_id: allow|deny}`` —— 群专属权限。
+        level_effect: ``{(kind, level_id): allow|deny|inherit}`` —— 等级默认权限。
+        subject_level: ``{scope_type: {scope_id: level_id}}`` —— 对象归级。
+        limits: ``{scope_type: {scope_id: {period: row}}}`` —— 限额规则，
+            ``scope_type`` 为 ``user`` / ``group`` / ``level`` / ``global``。
+        usage: ``{scope_type: {scope_id: {period: row}}}`` —— 用量计数，
+            ``scope_type`` 为 ``user`` / ``group``。
+    """
+
+    effect_user: Mapping[str, str] = field(default_factory=dict)
+    effect_group: Mapping[str, str] = field(default_factory=dict)
+    level_effect: Mapping[Any, str] = field(default_factory=dict)
+    subject_level: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+    limits: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
+    usage: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
+
+    def limits_of(self, scope_type: str, scope_id: str) -> Mapping[str, Mapping[str, Any]]:
+        return (self.limits.get(scope_type) or {}).get(str(scope_id)) or {}
+
+    def usage_of(self, scope_type: str, scope_id: str) -> Mapping[str, Mapping[str, Any]]:
+        return (self.usage.get(scope_type) or {}).get(str(scope_id)) or {}
+
+    def level_id_of(self, scope_type: str, scope_id: str) -> Optional[int]:
+        """对象所属等级 id；未归级返回 None。"""
+        got = (self.subject_level.get(scope_type) or {}).get(str(scope_id))
+        return int(got) if got else None
+
+
+@dataclass(frozen=True)
+class LayerRef:
+    """一个额度档位：去哪找限额、去哪找用量。"""
+
+    layer: str
+    scope_type: str  # user | group | level | global（限额所在）
+    scope_id: str
+    usage_type: str  # user | group（用量所在）
+    usage_id: str
+
+    @property
+    def label(self) -> str:
+        return layer_label(self.layer)
+
+
 @dataclass
 class Verdict:
     """判定结果。``allow=False`` 时插件会拒绝并给出 ``reason``。"""
 
     allow: bool = True
     reason: str = ""
-    # 命中的规则来源
-    scope_type: str = ""  # user | group | global
+    # 命中的档位 / 规则来源
+    layer: str = ""  # user | user_level | group | group_level | global
+    scope_type: str = ""  # user | group | level | global
     scope_id: str = ""
     # 额度相关
     period: str = ""
@@ -58,9 +138,15 @@ class Verdict:
     observed: bool = False
 
     @property
+    def layer_label(self) -> str:
+        return layer_label(self.layer)
+
+    @property
     def detail(self) -> str:
         """给日志/审计用的一句话说明。"""
         parts = [f"reason={self.reason or 'ok'}"]
+        if self.layer:
+            parts.append(f"layer={self.layer}({self.layer_label})")
         if self.scope_type:
             parts.append(f"scope={self.scope_type}:{self.scope_id}")
         if self.period:
@@ -106,60 +192,96 @@ class Gate:
         return eff if eff in ("allow", "deny") else "allow"
 
     # ------------------------------------------------------------------ #
-    # 权限
+    # 档位链
     # ------------------------------------------------------------------ #
-    def resolve_effect(
-        self,
-        subject: Subject,
-        effect_user: Mapping[str, str],
-        effect_group: Mapping[str, str],
-    ) -> tuple[str, str, str]:
-        """按「用户级 > 群级 > 全局默认」解析生效策略。
+    @staticmethod
+    def layers_for(subject: Subject, rules: Rules) -> list[LayerRef]:
+        """按「从具体到兜底」列出该对象适用的档位。
 
-        Returns:
-            ``(effect, scope_type, scope_id)``，effect 为 ``allow`` / ``deny``。
+        私聊：好友专属 → 好友等级 → 全局
+        群聊：好友专属 → 好友等级 → 群专属 → 群等级 → 全局
+        （群聊里也先看人：这是 v0.2 定的优先级，等级只是插进这条链的中间层）
         """
         uid = str(subject.sender_id or "")
         gid = str(subject.group_id or "")
-        if uid and uid in effect_user:
-            return str(effect_user[uid]), "user", uid
-        if gid and gid in effect_group:
-            return str(effect_group[gid]), "group", gid
-        return self.default_effect(), "global", "*"
+        out: list[LayerRef] = []
 
-    def check_permission(
-        self,
-        subject: Subject,
-        effect_user: Mapping[str, str],
-        effect_group: Mapping[str, str],
-    ) -> Verdict:
+        if uid:
+            out.append(LayerRef(LAYER_USER, "user", uid, "user", uid))
+            lv = rules.level_id_of("user", uid)
+            if lv:
+                out.append(LayerRef(LAYER_USER_LEVEL, "level", str(lv), "user", uid))
+        if gid:
+            out.append(LayerRef(LAYER_GROUP, "group", gid, "group", gid))
+            lv = rules.level_id_of("group", gid)
+            if lv:
+                out.append(LayerRef(LAYER_GROUP_LEVEL, "level", str(lv), "group", gid))
+        # 全局：群聊按群用量、私聊按人用量（与 v0.2 的记账口径一致）
+        out.append(
+            LayerRef(LAYER_GLOBAL, "global", "*", "group" if gid else "user", gid or uid)
+        )
+        return out
+
+    # ------------------------------------------------------------------ #
+    # 权限
+    # ------------------------------------------------------------------ #
+    def resolve_effect(self, subject: Subject, rules: Rules) -> tuple[str, str, str, str]:
+        """按档位链解析生效权限。
+
+        Returns:
+            ``(effect, layer, scope_type, scope_id)``；effect 为 ``allow`` / ``deny``。
+            ``layer`` 用于告诉管理员「这条规则是哪儿来的」。
+
+        注意：链上的「等级」只有在等级显式设了 allow / deny（非 inherit）时才截断链条，
+        否则继续往下找更粗的规则 —— 这样「等级只配额度、不管权限」也能正常工作。
+        """
+        for ref in self.layers_for(subject, rules):
+            if ref.layer == LAYER_USER:
+                if ref.scope_id in rules.effect_user:
+                    return str(rules.effect_user[ref.scope_id]), ref.layer, ref.scope_type, ref.scope_id
+            elif ref.layer == LAYER_GROUP:
+                if ref.scope_id in rules.effect_group:
+                    return str(rules.effect_group[ref.scope_id]), ref.layer, ref.scope_type, ref.scope_id
+            elif ref.layer in (LAYER_USER_LEVEL, LAYER_GROUP_LEVEL):
+                kind = "group" if ref.layer == LAYER_GROUP_LEVEL else "user"
+                eff = str(rules.level_effect.get((kind, _as_int(ref.scope_id)), "inherit") or "inherit")
+                if eff in ("allow", "deny"):
+                    return eff, ref.layer, ref.scope_type, ref.scope_id
+        return self.default_effect(), LAYER_GLOBAL, "global", "*"
+
+    def check_permission(self, subject: Subject, rules: Rules) -> Verdict:
         """只判定权限，不看额度。"""
-        effect, scope_type, scope_id = self.resolve_effect(subject, effect_user, effect_group)
+        effect, layer, scope_type, scope_id = self.resolve_effect(subject, rules)
         if effect == "deny":
             return Verdict(
                 allow=False,
                 reason=REASON_PERMISSION,
+                layer=layer,
                 scope_type=scope_type,
                 scope_id=scope_id,
             )
-        return Verdict(allow=True, scope_type=scope_type, scope_id=scope_id)
+        return Verdict(allow=True, layer=layer, scope_type=scope_type, scope_id=scope_id)
 
     # ------------------------------------------------------------------ #
     # 额度
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _quota_hit(rows: Optional[Mapping[str, Mapping[str, Any]]]) -> Optional[dict]:
-        """在某个对象的额度集合里找出第一条被突破的记录（day > month > total）。"""
-        if not rows:
-            return None
+    def quota_hit(
+        limits: Mapping[str, Mapping[str, Any]],
+        usage: Mapping[str, Mapping[str, Any]],
+    ) -> Optional[dict]:
+        """在某一层的额度集合里找出第一条被突破的记录（day > month > total）。
+
+        ``used`` 取自**对象自己的用量计数**（v2 起额度行不存用量）。
+        """
         for period in PERIODS:
-            row = rows.get(period)
+            row = limits.get(period)
             if not row:
                 continue
             limit = _as_int(row.get("limit_tokens"), 0)
             if limit <= 0:  # 0 视为未配置/不限
                 continue
-            used = _as_int(row.get("used_tokens"), 0)
+            used = _as_int((usage.get(period) or {}).get("used_tokens"), 0)
             if used >= limit:
                 return {
                     "period": period,
@@ -169,83 +291,97 @@ class Gate:
                 }
         return None
 
-    def check_quota(
-        self,
-        subject: Subject,
-        quotas_user: Mapping[str, Mapping[str, Mapping[str, Any]]],
-        quotas_group: Mapping[str, Mapping[str, Mapping[str, Any]]],
-    ) -> Verdict:
-        """按用户级、群级依次检查额度；超限时 ``mode=observe`` 仍然放行（标记 observed）。
+    @staticmethod
+    def compact_limit(
+        limits: Mapping[str, Mapping[str, Any]],
+        usage: Mapping[str, Mapping[str, Any]],
+    ) -> dict:
+        """该层「最紧凑」的一条额度（day > month > total）。
 
-        ``quotas_user`` / ``quotas_group`` 的形状是 ``{scope_id: {period: row}}``。
+        与 :meth:`quota_hit` 的区别：未超限时也要能报告「生效的上限是多少」，
+        所以这里不判断是否超限，只挑第一条真正配了上限的周期。
         """
-        uid = str(subject.sender_id or "")
-        gid = str(subject.group_id or "")
+        for period in PERIODS:
+            row = limits.get(period)
+            if not row:
+                continue
+            limit = _as_int(row.get("limit_tokens"), 0)
+            if limit <= 0:  # 0 = 不限，不作为「生效上限」报告
+                continue
+            return {
+                "period": period,
+                "limit": limit,
+                "used": _as_int((usage.get(period) or {}).get("used_tokens"), 0),
+                "mode": str(row.get("mode") or "enforce"),
+            }
+        return {}
 
-        for scope_type, scope_id, table in (
-            ("user", uid, quotas_user),
-            ("group", gid, quotas_group),
-        ):
-            if not scope_id:
+    def check_quota(self, subject: Subject, rules: Rules) -> Verdict:
+        """按档位链找**第一个配置了额度的层**，只用该层判定。
+
+        注意「配置了额度的层」是**结构判断**（该层有没有行），不是「有没有上限」：
+        某一层配了 ``limit_tokens=0``（明确「不限」）时，它会**占住档位**、更粗的层不再参与。
+        这是有意为之 —— 否则「VIP 等级 = 不限」永远会被全局额度先拦掉，等级就失去意义。
+
+        未超限时返回一个带 ``layer`` 与生效上限的「放行」结果，便于控制台/日志说明
+        「当前生效的是哪个额度」。``mode=observe`` 超限仍然放行并标记 ``observed``。
+        """
+        for ref in Gate.layers_for(subject, rules):
+            limits = rules.limits_of(ref.scope_type, ref.scope_id)
+            if not limits:
                 continue
-            hit = self._quota_hit(table.get(scope_id) if table else None)
+            usage = rules.usage_of(ref.usage_type, ref.usage_id)
+            hit = self.quota_hit(limits, usage)
+            base = {
+                "layer": ref.layer,
+                "scope_type": ref.scope_type,
+                "scope_id": ref.scope_id,
+            }
             if not hit:
-                continue
+                return Verdict(allow=True, **base, **self.compact_limit(limits, usage))
             observe = hit["mode"] == "observe"
             return Verdict(
                 allow=observe,  # 观察模式不拦
                 reason=REASON_QUOTA,
-                scope_type=scope_type,
-                scope_id=scope_id,
                 period=hit["period"],
                 limit=hit["limit"],
                 used=hit["used"],
                 mode=hit["mode"],
                 observed=observe,
+                **base,
             )
-        return Verdict(allow=True)
+        return Verdict(allow=True, layer="", scope_type="global", scope_id="*")
 
     # ------------------------------------------------------------------ #
     # 总入口
     # ------------------------------------------------------------------ #
-    def evaluate(
-        self,
-        subject: Subject,
-        effect_user: Optional[Mapping[str, str]] = None,
-        effect_group: Optional[Mapping[str, str]] = None,
-        quotas_user: Optional[Mapping[str, Mapping[str, Mapping[str, Any]]]] = None,
-        quotas_group: Optional[Mapping[str, Mapping[str, Mapping[str, Any]]]] = None,
-    ) -> Verdict:
+    def evaluate(self, subject: Subject, rules: Optional[Rules] = None) -> Verdict:
         """完整判定：插件总开关 → 管理员豁免 → 权限 → 额度。
 
-        放行时也会带回**命中的规则来源**（``scope_type``/``scope_id``），
-        便于 ``debug_log`` 时看清「为什么放行了」。
+        放行时也会带回**命中的档位**，便于 ``debug_log`` 时看清「为什么放行了」。
         """
-        effect_user = effect_user or {}
-        effect_group = effect_group or {}
-        quotas_user = quotas_user or {}
-        quotas_group = quotas_group or {}
+        rules = rules or Rules()
 
         if not self._enabled():
             return Verdict(allow=True, reason=REASON_DISABLED)
 
         if subject.is_admin and self._admin_exempt():
-            return Verdict(allow=True, reason=REASON_ADMIN, scope_type="admin", scope_id="*")
+            return Verdict(allow=True, reason=REASON_ADMIN, layer="admin", scope_type="admin", scope_id="*")
 
-        allowed = Verdict(allow=True, scope_type="global", scope_id="*")
+        allowed = Verdict(allow=True, layer=LAYER_GLOBAL, scope_type="global", scope_id="*")
 
         if self._guard_enabled():
-            perm = self.check_permission(subject, effect_user, effect_group)
+            perm = self.check_permission(subject, rules)
             if not perm.allow:
                 return perm
-            allowed = perm  # 保留「用户级 / 群级 / 全局」命中信息
+            allowed = perm  # 保留「命中了哪一层权限」的信息
 
         if self._quota_enabled():
-            quota = self.check_quota(subject, quotas_user, quotas_group)
-            if not quota.allow:
+            quota = self.check_quota(subject, rules)
+            if not quota.allow or quota.observed:
                 return quota
-            if quota.observed:  # 超限但观察模式：放行，同时把信息带回去记录
-                return quota
+            if quota.layer:  # 有生效额度层且未超限 → 报告它（比权限信息更有用）
+                allowed = quota
 
         return allowed
 

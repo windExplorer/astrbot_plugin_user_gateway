@@ -1,4 +1,4 @@
-"""SQLite 存储层：权限规则、token 额度、用量日志、好友/群缓存。
+"""SQLite 存储层：权限规则、等级、token 额度、用量、好友/群缓存、最后消息。
 
 设计要点（详见 docs/astrbot_plugin_user_gateway_PRD.md §7）：
 
@@ -8,6 +8,11 @@
   避免 Python 侧时区换算带来的边界问题。
 - ``usage_log`` 是统计与明细的唯一事实来源：被拒绝的请求也写一条（``status='denied'``），
   只有真正成功/失败的 LLM 调用写 token 数。
+- **额度与用量分离**（v2）：``llm_quota`` 只存「限额规则」（可能是某个对象专属，也可能是
+  全局/某等级这类模板），``usage_counter`` 存「每个对象每个周期的已用量」。
+  两者分离才能在引入等级后做到「额度模板换一个，既有用量不清零」。
+- 额度解析优先级（最具体的一层生效）：
+  ``user 专属 → 用户等级 → group 专属 → 群等级 → global 全局``。
 - 所有写操作都是幂等 upsert，冷启动与并发同步都安全。
 """
 
@@ -24,7 +29,10 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
     ) from e
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# 额度周期：越靠前越"紧凑"，超限时优先报告它
+PERIODS: tuple[str, ...] = ("day", "month", "total")
 
 SCHEMA_SQL = """
 -- 插件内部 KV（schema_version、上次同步时间等）
@@ -70,20 +78,66 @@ CREATE TABLE IF NOT EXISTS policy (
 );
 CREATE INDEX IF NOT EXISTS idx_policy_scope ON policy(scope_type, scope_id);
 
--- token 额度：period = day | month | total
+-- token 限额规则（v2 起只存「上限」，已用量在 usage_counter）
+-- scope_type: user | group（某对象专属） / level（某等级模板） / global（全局模板，scope_id 固定 '*'）
 CREATE TABLE IF NOT EXISTS llm_quota (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     scope_type   TEXT    NOT NULL,
     scope_id     TEXT    NOT NULL,
     period       TEXT    NOT NULL,
     limit_tokens INTEGER NOT NULL,
-    used_tokens  INTEGER NOT NULL DEFAULT 0,
     mode         TEXT    NOT NULL DEFAULT 'enforce',
     reset_at     INTEGER,
     updated_at   INTEGER NOT NULL,
     UNIQUE (scope_type, scope_id, period)
 );
 CREATE INDEX IF NOT EXISTS idx_quota_scope ON llm_quota(scope_type, scope_id);
+
+-- 自定义等级：私聊与群聊各一套（kind 区分），等级本身可带默认 LLM 权限
+CREATE TABLE IF NOT EXISTS quota_level (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    effect      TEXT    NOT NULL DEFAULT 'inherit',
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL,
+    UNIQUE (kind, name)
+);
+
+-- 对象归级：一个好友/群最多属于一个等级
+CREATE TABLE IF NOT EXISTS subject_level (
+    scope_type TEXT    NOT NULL,
+    scope_id   TEXT    NOT NULL,
+    level_id   INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (scope_type, scope_id)
+);
+CREATE INDEX IF NOT EXISTS idx_subject_level ON subject_level(level_id);
+
+-- 用量计数：每个对象每个周期的已用量（与「是否配了额度」无关，始终累加）
+CREATE TABLE IF NOT EXISTS usage_counter (
+    scope_type  TEXT    NOT NULL,
+    scope_id    TEXT    NOT NULL,
+    period      TEXT    NOT NULL,
+    used_tokens INTEGER NOT NULL DEFAULT 0,
+    reset_at    INTEGER,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (scope_type, scope_id, period)
+);
+
+-- bot 最后一条消息（每个会话一行，覆盖式更新）
+CREATE TABLE IF NOT EXISTS bot_message (
+    scope_type  TEXT    NOT NULL,
+    scope_id    TEXT    NOT NULL,
+    platform_id TEXT    NOT NULL DEFAULT '',
+    ts          INTEGER NOT NULL,
+    kind        TEXT    NOT NULL DEFAULT 'normal',
+    command     TEXT    NOT NULL DEFAULT '',
+    preview     TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (scope_type, scope_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_msg_ts ON bot_message(ts DESC);
 
 -- 用量 / 事件日志
 CREATE TABLE IF NOT EXISTS usage_log (
@@ -148,7 +202,7 @@ class Store:
     # 生命周期
     # ------------------------------------------------------------------ #
     async def open(self) -> None:
-        """建立连接、开启 WAL、建表并记录 schema 版本。可重复调用。"""
+        """建立连接、开启 WAL、建表、跑迁移并记录 schema 版本。可重复调用。"""
         if self._db is not None:
             return
         db = await aiosqlite.connect(self.db_path)
@@ -158,9 +212,85 @@ class Store:
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.execute("PRAGMA foreign_keys=ON")
         self._db = db
+
+        old_version = await self._schema_version(db)
         await db.executescript(SCHEMA_SQL)
+        if old_version < SCHEMA_VERSION:
+            await self._migrate(db, old_version)
         await db.commit()
         await self.set_setting("schema_version", str(SCHEMA_VERSION))
+
+    @staticmethod
+    async def _schema_version(db: aiosqlite.Connection) -> int:
+        """读库里的 schema 版本；`settings` 表还不存在时视为 0（全新库）。"""
+        try:
+            async with db.execute("SELECT value FROM settings WHERE key = 'schema_version'") as cur:
+                row = await cur.fetchone()
+            return int(row["value"]) if row and row["value"] else 0
+        except Exception:
+            return 0
+
+    @staticmethod
+    async def _table_columns(db: aiosqlite.Connection, table: str) -> set[str]:
+        """列出表的所有列名（表不存在时返回空集）。"""
+        try:
+            async with db.execute(f"PRAGMA table_info({table})") as cur:
+                return {str(r["name"]) for r in await cur.fetchall()}
+        except Exception:
+            return set()
+
+    @classmethod
+    async def _migrate(cls, db: aiosqlite.Connection, old_version: int) -> None:
+        """按版本号做结构迁移。每一步都必须可重入（靠列/表存在性判断，而不是靠版本号）。"""
+        if old_version < 2:
+            await cls._migrate_v1_to_v2(db)
+
+    @staticmethod
+    async def _migrate_v1_to_v2(db: aiosqlite.Connection) -> None:
+        """v1 → v2：额度与用量分离。
+
+        v1 的 ``llm_quota.used_tokens`` 同时承担「限额」和「已用量」，引入等级模板后
+        必须拆开（换额度模板不该清空用量），故把已用量搬进 ``usage_counter`` 并重建
+        ``llm_quota`` 去掉该列。
+        """
+        if "used_tokens" not in await Store._table_columns(db, "llm_quota"):
+            return
+        # 1) 已用量迁入 usage_counter（v1 只有 user/group 两种 scope）
+        await db.execute(
+            """
+            INSERT INTO usage_counter(scope_type, scope_id, period, used_tokens, reset_at, updated_at)
+            SELECT scope_type, scope_id, period, used_tokens, reset_at, updated_at
+            FROM llm_quota WHERE used_tokens > 0
+            ON CONFLICT(scope_type, scope_id, period) DO UPDATE SET
+                used_tokens = excluded.used_tokens,
+                reset_at = excluded.reset_at
+            """,
+        )
+        # 2) 重建 llm_quota（去掉 used_tokens 列）。
+        #    注意先 DROP INDEX：SQLite 重命名表时索引会跟着走，不先删掉的话
+        #    新表建索引会因为「同名索引已存在」而被 IF NOT EXISTS 跳过，导致新表没有索引。
+        await db.executescript(
+            """
+            DROP INDEX IF EXISTS idx_quota_scope;
+            ALTER TABLE llm_quota RENAME TO llm_quota_v1;
+            CREATE TABLE llm_quota (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope_type   TEXT    NOT NULL,
+                scope_id     TEXT    NOT NULL,
+                period       TEXT    NOT NULL,
+                limit_tokens INTEGER NOT NULL,
+                mode         TEXT    NOT NULL DEFAULT 'enforce',
+                reset_at     INTEGER,
+                updated_at   INTEGER NOT NULL,
+                UNIQUE (scope_type, scope_id, period)
+            );
+            INSERT INTO llm_quota(id, scope_type, scope_id, period, limit_tokens, mode, reset_at, updated_at)
+                SELECT id, scope_type, scope_id, period, limit_tokens, mode, reset_at, updated_at
+                FROM llm_quota_v1;
+            DROP TABLE llm_quota_v1;
+            CREATE INDEX IF NOT EXISTS idx_quota_scope ON llm_quota(scope_type, scope_id);
+            """,
+        )
 
     async def close(self) -> None:
         """关闭连接（幂等）。"""
@@ -291,21 +421,21 @@ class Store:
         limit_tokens: int,
         mode: str = "enforce",
         reset_at: Optional[int] = None,
-        keep_used: bool = True,
     ) -> None:
-        """新建或更新额度。``keep_used=False`` 时顺带把已用量清零（改额度时用）。"""
+        """新建或更新一条限额规则。
+
+        v2 起这里**只写上限**，已用量在 ``usage_counter``；因此改额度不会清零已用量
+        （要清零请用 :meth:`reset_used`）。``scope_type`` 支持
+        ``user`` / ``group``（对象专属）与 ``level`` / ``global``（模板）。
+        """
         db = self._conn()
-        used = 0
-        if keep_used:
-            old = await self.get_quota(scope_type, scope_id, period)
-            used = int(old["used_tokens"]) if old else 0
         await db.execute(
-            "INSERT INTO llm_quota(scope_type, scope_id, period, limit_tokens, used_tokens, mode, reset_at, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO llm_quota(scope_type, scope_id, period, limit_tokens, mode, reset_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(scope_type, scope_id, period) DO UPDATE SET "
-            "limit_tokens = excluded.limit_tokens, used_tokens = excluded.used_tokens, "
-            "mode = excluded.mode, reset_at = excluded.reset_at, updated_at = excluded.updated_at",
-            (scope_type, str(scope_id), period, int(limit_tokens), used, mode, reset_at, now_ts()),
+            "limit_tokens = excluded.limit_tokens, mode = excluded.mode, "
+            "reset_at = excluded.reset_at, updated_at = excluded.updated_at",
+            (scope_type, str(scope_id), period, int(limit_tokens), mode, reset_at, now_ts()),
         )
         await db.commit()
 
@@ -328,23 +458,38 @@ class Store:
         scope_type: str,
         scope_id: str,
         tokens: int,
-        period: Optional[str] = None,
-    ) -> None:
-        """累加已用量（只更新已存在的额度行，未配置额度则忽略）。
+        reset_at_map: Optional[dict[str, Optional[int]]] = None,
+    ) -> int:
+        """把一次消费累加进 ``usage_counter``（日 / 月 / 累计三个周期各一条）。
 
-        ``period=None`` 时对该对象的**所有周期**一起累加（一条 SQL 搞定，
-        避免每次 LLM 调用按周期发多条 UPDATE）。
+        与 v1 的关键区别：**即使该对象没有任何额度配置也会累加**。因为等级额度与全局额度
+        都是「模板」，判断是否超限时必须用**该对象自己的**用量，所以用量必须无条件记账。
+
+        Args:
+            reset_at_map: ``{period: 重置时间戳}``，仅在**首次创建**该周期计数行时写入；
+                已存在的行不动 ``reset_at``（否则每次调用都会把重置时间往后推，永远不重置）。
+
+        Returns:
+            实际累加的 token 数（``tokens<=0`` 时为 0）。
         """
         if tokens <= 0:
-            return
-        sql = "UPDATE llm_quota SET used_tokens = used_tokens + ?, updated_at = ? WHERE scope_type = ? AND scope_id = ?"
-        args: list[Any] = [int(tokens), now_ts(), scope_type, str(scope_id)]
-        if period:
-            sql += " AND period = ?"
-            args.append(period)
+            return 0
+        reset_at_map = reset_at_map or {}
+        now = now_ts()
+        rows = [
+            (scope_type, str(scope_id), period, int(tokens), reset_at_map.get(period), now)
+            for period in PERIODS
+        ]
         db = self._conn()
-        await db.execute(sql, args)
+        await db.executemany(
+            "INSERT INTO usage_counter(scope_type, scope_id, period, used_tokens, reset_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(scope_type, scope_id, period) DO UPDATE SET "
+            "used_tokens = used_tokens + excluded.used_tokens, updated_at = excluded.updated_at",
+            rows,
+        )
         await db.commit()
+        return int(tokens)
 
     async def reset_used(
         self,
@@ -353,8 +498,8 @@ class Store:
         period: Optional[str] = None,
         reset_at: Optional[int] = None,
     ) -> int:
-        """清零已用量（可按对象/周期过滤），返回受影响行数。"""
-        sql = "UPDATE llm_quota SET used_tokens = 0, updated_at = ?"
+        """清零已用量（可按对象/周期过滤），返回受影响行数。作用于 ``usage_counter``。"""
+        sql = "UPDATE usage_counter SET used_tokens = 0, updated_at = ?"
         args: list[Any] = [now_ts()]
         if reset_at is not None:
             sql += ", reset_at = ?"
@@ -386,6 +531,210 @@ class Store:
             parts.append("period = ?")
             args.append(period)
         return " AND ".join(parts), args
+
+    # ------------------------------------------------------------------ #
+    # 等级（kind=user 的私聊等级 / kind=group 的群聊等级）
+    # ------------------------------------------------------------------ #
+    async def list_levels(self, kind: Optional[str] = None) -> list[dict[str, Any]]:
+        """列出等级；``kind`` 为空时返回私聊+群聊全部（按 kind、排序号）。"""
+        sql = "SELECT * FROM quota_level"
+        args: list[Any] = []
+        if kind:
+            sql += " WHERE kind = ?"
+            args.append(kind)
+        sql += " ORDER BY kind, sort_order, id"
+        async with self._conn().execute(sql, args) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_level(self, level_id: int) -> Optional[dict[str, Any]]:
+        async with self._conn().execute("SELECT * FROM quota_level WHERE id = ?", (int(level_id),)) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def upsert_level(
+        self,
+        kind: str,
+        name: str,
+        description: str = "",
+        effect: str = "inherit",
+        sort_order: int = 0,
+        level_id: Optional[int] = None,
+    ) -> int:
+        """新建 / 更新等级，返回等级 id（``level_id`` 为空则按 ``(kind, name)`` 新建）。"""
+        db = self._conn()
+        if level_id:
+            await db.execute(
+                "UPDATE quota_level SET kind = ?, name = ?, description = ?, effect = ?, "
+                "sort_order = ?, updated_at = ? WHERE id = ?",
+                (kind, name, description, effect, int(sort_order), now_ts(), int(level_id)),
+            )
+            await db.commit()
+            return int(level_id)
+        await db.execute(
+            "INSERT INTO quota_level(kind, name, description, effect, sort_order, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(kind, name) DO UPDATE SET "
+            "description = excluded.description, effect = excluded.effect, "
+            "sort_order = excluded.sort_order, updated_at = excluded.updated_at",
+            (kind, name, description, effect, int(sort_order), now_ts()),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT id FROM quota_level WHERE kind = ? AND name = ?", (kind, name)
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["id"]) if row else 0
+
+    async def delete_level(self, level_id: int) -> None:
+        """删除等级：连带删掉该等级的额度模板与所有归级记录（对象回到「无等级」）。"""
+        db = self._conn()
+        await db.execute("DELETE FROM quota_level WHERE id = ?", (int(level_id),))
+        await db.execute(
+            "DELETE FROM llm_quota WHERE scope_type = 'level' AND scope_id = ?", (str(level_id),)
+        )
+        await db.execute("DELETE FROM subject_level WHERE level_id = ?", (int(level_id),))
+        await db.commit()
+
+    async def level_counts(self) -> dict[int, int]:
+        """每个等级下的对象数量 ``{level_id: count}``（控制台列表展示用）。"""
+        async with self._conn().execute(
+            "SELECT level_id, COUNT(*) AS c FROM subject_level GROUP BY level_id"
+        ) as cur:
+            return {int(r["level_id"]): int(r["c"]) for r in await cur.fetchall()}
+
+    # ------------------------------------------------------------------ #
+    # 对象归级
+    # ------------------------------------------------------------------ #
+    async def subject_level_map(self, scope_type: str) -> dict[str, int]:
+        """取某作用域下 ``{scope_id: level_id}`` 映射（闸门热路径全内存判定用）。"""
+        async with self._conn().execute(
+            "SELECT scope_id, level_id FROM subject_level WHERE scope_type = ?", (scope_type,)
+        ) as cur:
+            return {str(r["scope_id"]): int(r["level_id"]) for r in await cur.fetchall()}
+
+    async def get_subject_level(self, scope_type: str, scope_id: str) -> Optional[int]:
+        async with self._conn().execute(
+            "SELECT level_id FROM subject_level WHERE scope_type = ? AND scope_id = ?",
+            (scope_type, str(scope_id)),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["level_id"]) if row else None
+
+    async def set_subject_level(self, scope_type: str, scope_id: str, level_id: Optional[int]) -> None:
+        """给对象设定等级；``level_id`` 为空表示取消等级（删除记录）。"""
+        db = self._conn()
+        if not level_id:
+            await db.execute(
+                "DELETE FROM subject_level WHERE scope_type = ? AND scope_id = ?",
+                (scope_type, str(scope_id)),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO subject_level(scope_type, scope_id, level_id, updated_at) VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(scope_type, scope_id) DO UPDATE SET "
+                "level_id = excluded.level_id, updated_at = excluded.updated_at",
+                (scope_type, str(scope_id), int(level_id), now_ts()),
+            )
+        await db.commit()
+
+    # ------------------------------------------------------------------ #
+    # 用量计数（与限额规则分离）
+    # ------------------------------------------------------------------ #
+    async def usage_map(self, scope_type: str) -> dict[str, dict[str, dict[str, Any]]]:
+        """取某作用域的用量 ``{scope_id: {period: row}}``（闸门热路径用）。"""
+        async with self._conn().execute(
+            "SELECT * FROM usage_counter WHERE scope_type = ?", (scope_type,)
+        ) as cur:
+            out: dict[str, dict[str, dict[str, Any]]] = {}
+            for r in await cur.fetchall():
+                row = dict(r)
+                out.setdefault(str(row["scope_id"]), {})[str(row["period"])] = row
+            return out
+
+    async def get_usage(self, scope_type: str, scope_id: str) -> dict[str, dict[str, Any]]:
+        """取单个对象的用量 ``{period: row}``。"""
+        async with self._conn().execute(
+            "SELECT * FROM usage_counter WHERE scope_type = ? AND scope_id = ?",
+            (scope_type, str(scope_id)),
+        ) as cur:
+            return {str(r["period"]): dict(r) for r in await cur.fetchall()}
+
+    async def counters_due(self, now: Optional[int] = None) -> list[dict[str, Any]]:
+        """列出 ``reset_at`` 已到期的用量计数行（维护任务据此清零）。"""
+        ts = int(now if now is not None else now_ts())
+        async with self._conn().execute(
+            "SELECT * FROM usage_counter WHERE reset_at IS NOT NULL AND reset_at <= ?", (ts,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    # ------------------------------------------------------------------ #
+    # bot 最后一条消息
+    # ------------------------------------------------------------------ #
+    async def set_bot_message(
+        self,
+        scope_type: str,
+        scope_id: str,
+        kind: str,
+        *,
+        ts: Optional[int] = None,
+        command: str = "",
+        preview: str = "",
+        platform_id: str = "",
+    ) -> None:
+        """记录 bot 在某会话里的最后一条消息（覆盖式，每个会话只留最新一条）。"""
+        if not scope_id:
+            return
+        db = self._conn()
+        await db.execute(
+            "INSERT INTO bot_message(scope_type, scope_id, platform_id, ts, kind, command, preview) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(scope_type, scope_id) DO UPDATE SET "
+            "platform_id = excluded.platform_id, ts = excluded.ts, kind = excluded.kind, "
+            "command = excluded.command, preview = excluded.preview",
+            (
+                scope_type,
+                str(scope_id),
+                platform_id,
+                int(ts if ts is not None else now_ts()),
+                kind,
+                command[:64],
+                preview[:120],
+            ),
+        )
+        await db.commit()
+
+    async def bot_message_summary(self, from_ts: int, to_ts: int) -> dict[str, Any]:
+        """最后消息的类型分布 + 总会话数（总览页展示「bot 最近都在回什么」）。"""
+        db = self._conn()
+        async with db.execute(
+            "SELECT kind, COUNT(*) AS cnt FROM bot_message WHERE ts >= ? AND ts <= ? GROUP BY kind",
+            (int(from_ts), int(to_ts)),
+        ) as cur:
+            kinds = [dict(r) for r in await cur.fetchall()]
+        async with db.execute(
+            "SELECT COUNT(*) AS c, COALESCE(MAX(ts), 0) AS latest FROM bot_message"
+        ) as cur:
+            row = await cur.fetchone()
+        return {
+            "kinds": kinds,
+            "sessions": int(row["c"]) if row else 0,
+            "latest_ts": int(row["latest"]) if row else 0,
+        }
+
+    async def bot_message_map(self, scope_type: str) -> dict[str, dict[str, Any]]:
+        """取某作用域下所有会话的最后消息 ``{scope_id: row}``。"""
+        async with self._conn().execute(
+            "SELECT * FROM bot_message WHERE scope_type = ?", (scope_type,)
+        ) as cur:
+            return {str(r["scope_id"]): dict(r) for r in await cur.fetchall()}
+
+    async def get_bot_message(self, scope_type: str, scope_id: str) -> Optional[dict[str, Any]]:
+        async with self._conn().execute(
+            "SELECT * FROM bot_message WHERE scope_type = ? AND scope_id = ?",
+            (scope_type, str(scope_id)),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
 
     # ------------------------------------------------------------------ #
     # 用量日志

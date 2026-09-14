@@ -115,52 +115,134 @@ def _as_bool(v: Any, default: bool = False) -> bool:
 # 列表上只展示一条，按 day > month > total 取最紧凑的那个。
 _PERIOD_PREF = ("day", "month", "total")
 
+# 档位的中文名（与 gate.py 的文案保持一致；消息类型的文案在前端）
+LAYER_LABELS: dict[str, str] = {
+    "user": "好友专属",
+    "user_level": "好友等级",
+    "group": "群专属",
+    "group_level": "群等级",
+    "global": "全局默认",
+}
 
-def _quota_index(rows: list[dict]) -> dict[str, dict]:
-    """把额度行按 ``scope_id`` 归并为 ``{scope_id: 最优先的那条}``。"""
-    out: dict[str, dict] = {}
+
+def _by_scope(rows: list[dict]) -> dict[str, dict[str, dict]]:
+    """把限额行归并成 ``{scope_id: {period: row}}``。"""
+    out: dict[str, dict[str, dict]] = {}
     for row in rows:
         sid = str(row.get("scope_id") or "")
-        if not sid:
-            continue
-        period = str(row.get("period") or "")
-        rank = _PERIOD_PREF.index(period) if period in _PERIOD_PREF else len(_PERIOD_PREF)
-        cur = out.get(sid)
-        if cur is None:
-            out[sid] = {**row, "_rank": rank}
-            continue
-        if rank < cur.get("_rank", len(_PERIOD_PREF)):
-            out[sid] = {**row, "_rank": rank}
+        if sid:
+            out.setdefault(sid, {})[str(row.get("period"))] = row
     return out
 
 
-def _fmt_group(row: dict, policy: dict[str, str], quota: dict[str, dict], usage: dict[str, int]) -> dict:
-    """把群缓存行补上权限状态、额度与今日用量，供前端表格直接渲染。"""
-    gid = str(row.get("group_id") or "")
-    q = quota.get(gid) or {}
+def _levels_index(rows: list[dict]) -> dict[str, dict[int, dict]]:
+    """``{kind: {level_id: level_row}}``，便于给列表行标等级名。"""
+    out: dict[str, dict[int, dict]] = {"user": {}, "group": {}}
+    for row in rows:
+        try:
+            out.setdefault(str(row.get("kind") or "user"), {})[int(row["id"])] = row
+        except Exception:
+            continue
+    return out
+
+
+def _effective_from_chain(chain: list[dict]) -> dict[str, Any]:
+    """从 ``plugin.quota_chain()`` 的结果里挑出「生效档位」并压成一行展示数据。
+
+    生效规则来自闸门内核（命中最具体的一层即止），这里只做展示层的取值：
+    在该层内按 day > month > total 取第一个真正配了上限的周期。
+
+    Returns:
+        ``{layer, layer_label, period, limit, used, mode}``；没配额度时 ``layer`` 为空串。
+    """
+    for item in chain or []:
+        if not item.get("effective"):
+            continue
+        limits = item.get("limits") or {}
+        usage = item.get("usage") or {}
+        for period in _PERIOD_PREF:
+            row = limits.get(period)
+            if not row:
+                continue
+            limit = int(row.get("limit_tokens") or 0)
+            if limit <= 0:
+                continue
+            layer = str(item.get("layer") or "")
+            return {
+                "layer": layer,
+                "layer_label": LAYER_LABELS.get(layer, str(item.get("label") or layer)),
+                "scope_type": str(item.get("scope_type") or ""),
+                "scope_id": str(item.get("scope_id") or ""),
+                "period": period,
+                "limit": limit,
+                "used": int(usage.get(period) or 0),
+                "mode": str(row.get("mode") or "enforce"),
+                "exceeded": bool(item.get("exceeded")),
+            }
     return {
-        **row,
-        "effect": policy.get(gid, "inherit"),
-        "quota_limit": q.get("limit_tokens"),
-        "quota_used": q.get("used_tokens"),
-        "quota_mode": q.get("mode"),
-        "today_tokens": int(usage.get(gid, 0)),
+        "layer": "",
+        "layer_label": "",
+        "scope_type": "",
+        "scope_id": "",
+        "period": "",
+        "limit": 0,
+        "used": 0,
+        "mode": "",
+        "exceeded": False,
     }
 
 
-def _fmt_friend(row: dict, policy: dict[str, str], quota: dict[str, dict], usage: dict[str, int]) -> dict:
-    """把好友缓存行补上权限状态、额度与今日用量。"""
+def _fmt_group(row: dict, ctx: dict[str, Any]) -> dict:
+    """把群缓存行补上等级、权限、生效额度、今日用量与「最后回复」。"""
+    gid = str(row.get("group_id") or "")
+    lv_id = (ctx["subject_level"].get("group") or {}).get(gid)
+    lv = (ctx["levels"].get("group") or {}).get(int(lv_id)) if lv_id else None
+    q = _effective_from_chain(ctx["plugin"].quota_chain("group", gid))
+    bm = ctx["last_bot"].get(gid) or {}
+    return {
+        **row,
+        "avatar_id": gid,
+        "effect": ctx["policy"].get(gid, "inherit"),
+        "level_id": int(lv_id) if lv_id else None,
+        "level_name": (lv or {}).get("name") or "",
+        "quota": q,
+        "quota_limit": q["limit"] or None,
+        "quota_used": q["used"] if q["limit"] else None,
+        "quota_mode": q["mode"] or None,
+        "quota_layer": q["layer"],
+        "today_tokens": int(ctx["today"].get(gid, 0)),
+        "last_bot_ts": int(bm.get("ts") or 0),
+        "last_bot_kind": str(bm.get("kind") or ""),
+        "last_bot_command": str(bm.get("command") or ""),
+        "last_bot_preview": str(bm.get("preview") or ""),
+    }
+
+
+def _fmt_friend(row: dict, ctx: dict[str, Any]) -> dict:
+    """把好友缓存行补上等级、权限、生效额度、今日用量与「最后回复」。"""
     uin = str(row.get("uin") or "")
-    q = quota.get(uin) or {}
+    lv_id = (ctx["subject_level"].get("user") or {}).get(uin)
+    lv = (ctx["levels"].get("user") or {}).get(int(lv_id)) if lv_id else None
+    q = _effective_from_chain(ctx["plugin"].quota_chain("user", uin))
+    bm = ctx["last_bot"].get(uin) or {}
     return {
         **row,
         "display_name": (row.get("remark") or "").strip() or (row.get("nickname") or "").strip() or uin,
         "avatar": f"https://q1.qlogo.cn/g?b=qq&nk={uin}&s=100",
-        "effect": policy.get(uin, "inherit"),
-        "quota_limit": q.get("limit_tokens"),
-        "quota_used": q.get("used_tokens"),
-        "quota_mode": q.get("mode"),
-        "today_tokens": int(usage.get(uin, 0)),
+        "avatar_id": uin,
+        "effect": ctx["policy"].get(uin, "inherit"),
+        "level_id": int(lv_id) if lv_id else None,
+        "level_name": (lv or {}).get("name") or "",
+        "quota": q,
+        "quota_limit": q["limit"] or None,
+        "quota_used": q["used"] if q["limit"] else None,
+        "quota_mode": q["mode"] or None,
+        "quota_layer": q["layer"],
+        "today_tokens": int(ctx["today"].get(uin, 0)),
+        "last_bot_ts": int(bm.get("ts") or 0),
+        "last_bot_kind": str(bm.get("kind") or ""),
+        "last_bot_command": str(bm.get("command") or ""),
+        "last_bot_preview": str(bm.get("preview") or ""),
     }
 
 
@@ -195,11 +277,50 @@ async def h_ping(plugin) -> dict:
             "rules": {
                 "effect_users": len(getattr(plugin, "_effect_user", {}) or {}),
                 "effect_groups": len(getattr(plugin, "_effect_group", {}) or {}),
-                "quota_users": len(getattr(plugin, "_quota_user", {}) or {}),
-                "quota_groups": len(getattr(plugin, "_quota_group", {}) or {}),
+                "levels": len(getattr(plugin, "_level_effect", {}) or {}),
+                "leveled_users": len(getattr(plugin, "_subject_level_user", {}) or {}),
+                "leveled_groups": len(getattr(plugin, "_subject_level_group", {}) or {}),
+                "limits": sum(len(v) for v in (getattr(plugin, "_limits", {}) or {}).values()),
+                "usage_users": len(getattr(plugin, "_usage_user", {}) or {}),
+                "usage_groups": len(getattr(plugin, "_usage_group", {}) or {}),
             },
+            # 头像缓存概况（抓了多少、占多少、最旧的是什么时候）
+            "avatars": (
+                plugin.avatars.stats() if getattr(plugin, "avatars", None) is not None else {}
+            ),
         },
     )
+
+
+async def _list_ctx(plugin, kind: str) -> dict[str, Any]:
+    """装配列表页要用的映射。
+
+    等级 / 限额 / 用量 / 归级 / 权限这几张都直接取插件**内存里已有的快照**
+    （闸门热路径的同一份数据，reload_rules 时整体重建），避免每翻一页都做十来次查询，
+    也保证「界面上看到的」与「闸门实际用的」完全一致。只有等级名与最后回复需要查库。
+    """
+    store = plugin.store
+    from_ts, to_ts = _today_bounds()
+    return {
+        "plugin": plugin,
+        "levels": _levels_index(await store.list_levels()),
+        "limits": getattr(plugin, "_limits", {}) or {},
+        "usage": {
+            "user": getattr(plugin, "_usage_user", {}) or {},
+            "group": getattr(plugin, "_usage_group", {}) or {},
+        },
+        "subject_level": {
+            "user": getattr(plugin, "_subject_level_user", {}) or {},
+            "group": getattr(plugin, "_subject_level_group", {}) or {},
+        },
+        "policy": (
+            getattr(plugin, "_effect_user", {}) or {}
+            if kind == "user"
+            else getattr(plugin, "_effect_group", {}) or {}
+        ),
+        "last_bot": await store.bot_message_map(kind),
+        "today": await store.usage_sums("sender_id" if kind == "user" else "group_id", from_ts, to_ts),
+    }
 
 
 async def h_get_config(plugin) -> dict:
@@ -264,21 +385,27 @@ async def h_set_config(plugin) -> dict:
 
 
 async def h_overview(plugin) -> dict:
-    """总览统计：区间总量 + 趋势 + 榜单 + 模型占比 + 拒绝原因。"""
+    """总览统计：区间总量 + 趋势 + 榜单 + 模型占比 + 拒绝原因 + bot 回复类型分布。"""
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
     from_ts, to_ts = _range_bounds(_q("range", "7d"), _q("from"), _q("to"))
     data = await plugin.store.summary(from_ts, to_ts)
     data["range_key"] = _q("range", "7d")
+    try:
+        data["bot"] = await plugin.store.bot_message_summary(from_ts, to_ts)
+    except Exception as e:
+        logger.warning(f"[UserGateway] 汇总最后消息失败（忽略）: {e}")
+        data["bot"] = {"kinds": [], "sessions": 0, "latest_ts": 0}
     return ok(data)
 
 
 async def h_friends(plugin) -> dict:
-    """好友列表（含权限状态、额度与今日用量）。
+    """好友列表（含头像、等级、权限、生效额度、今日用量、最后回复）。
 
-    排序支持：``active``（默认，按同步时间）/ ``usage``（今日 token 降序）/
-    ``name``（昵称升序）/ ``qq``（QQ 号升序）。除 ``active`` 外都需要**先取全量再排序分页**，
-    好友量级通常只有数百，整表取回是可接受的（上限 5000 条防爆）。
+    排序：``active``（默认，按同步时间）/ ``usage``（今日 token）/ ``name`` / ``qq`` /
+    ``level``（按等级名）/ ``last``（最近有 bot 回复的排前面）。
+    除 ``active`` 外都需要**先取全量再排序分页**，好友量级通常只有数百，
+    整表取回可接受（上限 5000 条防爆）。``effect`` 可再按权限过滤（同样是全量语义）。
     """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
@@ -287,33 +414,35 @@ async def h_friends(plugin) -> dict:
     size = _qi("size", 50, 1, 500)
     platform = _q("platform") or None
     kw = _q("q")
+    effect_filter = _q("effect")
 
-    if sort in ("usage", "name", "qq"):
+    full = sort in ("usage", "name", "qq", "level", "last") or effect_filter in ("allow", "deny", "inherit")
+    if full:
         res = await plugin.store.list_friends(platform_id=platform, keyword=kw, limit=5000, offset=0)
     else:
         res = await plugin.store.list_friends(
             platform_id=platform, keyword=kw, limit=size, offset=(page - 1) * size
         )
 
-    from_ts, to_ts = _today_bounds()
-    try:
-        usage = await plugin.store.usage_sums("sender_id", from_ts, to_ts)
-    except Exception as e:
-        logger.warning(f"[UserGateway] 聚合今日用量失败（忽略）: {e}")
-        usage = {}
-
-    policy = await plugin.store.effect_map("user")
-    quotas = _quota_index(await plugin.store.list_quotas("user"))
-    rows = [_fmt_friend(r, policy, quotas, usage) for r in res["rows"]]
-
+    ctx = await _list_ctx(plugin, "user")
+    rows = [_fmt_friend(r, ctx) for r in res["rows"]]
     total = res["total"]
+
+    if effect_filter in ("allow", "deny", "inherit"):
+        rows = [r for r in rows if str(r.get("effect") or "inherit") == effect_filter]
+
     if sort == "usage":
         rows.sort(key=lambda r: int(r.get("today_tokens") or 0), reverse=True)
     elif sort == "name":
         rows.sort(key=lambda r: str(r.get("display_name") or ""))
     elif sort == "qq":
         rows.sort(key=lambda r: str(r.get("uin") or ""))
-    if sort in ("usage", "name", "qq"):
+    elif sort == "level":
+        rows.sort(key=lambda r: (str(r.get("level_name") or "~"), str(r.get("display_name") or "")))
+    elif sort == "last":
+        rows.sort(key=lambda r: int(r.get("last_bot_ts") or 0), reverse=True)
+
+    if full:
         total = len(rows)
         rows = rows[(page - 1) * size : page * size]
 
@@ -321,7 +450,7 @@ async def h_friends(plugin) -> dict:
 
 
 async def h_groups(plugin) -> dict:
-    """群列表（含权限状态、额度与今日用量）。排序语义同好友列表。"""
+    """群列表（含群头像、等级、权限、生效额度、今日用量、最后回复）。排序语义同好友列表。"""
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
     sort = _q("sort", "active") or "active"
@@ -329,26 +458,26 @@ async def h_groups(plugin) -> dict:
     size = _qi("size", 50, 1, 500)
     platform = _q("platform") or None
     kw = _q("q")
+    effect_filter = _q("effect")
 
-    if sort in ("usage", "name", "group", "size"):
+    full = (
+        sort in ("usage", "name", "group", "size", "level", "last")
+        or effect_filter in ("allow", "deny", "inherit")
+    )
+    if full:
         res = await plugin.store.list_groups(platform_id=platform, keyword=kw, limit=5000, offset=0)
     else:
         res = await plugin.store.list_groups(
             platform_id=platform, keyword=kw, limit=size, offset=(page - 1) * size
         )
 
-    from_ts, to_ts = _today_bounds()
-    try:
-        usage = await plugin.store.usage_sums("group_id", from_ts, to_ts)
-    except Exception as e:
-        logger.warning(f"[UserGateway] 聚合今日用量失败（忽略）: {e}")
-        usage = {}
-
-    policy = await plugin.store.effect_map("group")
-    quotas = _quota_index(await plugin.store.list_quotas("group"))
-    rows = [_fmt_group(r, policy, quotas, usage) for r in res["rows"]]
-
+    ctx = await _list_ctx(plugin, "group")
+    rows = [_fmt_group(r, ctx) for r in res["rows"]]
     total = res["total"]
+
+    if effect_filter in ("allow", "deny", "inherit"):
+        rows = [r for r in rows if str(r.get("effect") or "inherit") == effect_filter]
+
     if sort == "usage":
         rows.sort(key=lambda r: int(r.get("today_tokens") or 0), reverse=True)
     elif sort == "name":
@@ -357,7 +486,12 @@ async def h_groups(plugin) -> dict:
         rows.sort(key=lambda r: str(r.get("group_id") or ""))
     elif sort == "size":
         rows.sort(key=lambda r: int(r.get("member_count") or 0), reverse=True)
-    if sort in ("usage", "name", "group", "size"):
+    elif sort == "level":
+        rows.sort(key=lambda r: (str(r.get("level_name") or "~"), str(r.get("name") or "")))
+    elif sort == "last":
+        rows.sort(key=lambda r: int(r.get("last_bot_ts") or 0), reverse=True)
+
+    if full:
         total = len(rows)
         rows = rows[(page - 1) * size : page * size]
 
@@ -420,6 +554,14 @@ async def h_subject(plugin) -> dict:
         offset=0,
     )
 
+    # 等级 / 额度档位链 / 用量计数 / 最后回复
+    level_id = await plugin.store.get_subject_level(subject_type, subject_id)
+    level = await plugin.store.get_level(level_id) if level_id else None
+    level_quotas = await plugin.store.list_quotas_of("level", str(level_id)) if level_id else []
+    chain = plugin.quota_chain(subject_type, subject_id)
+    bot = await plugin.store.get_bot_message(subject_type, subject_id)
+    usage = await plugin.store.get_usage(subject_type, subject_id)
+
     return ok(
         {
             "type": subject_type,
@@ -427,6 +569,13 @@ async def h_subject(plugin) -> dict:
             "info": info,
             "effect": effect or "inherit",
             "quotas": quotas,
+            "level_id": level_id,
+            "level": level,
+            "level_quotas": level_quotas,
+            "quota_chain": chain,
+            "quota": _effective_from_chain(chain),
+            "usage": usage,
+            "bot": bot,
             "days": days,
             "stats": stats,
             "today": today.get("totals", {}),
@@ -477,15 +626,44 @@ async def h_set_policy(plugin) -> dict:
 
 
 async def h_get_quota(plugin) -> dict:
-    """读取额度配置。"""
+    """读取限额配置。
+
+    返回的每行会补上 ``used_tokens``：
+    - ``scope_type=user|group``（对象专属）→ 该对象自己的用量计数；
+    - ``scope_type=level|global``（模板）→ ``used_tokens=None``，
+      因为模板是「每个对象各自的上限」，没有单一的合计值（合计口径看总览页）。
+    """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
     rows = await plugin.store.list_quotas(_q("scope_type") or None)
-    return ok({"items": rows})
+    usage = {
+        "user": getattr(plugin, "_usage_user", {}) or {},
+        "group": getattr(plugin, "_usage_group", {}) or {},
+    }
+    out = []
+    for row in rows:
+        st = str(row.get("scope_type") or "")
+        sid = str(row.get("scope_id") or "")
+        period = str(row.get("period") or "")
+        used = None
+        if st in ("user", "group"):
+            used = int(((usage.get(st) or {}).get(sid) or {}).get(period, {}).get("used_tokens") or 0)
+        out.append({**row, "used_tokens": used})
+    return ok({"items": out})
 
 
 async def h_set_quota(plugin) -> dict:
-    """写入额度。body: {scope_type, scope_id, period, limit_tokens, mode?, reset_used?}。"""
+    """写入限额。body: ``{scope_type, scope_id, period, limit_tokens, mode?}`` 或 ``{items: [...]}``。
+
+    ``scope_type`` 支持 ``user`` / ``group``（对象专属）、``level``（等级模板，
+    ``scope_id`` 传等级 id）、``global``（全局模板，``scope_id`` 固定 ``*``）。
+
+    ⚠️ ``limit_tokens`` 的语义（见 ``gate.check_quota`` 的说明）：
+
+    - ``0`` = **明确不限**，该档位仍然「占位」，更粗的档位不再生效
+      （所以「VIP 等级 = 不限」不会被全局额度反手拦掉）；
+    - ``null`` 或 ``delete=true`` = **删掉该周期**，该档位不再占位。
+    """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
     body = await _payload()
@@ -501,35 +679,36 @@ async def h_set_quota(plugin) -> dict:
         scope_id = str(it.get("scope_id") or "").strip()
         period = str(it.get("period") or "day").strip()
         mode = str(it.get("mode") or "enforce").strip()
-        if scope_type not in ("user", "group"):
-            return err("scope_type 必须是 user 或 group")
+        if scope_type not in ("user", "group", "level", "global"):
+            return err("scope_type 必须是 user / group / level / global")
+        if scope_type == "global":
+            scope_id = "*"
         if not scope_id:
             return err("scope_id 不能为空")
         if period not in ("day", "month", "total"):
             return err("period 必须是 day / month / total")
         if mode not in ("enforce", "observe"):
             return err("mode 必须是 enforce / observe")
-        try:
-            limit_tokens = int(it.get("limit_tokens"))
-        except Exception:
-            return err("limit_tokens 必须是整数")
-        if limit_tokens < 0:
-            return err("limit_tokens 不能为负")
 
-        if limit_tokens == 0:
+        raw_limit = it.get("limit_tokens")
+        if _as_bool(it.get("delete"), default=False) or raw_limit is None:
             await plugin.store.delete_quota(scope_type, scope_id, period)
             applied.append({"scope_type": scope_type, "scope_id": scope_id, "period": period, "deleted": True})
             continue
+        try:
+            limit_tokens = int(raw_limit)
+        except Exception:
+            return err("limit_tokens 必须是整数（0 表示不限；null / delete=true 表示删除）")
+        if limit_tokens < 0:
+            return err("limit_tokens 不能为负")
 
-        reset_at = plugin.quota_reset_at(period)
         await plugin.store.upsert_quota(
             scope_type,
             scope_id,
             period,
             limit_tokens,
             mode=mode,
-            reset_at=reset_at,
-            keep_used=not _as_bool(it.get("reset_used"), default=False),
+            reset_at=plugin.quota_reset_at(period),
         )
         applied.append(
             {"scope_type": scope_type, "scope_id": scope_id, "period": period, "limit_tokens": limit_tokens, "mode": mode},
@@ -543,12 +722,19 @@ async def h_set_quota(plugin) -> dict:
 
 
 async def h_reset_quota(plugin) -> dict:
-    """清零已用量。body: {scope_type?, scope_id?, period?}（全空 = 全部清零）。"""
+    """清零已用量（作用于 usage_counter）。
+
+    body: ``{scope_type?, scope_id?, period?}`` —— 全空表示**把所有对象的用量清零**。
+    注意：只会动「用量计数」，不会删掉任何额度配置。
+    """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
     body = await _payload()
+    scope_type = str(body.get("scope_type") or "").strip()
+    if scope_type and scope_type not in ("user", "group"):
+        return err("scope_type 必须是 user / group（留空则全部清零）")
     n = await plugin.store.reset_used(
-        scope_type=str(body.get("scope_type") or "").strip() or None,
+        scope_type=scope_type or None,
         scope_id=str(body.get("scope_id") or "").strip() or None,
         period=str(body.get("period") or "").strip() or None,
     )
@@ -590,6 +776,249 @@ async def h_audit(plugin) -> dict:
 
 
 # ---------------------------------------------------------------------- #
+# 等级 / 归级
+# ---------------------------------------------------------------------- #
+async def h_levels(plugin) -> dict:
+    """等级列表（含每个等级的额度模板与成员数）。``?kind=user|group`` 可只取一类。"""
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    levels = await plugin.store.list_levels(_q("kind") or None)
+    counts = await plugin.store.level_counts()
+    limits = _by_scope(await plugin.store.list_quotas("level"))
+    items = []
+    for lv in levels:
+        lid = int(lv["id"])
+        items.append(
+            {
+                "id": lid,
+                "kind": str(lv.get("kind") or "user"),
+                "name": str(lv.get("name") or ""),
+                "description": str(lv.get("description") or ""),
+                "effect": str(lv.get("effect") or "inherit"),
+                "sort_order": int(lv.get("sort_order") or 0),
+                "members": int(counts.get(lid, 0)),
+                "quotas": limits.get(str(lid), {}),
+            },
+        )
+    return ok({"items": items, "counts": counts})
+
+
+async def h_set_level(plugin) -> dict:
+    """新建 / 更新等级，并可同时写入该等级的额度模板。
+
+    body: ``{id?, kind, name, description?, effect?, sort_order?,
+    quotas?: [{period, limit_tokens, mode?}]}``
+    （``limit_tokens=0`` 表示删掉该周期的额度）
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    body = await _payload()
+    kind = str(body.get("kind") or "user").strip()
+    name = str(body.get("name") or "").strip()
+    effect = str(body.get("effect") or "inherit").strip()
+    if kind not in ("user", "group"):
+        return err("kind 必须是 user 或 group")
+    if not name:
+        return err("等级名称不能为空")
+    if effect not in ("inherit", "allow", "deny"):
+        return err("effect 必须是 inherit / allow / deny（等级默认 LLM 权限）")
+    try:
+        sort_order = int(body.get("sort_order") or 0)
+    except Exception:
+        sort_order = 0
+    try:
+        level_id = int(body["id"]) if body.get("id") else None
+    except Exception:
+        level_id = None
+    if level_id is not None:
+        old = await plugin.store.get_level(level_id)
+        if not old:
+            return err(f"等级 {level_id} 不存在")
+
+    new_id = await plugin.store.upsert_level(
+        kind,
+        name,
+        description=str(body.get("description") or "").strip(),
+        effect=effect,
+        sort_order=sort_order,
+        level_id=level_id,
+    )
+    if not new_id:
+        return err("等级写入失败")
+
+    quotas = body.get("quotas")
+    changed_quota = False
+    if isinstance(quotas, list):
+        for q in quotas:
+            if not isinstance(q, dict):
+                continue
+            period = str(q.get("period") or "").strip()
+            if period not in ("day", "month", "total"):
+                continue
+            mode = str(q.get("mode") or "enforce").strip()
+            if mode not in ("enforce", "observe"):
+                mode = "enforce"
+            if _as_bool(q.get("delete"), default=False) or q.get("limit_tokens") is None:
+                await plugin.store.delete_quota("level", str(new_id), period)
+            else:
+                try:
+                    limit = max(0, int(q.get("limit_tokens")))
+                except Exception:
+                    continue
+                # limit=0 = 明确「不限」：保留该行占住档位（见 h_set_quota 说明）
+                await plugin.store.upsert_quota(
+                    "level",
+                    str(new_id),
+                    period,
+                    limit,
+                    mode=mode,
+                    reset_at=plugin.quota_reset_at(period),
+                )
+            changed_quota = True
+
+    await plugin.store.log_audit(
+        "console",
+        "set_level",
+        json.dumps({"id": new_id, "kind": kind, "name": name, "quotas": changed_quota}, ensure_ascii=False),
+    )
+    await plugin.reload_rules()
+    return ok({"id": new_id})
+
+
+async def h_delete_level(plugin) -> dict:
+    """删除等级（连带清掉它的额度模板与所有归级记录，相关对象回到「无等级」）。"""
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    body = await _payload()
+    try:
+        level_id = int(body.get("id"))
+    except Exception:
+        return err("缺少 id")
+    lv = await plugin.store.get_level(level_id)
+    if not lv:
+        return err(f"等级 {level_id} 不存在")
+    await plugin.store.delete_level(level_id)
+    await plugin.store.log_audit("console", "delete_level", json.dumps({"id": level_id}, ensure_ascii=False))
+    await plugin.reload_rules()
+    return ok({"deleted": level_id})
+
+
+async def h_set_subject_level(plugin) -> dict:
+    """给好友 / 群设置等级。
+
+    body: ``{scope_type, scope_id, level_id}`` 或 ``{items: [...]}``；
+    ``level_id`` 为 0 / null 表示取消等级。
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    body = await _payload()
+    items = body.get("items")
+    if not isinstance(items, list):
+        items = [body]
+
+    applied = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        scope_type = str(it.get("scope_type") or "").strip()
+        scope_id = str(it.get("scope_id") or "").strip()
+        if scope_type not in ("user", "group"):
+            return err("scope_type 必须是 user 或 group")
+        if not scope_id:
+            return err("scope_id 不能为空")
+        raw = it.get("level_id")
+        try:
+            level_id = int(raw) if raw else None
+        except Exception:
+            level_id = None
+        if level_id:
+            lv = await plugin.store.get_level(level_id)
+            if not lv:
+                return err(f"等级 {level_id} 不存在")
+            lv_kind = str(lv.get("kind") or "user")
+            if lv_kind != scope_type:
+                return err(
+                    f"「{lv.get('name')}」是{'好友' if lv_kind == 'user' else '群聊'}等级，"
+                    f"不能用在{'好友' if scope_type == 'user' else '群聊'}上"
+                )
+        await plugin.store.set_subject_level(scope_type, scope_id, level_id)
+        applied.append({"scope_type": scope_type, "scope_id": scope_id, "level_id": level_id})
+
+    if not applied:
+        return err("没有可应用的变化")
+    await plugin.store.log_audit("console", "set_subject_level", json.dumps(applied, ensure_ascii=False))
+    await plugin.reload_rules()
+    return ok({"applied": applied})
+
+
+# ---------------------------------------------------------------------- #
+# 头像
+# ---------------------------------------------------------------------- #
+async def h_avatars(plugin) -> dict:
+    """批量取头像，返回 ``{id: data URI}``（前端直接塞 ``<img src>``）。
+
+    参数：``?type=user|group&ids=1,2,3&force=0&days=30``。
+    只对可见行的 id 按需抓取，抓不到的 id 不会出现在结果里（前端退化为首字母色块）。
+    """
+    cache = getattr(plugin, "avatars", None)
+    if cache is None:
+        return ok({"items": {}, "stats": {}, "error": "头像缓存未初始化"})
+    # 配置页关掉头像时直接返回空（前端退化为首字母色块），逻辑收在服务端、前端不用关心配置
+    if (
+        str(plugin._cfg("avatar_source", "backend") or "backend").strip().lower() == "off"
+        or not _as_bool(plugin._cfg("load_avatars", True), default=True)
+    ):
+        return ok({"items": {}, "stats": cache.stats(), "requested": 0, "got": 0, "disabled": True})
+    kind = _q("type", "user") or "user"
+    if kind not in ("user", "group"):
+        return err("type 必须是 user 或 group")
+    raw = _q("ids")
+    ids = [s.strip() for s in raw.split(",") if s.strip()][:400]
+    if not ids:
+        return ok({"items": {}, "stats": cache.stats(), "requested": 0, "got": 0})
+    force = _q("force").lower() in ("1", "true", "yes", "on")
+    default_days = int(plugin._cfg("avatar_cache_days", 30) or 0)
+    days = _qi("days", default_days, 0, 3650)
+    try:
+        items = await cache.ensure_map(kind, ids, force=force, max_age_days=days)
+    except Exception as e:
+        logger.warning(f"[UserGateway] 取头像失败（忽略）: {e}")
+        items = {}
+    return ok({"items": items, "stats": cache.stats(), "requested": len(ids), "got": len(items)})
+
+
+async def h_avatars_refresh(plugin) -> dict:
+    """更新头像缓存。
+
+    body: ``{type?, ids?: [...]}``；``ids`` 为空表示「把该类型**所有已缓存**的头像重取一遍」
+    （用于好友换了头像之后手动刷新）。
+    """
+    cache = getattr(plugin, "avatars", None)
+    if cache is None:
+        return err("头像缓存未初始化")
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    body = await _payload()
+    kind = str(body.get("type") or "user").strip()
+    if kind not in ("user", "group"):
+        return err("type 必须是 user 或 group")
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids:
+        prefix = "group_" if kind == "group" else "user_"
+        try:
+            ids = [f.stem[len(prefix):] for f in cache.root.glob(f"{prefix}*.img")]
+        except Exception:
+            ids = []
+    if not ids:
+        return ok({"refreshed": 0, "failed": 0, "stats": cache.stats()})
+    got = await cache.ensure(kind, ids, force=True)
+    await plugin.store.log_audit(
+        "console", "refresh_avatars", json.dumps({"type": kind, "n": len(ids)}, ensure_ascii=False)
+    )
+    return ok({"refreshed": len(got), "failed": len(ids) - len(got), "stats": cache.stats()})
+
+
+# ---------------------------------------------------------------------- #
 # 注册
 # ---------------------------------------------------------------------- #
 def _bind(plugin, fn: Callable[[Any], Awaitable[dict]]) -> Callable[[], Awaitable[dict]]:
@@ -622,6 +1051,12 @@ def register_apis(plugin) -> None:
         ("/quota", h_get_quota, ["GET"]),
         ("/quota", h_set_quota, ["POST"]),
         ("/quota/reset", h_reset_quota, ["POST"]),
+        ("/levels", h_levels, ["GET"]),
+        ("/levels", h_set_level, ["POST"]),
+        ("/levels/delete", h_delete_level, ["POST"]),
+        ("/subject-level", h_set_subject_level, ["POST"]),
+        ("/avatars", h_avatars, ["GET"]),
+        ("/avatars/refresh", h_avatars_refresh, ["POST"]),
         ("/usage", h_usage, ["GET"]),
         ("/audit", h_audit, ["GET"]),
     ]

@@ -157,6 +157,44 @@ export interface SummaryData {
   top_scopes: { scope_type: string; scope_id: string; tokens: number; events: number }[];
   by_model: { model: string; tokens: number }[];
   deny_reasons: { reason: string; cnt: number }[];
+  /** bot 最后消息概况（M2）：最近回过话的会话数与类型分布 */
+  bot?: { kinds: { kind: string; cnt: number }[]; sessions: number; latest_ts: number };
+}
+
+/** 「当前生效」的额度档位（与后端闸门的档位链严格一致）。 */
+export interface EffectiveQuota {
+  layer: string;
+  layer_label: string;
+  scope_type: string;
+  scope_id: string;
+  period: string;
+  limit: number;
+  used: number;
+  mode: string;
+  exceeded?: boolean;
+}
+
+/** 额度档位链：从具体到兜底，用于详情抽屉解释「为什么按这条额度算」。 */
+export interface QuotaChainItem {
+  layer: string;
+  label: string;
+  scope_type: string;
+  scope_id: string;
+  limits: Record<string, { limit_tokens: number; mode: string; reset_at: number | null }>;
+  usage: Record<string, number>;
+  effective: boolean;
+  exceeded: boolean;
+}
+
+/** bot 在某个会话里的最后一条消息。 */
+export interface LastBotMessage {
+  scope_type: string;
+  scope_id: string;
+  platform_id: string;
+  ts: number;
+  kind: string;
+  command: string;
+  preview: string;
 }
 
 export interface FriendRow {
@@ -166,11 +204,20 @@ export interface FriendRow {
   remark: string;
   display_name: string;
   avatar: string;
+  avatar_id: string;
   effect: "allow" | "deny" | "inherit";
+  level_id: number | null;
+  level_name: string;
+  quota: EffectiveQuota;
   quota_limit: number | null;
   quota_used: number | null;
   quota_mode: "enforce" | "observe" | null;
+  quota_layer: string;
   today_tokens: number;
+  last_bot_ts: number;
+  last_bot_kind: string;
+  last_bot_command: string;
+  last_bot_preview: string;
   updated_at: number;
 }
 
@@ -181,11 +228,20 @@ export interface GroupRow {
   member_count: number;
   max_member_count: number;
   owner: string;
+  avatar_id: string;
   effect: "allow" | "deny" | "inherit";
+  level_id: number | null;
+  level_name: string;
+  quota: EffectiveQuota;
   quota_limit: number | null;
   quota_used: number | null;
   quota_mode: "enforce" | "observe" | null;
+  quota_layer: string;
   today_tokens: number;
+  last_bot_ts: number;
+  last_bot_kind: string;
+  last_bot_command: string;
+  last_bot_preview: string;
   updated_at: number;
 }
 
@@ -197,15 +253,39 @@ export interface Paged<T> {
   sort?: string;
 }
 
+/** 一条限额规则。``used_tokens``：对象专属 → 该对象用量；模板（level/global）→ null。 */
 export interface QuotaRow {
-  scope_type: string;
+  scope_type: "user" | "group" | "level" | "global";
   scope_id: string;
   period: "day" | "month" | "total";
   limit_tokens: number;
-  used_tokens: number;
+  used_tokens: number | null;
   mode: "enforce" | "observe";
   reset_at: number | null;
   updated_at: number;
+}
+
+/** 自定义等级（好友 / 群各一套）。 */
+export interface LevelRow {
+  id: number;
+  kind: "user" | "group";
+  name: string;
+  description: string;
+  effect: "inherit" | "allow" | "deny";
+  sort_order: number;
+  members: number;
+  quotas: Record<string, { limit_tokens: number; mode: string; reset_at: number | null }>;
+}
+
+/** 等级编辑负载：``quotas`` 里 ``limit_tokens=null`` 或 ``delete=true`` 表示删除该周期。 */
+export interface LevelPayload {
+  id?: number;
+  kind: "user" | "group";
+  name: string;
+  description?: string;
+  effect?: "inherit" | "allow" | "deny";
+  sort_order?: number;
+  quotas?: { period: string; limit_tokens: number | null; mode?: string; delete?: boolean }[];
 }
 
 export interface SubjectTotals {
@@ -233,6 +313,13 @@ export interface SubjectDetail {
   info: FriendRow | GroupRow | null;
   effect: "allow" | "deny" | "inherit";
   quotas: QuotaRow[];
+  level_id: number | null;
+  level: LevelRow | null;
+  level_quotas: QuotaRow[];
+  quota_chain: QuotaChainItem[];
+  quota: EffectiveQuota;
+  usage: Record<string, { used_tokens: number; reset_at: number | null }>;
+  bot: LastBotMessage | null;
   days: number;
   stats: {
     totals: SubjectTotals;
@@ -243,7 +330,7 @@ export interface SubjectDetail {
   recent: Record<string, any>[];
 }
 
-/** 单个对象（好友/群）的详情：基础信息 + 权限 + 额度 + 区间用量与曲线。 */
+/** 单个对象（好友/群）的详情：基础信息 + 权限 + 等级 + 额度档位链 + 区间用量与曲线。 */
 export function apiSubject(type: "user" | "group", id: string, days = 7) {
   return apiGet<SubjectDetail>(`/subject?type=${type}&id=${encodeURIComponent(id)}&days=${days}`);
 }
@@ -257,6 +344,46 @@ export function apiSync() {
     platforms: { platform_id: string; ok: boolean; friends: number; groups: number; error?: string }[];
     error?: string;
   }>("/sync", {}, 60000);
+}
+
+/** 等级列表（含额度模板与成员数）。 */
+export function apiLevels(kind?: "user" | "group") {
+  return apiGet<{ items: LevelRow[]; counts: Record<string, number> }>(
+    `/levels${kind ? `?kind=${kind}` : ""}`,
+  );
+}
+
+export function apiSetLevel(body: LevelPayload) {
+  return apiPost<{ id: number }>("/levels", body, 20000);
+}
+
+export function apiDeleteLevel(id: number) {
+  return apiPost<{ deleted: number }>("/levels/delete", { id });
+}
+
+/** 批量设置等级（``level_id=null`` 表示取消归级）。 */
+export function apiSetSubjectLevel(
+  items: { scope_type: "user" | "group"; scope_id: string; level_id: number | null }[],
+) {
+  return apiPost<{ applied: unknown[] }>("/subject-level", { items });
+}
+
+/** 批量取头像（返回 data URI 映射；只请求需要的 id，失败的不出现）。 */
+export function apiAvatars(kind: "user" | "group", ids: string[], force = false) {
+  const qs = `type=${kind}&ids=${encodeURIComponent(ids.join(","))}${force ? "&force=1" : ""}`;
+  return apiGet<{ items: Record<string, string>; stats: Record<string, any>; got: number }>(
+    `/avatars?${qs}`,
+    45000,
+  );
+}
+
+/** 强制更新头像缓存（``ids`` 省略 = 该类型全部已缓存的重取）。 */
+export function apiRefreshAvatars(kind: "user" | "group", ids?: string[]) {
+  return apiPost<{ refreshed: number; failed: number; stats: Record<string, any> }>(
+    "/avatars/refresh",
+    { type: kind, ids: ids && ids.length ? ids : undefined },
+    120000,
+  );
 }
 
 export interface ConfigPayload {

@@ -1,11 +1,12 @@
 <script setup lang="ts">
-// 群聊：QQ 群列表 + 逐个 / 批量权限管控。
+// 群聊：QQ 群列表 + 等级 / LLM 权限 / 生效额度 / 最后回复，支持逐个与批量管控。
 // 群成员级管控（展开成员列表）按 PRD 排期在 M3，此处预留入口。
 import { computed, h, onMounted, ref } from "vue";
 import {
   NButton,
   NCard,
   NDataTable,
+  NDropdown,
   NEmpty,
   NInput,
   NPagination,
@@ -13,17 +14,31 @@ import {
   NSelect,
   NSpace,
   NTag,
+  NTooltip,
   useMessage,
   type DataTableColumns,
 } from "naive-ui";
 
-import { apiGet, apiPost, apiSync, type GroupRow, type Paged } from "../api";
-import EffectTag from "../components/EffectTag.vue";
+import {
+  apiGet,
+  apiLevels,
+  apiPost,
+  apiRefreshAvatars,
+  apiSetSubjectLevel,
+  apiSync,
+  type GroupRow,
+  type LevelRow,
+  type Paged,
+} from "../api";
+import { dropAvatars, loadAvatars } from "../avatarStore";
+import EffectSegment from "../components/EffectSegment.vue";
+import SubjectAvatar from "../components/SubjectAvatar.vue";
 import SubjectDrawer from "../components/SubjectDrawer.vue";
 
 const message = useMessage();
 const loading = ref(false);
 const syncing = ref(false);
+const refreshingAvatars = ref(false);
 const rows = ref<GroupRow[]>([]);
 const total = ref(0);
 const page = ref(1);
@@ -32,31 +47,66 @@ const keyword = ref("");
 const effectFilter = ref("");
 const sort = ref("active");
 const checked = ref<string[]>([]);
+const levels = ref<LevelRow[]>([]);
+const batchLevelId = ref<number | null>(null);
 
 // 详情抽屉
 const drawerShow = ref(false);
 const drawerId = ref("");
 
-function openDetail(row: GroupRow) {
-  drawerId.value = row.group_id;
-  drawerShow.value = true;
-}
+const levelOptions = computed(() => [
+  { label: "未分组", value: 0 },
+  ...levels.value.map((l) => ({ label: `${l.name}（${l.members}）`, value: l.id })),
+]);
 
 const sortOptions = [
   { label: "最近同步", value: "active" },
+  { label: "最近回复", value: "last" },
   { label: "今日用量", value: "usage" },
   { label: "人数", value: "size" },
   { label: "群名", value: "name" },
+  { label: "等级", value: "level" },
 ];
+
+const KIND_META: Record<string, { text: string; type: "success" | "info" | "default" }> = {
+  llm: { text: "LLM 回复", type: "success" },
+  command: { text: "指令回复", type: "info" },
+  normal: { text: "普通消息", type: "default" },
+};
+
+function kindMeta(kind: string) {
+  return KIND_META[kind] || { text: kind || "未知", type: "default" as const };
+}
+
+function relTime(ts: number): string {
+  if (!ts) return "";
+  const diff = Math.max(0, Date.now() / 1000 - ts);
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`;
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
+async function loadLevels() {
+  try {
+    const res = await apiLevels("group");
+    levels.value = res.items || [];
+  } catch {
+    /* 等级加载失败不阻塞列表 */
+  }
+}
 
 async function load() {
   loading.value = true;
   try {
     const res = await apiGet<Paged<GroupRow>>(
-      `/groups?page=${page.value}&size=${size.value}&sort=${sort.value}&q=${encodeURIComponent(keyword.value)}`,
+      `/groups?page=${page.value}&size=${size.value}&sort=${sort.value}` +
+        `&effect=${encodeURIComponent(effectFilter.value)}&q=${encodeURIComponent(keyword.value)}`,
     );
     rows.value = res.rows || [];
     total.value = res.total || 0;
+    loadAvatars("group", rows.value.map((r) => r.avatar_id || r.group_id));
   } catch (e: any) {
     message.error(e?.message || String(e));
   } finally {
@@ -77,16 +127,28 @@ async function syncNow() {
   }
 }
 
-const filtered = computed(() =>
-  effectFilter.value ? rows.value.filter((r) => r.effect === effectFilter.value) : rows.value,
-);
+async function refreshAvatars() {
+  const ids = rows.value.map((r) => r.avatar_id || r.group_id).filter(Boolean);
+  if (!ids.length) return;
+  refreshingAvatars.value = true;
+  try {
+    const res = await apiRefreshAvatars("group", ids);
+    dropAvatars("group", ids);
+    await load();
+    message.success(`群头像已更新：成功 ${res.refreshed} / 失败 ${res.failed}`);
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    refreshingAvatars.value = false;
+  }
+}
 
 function search() {
   page.value = 1;
   load();
 }
 
-async function applyEffect(items: { scope_id: string; effect: string }[]) {
+async function applyEffect(items: { scope_id: string; effect: string }[], silent = false) {
   if (!items.length) {
     message.warning("请先选择群");
     return;
@@ -95,7 +157,7 @@ async function applyEffect(items: { scope_id: string; effect: string }[]) {
     await apiPost("/policy", {
       items: items.map((i) => ({ scope_type: "group", scope_id: i.scope_id, effect: i.effect, feature: "llm" })),
     });
-    message.success(`已更新 ${items.length} 个群的权限`);
+    if (!silent) message.success(`已更新 ${items.length} 个群的权限`);
     checked.value = [];
     await load();
   } catch (e: any) {
@@ -103,9 +165,40 @@ async function applyEffect(items: { scope_id: string; effect: string }[]) {
   }
 }
 
+async function applyLevel(items: { scope_id: string; level_id: number | null }[]) {
+  if (!items.length) {
+    message.warning("请先选择群");
+    return;
+  }
+  try {
+    await apiSetSubjectLevel(items.map((i) => ({ scope_type: "group", scope_id: i.scope_id, level_id: i.level_id })));
+    message.success(`已更新 ${items.length} 个群的等级`);
+    checked.value = [];
+    batchLevelId.value = null;
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  }
+}
+
+const batchOptions = [
+  { label: "批量放行", key: "allow" },
+  { label: "批量禁止", key: "deny" },
+  { label: "批量恢复继承", key: "inherit" },
+];
+
+async function onBatch(key: string) {
+  await applyEffect(checked.value.map((id) => ({ scope_id: id, effect: key })));
+}
+
 function quotaPercent(row: GroupRow): number {
-  if (!row.quota_limit) return 0;
-  return Math.min(100, Math.round((Number(row.quota_used || 0) / row.quota_limit) * 100));
+  if (!row.quota?.limit) return 0;
+  return Math.min(100, Math.round(((row.quota.used || 0) / row.quota.limit) * 100));
+}
+
+function openDetail(row: GroupRow) {
+  drawerId.value = row.group_id;
+  drawerShow.value = true;
 }
 
 const columns: DataTableColumns<GroupRow> = [
@@ -113,65 +206,126 @@ const columns: DataTableColumns<GroupRow> = [
   {
     title: "群",
     key: "name",
+    minWidth: 190,
     render: (row) =>
       h(
         "div",
         {
-          style: "line-height:1.3;cursor:pointer",
+          style: "display:flex;align-items:center;gap:10px;cursor:pointer",
           title: "点击查看详情",
           onClick: () => openDetail(row),
         },
         [
-          h("div", { style: "font-weight:500" }, row.name || row.group_id),
-          h("div", { style: "font-size:12px;opacity:.65" }, `群号 ${row.group_id}`),
+          h(SubjectAvatar, { kind: "group", id: row.group_id, name: row.name }),
+          h("div", { style: "line-height:1.3" }, [
+            h("div", { style: "font-weight:500" }, row.name || row.group_id),
+            h("div", { style: "font-size:12px;opacity:.65" }, `群号 ${row.group_id}`),
+          ]),
         ],
       ),
   },
   {
+    title: "等级",
+    key: "level_id",
+    width: 130,
+    render: (row) =>
+      h(NSelect, {
+        size: "tiny",
+        value: row.level_id || 0,
+        options: levelOptions.value,
+        consistentMenuWidth: false,
+        onUpdateValue: (v: number) => applyLevel([{ scope_id: row.group_id, level_id: v || null }]),
+      }),
+  },
+  {
+    title: "LLM 权限",
+    key: "effect",
+    width: 195,
+    render: (row) =>
+      h(EffectSegment, { effect: row.effect, onChange: (v: string) => applyEffect([{ scope_id: row.group_id, effect: v }]) }),
+  },
+  {
+    title: "生效额度",
+    key: "quota",
+    width: 200,
+    render: (row) => {
+      const q = row.quota;
+      if (!q || !q.layer) {
+        return h(NTag, { size: "small", bordered: false }, { default: () => "不限量" });
+      }
+      return h("div", { style: "min-width:160px" }, [
+        h("div", { style: "font-size:12px;margin-bottom:2px;display:flex;justify-content:space-between;gap:8px" }, [
+          h("span", [
+            `${(q.used || 0) / 1000 >= 1 ? ((q.used || 0) / 1000).toFixed(1) + "K" : q.used || 0}` +
+              ` / ${(q.limit / 1000).toFixed(0)}K`,
+          ]),
+          h(NTooltip, { trigger: "hover" }, {
+            trigger: () => h(NTag, { size: "tiny", bordered: false, type: q.mode === "observe" ? "warning" : "default" }, { default: () => q.layer_label }),
+            default: () => `生效档位：${q.layer_label}｜周期：${q.period === "day" ? "每日" : q.period === "month" ? "每月" : "累计"}${q.mode === "observe" ? "｜观察模式（只记账不拦截）" : ""}`,
+          }),
+        ]),
+        h(NProgress, {
+          type: "line",
+          percentage: quotaPercent(row),
+          height: 6,
+          showIndicator: false,
+          status: q.exceeded ? "error" : undefined,
+        }),
+      ]);
+    },
+  },
+  {
     title: "今日用量",
     key: "today_tokens",
-    width: 110,
+    width: 95,
     render: (row) => (row.today_tokens ? `${(row.today_tokens / 1000).toFixed(1)}K` : "-"),
   },
   {
     title: "人数",
     key: "member_count",
-    width: 110,
+    width: 90,
     render: (row) =>
       h("span", row.max_member_count ? `${row.member_count} / ${row.max_member_count}` : String(row.member_count || 0)),
   },
-  { title: "LLM 权限", key: "effect", width: 110, render: (row) => h(EffectTag, { effect: row.effect }) },
   {
-    title: "今日额度",
-    key: "quota",
-    width: 220,
-    render: (row) =>
-      row.quota_limit == null
-        ? h(NTag, { size: "small", bordered: false }, { default: () => "未设额度" })
-        : h("div", { style: "min-width:170px" }, [
-            h("div", { style: "font-size:12px;margin-bottom:2px" }, [
-              `${row.quota_used || 0} / ${row.quota_limit}`,
-              row.quota_mode === "observe" ? h("span", { style: "opacity:.6" }, " · 观察") : null,
-            ]),
-            h(NProgress, { type: "line", percentage: quotaPercent(row), height: 6, showIndicator: false }),
+    title: "最后回复",
+    key: "last_bot_ts",
+    width: 140,
+    render: (row) => {
+      if (!row.last_bot_ts) {
+        return h("span", { style: "opacity:.4" }, "无记录");
+      }
+      const meta = kindMeta(row.last_bot_kind);
+      const tip = [
+        new Date(row.last_bot_ts * 1000).toLocaleString(),
+        row.last_bot_command ? `指令：${row.last_bot_command}` : "",
+        row.last_bot_preview || "（无文本预览）",
+      ]
+        .filter(Boolean)
+        .join("\n");
+      return h(NTooltip, { trigger: "hover" }, {
+        trigger: () =>
+          h("div", { style: "line-height:1.35" }, [
+            h("div", { style: "font-size:12px" }, relTime(row.last_bot_ts)),
+            h(NTag, { size: "tiny", bordered: false, type: meta.type }, { default: () => meta.text }),
           ]),
+        default: () => h("span", { style: "white-space:pre-line" }, tip),
+      });
+    },
   },
   {
-    title: "操作",
+    title: "",
     key: "actions",
-    width: 210,
+    width: 70,
     render: (row) =>
-      h(NSpace, { size: 6 }, {
-        default: () => [
-          h(NButton, { size: "tiny", type: row.effect === "allow" ? "primary" : "default", onClick: () => applyEffect([{ scope_id: row.group_id, effect: "allow" }]) }, { default: () => "放行" }),
-          h(NButton, { size: "tiny", type: row.effect === "deny" ? "error" : "default", onClick: () => applyEffect([{ scope_id: row.group_id, effect: "deny" }]) }, { default: () => "禁止" }),
-          h(NButton, { size: "tiny", quaternary: true, onClick: () => applyEffect([{ scope_id: row.group_id, effect: "inherit" }]) }, { default: () => "继承" }),
-        ],
-      }),
+      h(NButton, { size: "tiny", quaternary: true, onClick: () => openDetail(row) }, { default: () => "详情" }),
   },
 ];
 
-onMounted(load);
+onMounted(async () => {
+  await loadLevels();
+  await load();
+});
 </script>
 
 <template>
@@ -189,11 +343,11 @@ onMounted(load);
           v-model:value="keyword"
           size="small"
           placeholder="群号 / 群名"
-          style="width: 180px"
+          style="width: 170px"
           clearable
           @keyup.enter="search"
         />
-        <select v-model="effectFilter" class="plain-select">
+        <select v-model="effectFilter" class="plain-select" @change="search">
           <option value="">全部权限</option>
           <option value="allow">放行</option>
           <option value="deny">禁止</option>
@@ -208,14 +362,27 @@ onMounted(load);
         />
         <n-button size="small" @click="search">搜索</n-button>
         <n-button size="small" :loading="syncing" @click="syncNow">同步列表</n-button>
-        <n-button size="small" type="primary" :disabled="!checked.length" @click="applyEffect(checked.map((id) => ({ scope_id: id, effect: 'allow' })))">
-          批量放行
-        </n-button>
-        <n-button size="small" type="error" ghost :disabled="!checked.length" @click="applyEffect(checked.map((id) => ({ scope_id: id, effect: 'deny' })))">
-          批量禁止
-        </n-button>
+        <n-button size="small" :loading="refreshingAvatars" @click="refreshAvatars">更新头像</n-button>
       </n-space>
     </template>
+
+    <n-space v-if="checked.length" align="center" :size="8" style="margin-bottom: 10px">
+      <span style="font-size: 12px; opacity: 0.7">已选 {{ checked.length }} 个</span>
+      <n-dropdown trigger="click" :options="batchOptions" @select="onBatch">
+        <n-button size="small" type="primary" ghost>批量权限</n-button>
+      </n-dropdown>
+      <n-select
+        v-model:value="batchLevelId"
+        size="small"
+        style="width: 160px"
+        placeholder="批量设置等级…"
+        clearable
+        :options="levelOptions"
+      />
+      <n-button size="small" :disabled="batchLevelId == null" @click="applyLevel(checked.map((id) => ({ scope_id: id, level_id: batchLevelId || null })))">
+        应用等级
+      </n-button>
+    </n-space>
 
     <n-empty v-if="!loading && !total" description="还没有群数据" style="padding: 40px 0">
       <template #extra>
@@ -230,10 +397,11 @@ onMounted(load);
       <n-data-table
         v-model:checked-row-keys="checked"
         :columns="columns"
-        :data="filtered"
+        :data="rows"
         :loading="loading"
         :row-key="(row: GroupRow) => row.group_id"
         :bordered="false"
+        :scroll-x="1140"
         size="small"
       />
       <n-space justify="end" style="margin-top: 12px">

@@ -92,8 +92,33 @@
     "default": 15
   },
   "load_avatars": {
-    "description": "加载 QQ 头像",
-    "hint": "控制台前端会按 QQ 号从腾讯 CDN 拉取头像。内网 / 离线环境下建议关闭，列表会退化为首字母色块。",
+    "description": "显示头像（总开关）",
+    "hint": "关闭后控制台只显示「首字母 / 尾号」色块，不再取任何头像。",
+    "type": "bool",
+    "default": true
+  },
+  "avatar_source": {
+    "description": "头像获取方式",
+    "hint": "backend=后端抓取并缓存到插件数据目录（推荐，离线/内网可用，支持「更新头像」）；cdn=让浏览器直接请求腾讯 CDN（旧行为，需要访问电脑能上外网）；off=等同关闭头像。",
+    "type": "string",
+    "options": ["backend", "cdn", "off"],
+    "default": "backend"
+  },
+  "avatar_cache_days": {
+    "description": "头像缓存天数",
+    "hint": "缓存超过该天数的头像会在下次显示时重新抓取。默认 30 天；设 0 表示永不过期（只能手动「更新头像」）。",
+    "type": "int",
+    "default": 30
+  },
+  "avatar_timeout_sec": {
+    "description": "头像抓取超时（秒）",
+    "hint": "单个头像的下载超时。网络差时可以调大，默认 8。",
+    "type": "int",
+    "default": 8
+  },
+  "track_bot_messages": {
+    "description": "记录 bot 最后一条消息",
+    "hint": "记录 bot 在每个好友/群里的最后一条回复（时间 + 类型：LLM 回复 / 指令回复 / 普通消息），控制台列表据此显示「最后回复」。关闭则列表该列空白。",
     "type": "bool",
     "default": true
   },

@@ -1,35 +1,57 @@
 <script setup lang="ts">
-// QQ 头像：直接请求腾讯 CDN；失败或关闭头像加载时退化为「首字母 / 尾号」色块。
-// 头像不入库、不经后端代理（离线环境下由用户在配置页关闭 avatars 开关）。
+// 头像：优先用后端缓存（data URI，见 avatarStore / avatar.py），没有就退回腾讯 CDN，
+// 再失败（或配置关闭头像）退化为「首字母 / 尾号」色块 —— 三级兜底，任何环境都能看。
 import { computed, ref } from "vue";
 
-const props = defineProps<{
-  qq: string;
-  name?: string;
-  size?: number;
-  enabled?: boolean;
-}>();
+import { avatarOf } from "../avatarStore";
+
+const props = withDefaults(
+  defineProps<{
+    kind?: "user" | "group";
+    /** 好友 QQ 号或群号 */
+    id?: string;
+    /** 兼容旧用法（= id） */
+    qq?: string;
+    name?: string;
+    size?: number;
+    /** 配置页关掉头像时传 false */
+    enabled?: boolean;
+  }>(),
+  { kind: "user", size: 34, enabled: true },
+);
 
 const failed = ref(false);
 
 const size = computed(() => props.size || 34);
+const targetId = computed(() => String(props.id || props.qq || "").trim());
 
+// 后端缓存里有的直接用（离线也能显示）
+const backendSrc = computed(() =>
+  props.enabled === false ? "" : avatarOf(props.kind, targetId.value),
+);
+// 后端还没有 → 试一次腾讯 CDN（失败由 @error 兜底成色块）
+const cdnSrc = computed(() => {
+  if (props.enabled === false || !targetId.value) return "";
+  const q = targetId.value;
+  return props.kind === "group"
+    ? `https://p.qlogo.cn/gh/${q}/${q}/100`
+    : `https://q1.qlogo.cn/g?b=qq&nk=${q}&s=100`;
+});
 const src = computed(() => {
-  if (props.enabled === false) return "";
-  const q = String(props.qq || "").trim();
-  return q ? `https://q1.qlogo.cn/g?b=qq&nk=${q}&s=100` : "";
+  failed.value = false;
+  return backendSrc.value || cdnSrc.value;
 });
 
 const fallbackText = computed(() => {
   const n = (props.name || "").trim();
   if (n) return n.slice(0, 1).toUpperCase();
-  const q = String(props.qq || "");
+  const q = targetId.value;
   return q ? q.slice(-2) : "?";
 });
 
-// 由 QQ 号派生的稳定色相，保证同一个人每次颜色一致
+// 由 id 派生的稳定色相，保证同一个人每次颜色一致
 const bg = computed(() => {
-  const q = String(props.qq || "");
+  const q = targetId.value || (props.name || "");
   let h = 0;
   for (let i = 0; i < q.length; i++) h = (h * 31 + q.charCodeAt(i)) % 360;
   return `hsl(${h}, 52%, 62%)`;

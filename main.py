@@ -42,7 +42,8 @@ if _PLUGIN_DIR not in sys.path:
 
 try:  # 包内相对导入（AstrBot 正常加载路径）
     from . import quota as quota_mod
-    from .gate import Cooldown, Gate, Subject
+    from .avatar import AvatarCache
+    from .gate import Cooldown, Gate, Rules, Subject, layer_label
     from .store import Store
     from .sync import SyncScheduler
     from .webui_api import register_apis
@@ -54,7 +55,8 @@ except ImportError as _rel_err:
     # v0.2.0 就真的这么翻车过，所以这里把两种错误都原样带出来。
     try:
         import quota as quota_mod  # type: ignore
-        from gate import Cooldown, Gate, Subject  # type: ignore
+        from avatar import AvatarCache  # type: ignore
+        from gate import Cooldown, Gate, Rules, Subject, layer_label  # type: ignore
         from store import Store  # type: ignore
         from sync import SyncScheduler  # type: ignore
         from webui_api import register_apis  # type: ignore
@@ -62,12 +64,17 @@ except ImportError as _rel_err:
         raise ImportError(
             "萌萌权限控制台：子模块导入失败。"
             f"相对导入报错 {_rel_err!r}；平铺导入报错 {_flat_err!r}。"
-            "若报错是 No module named 'gate' / 'quota' / 'sync'，说明**安装包少了文件**"
+            "若报错是 No module named 'gate' / 'quota' / 'sync' / 'avatar'，说明**安装包少了文件**"
             "（打包脚本 build_zip.ps1 的 $includeList 未同步新增模块），"
             "请用仓库里最新的 zip 重新安装，或把缺失的 .py 补进插件目录。"
         ) from _flat_err
 
 PLUGIN_NAME = "astrbot_plugin_user_gateway"
+
+# 当前生效的插件实例（发送钩子要用它拿 store）。
+# 用模块级变量而不是闭包捕获插件实例：插件热重载时旧实例会被替换，
+# 闭包会一直抓着已经 terminate() 的旧实例（store 已关闭）。
+_ACTIVE_PLUGIN: "Optional[UserGatewayPlugin]" = None
 
 
 def _read_plugin_version() -> str:
@@ -103,8 +110,15 @@ class UserGatewayPlugin(Star):
         # 闸门热路径用的内存规则缓存（reload_rules() 重建）
         self._effect_user: dict[str, str] = {}
         self._effect_group: dict[str, str] = {}
-        self._quota_user: dict[str, dict[str, dict[str, Any]]] = {}
-        self._quota_group: dict[str, dict[str, dict[str, Any]]] = {}
+        # 等级：{(kind, level_id): effect}、{scope_type: {scope_id: level_id}}
+        self._level_effect: dict[tuple[str, int], str] = {}
+        self._subject_level_user: dict[str, int] = {}
+        self._subject_level_group: dict[str, int] = {}
+        # 限额规则：{scope_type(user|group|level|global): {scope_id: {period: row}}}
+        self._limits: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+        # 用量计数：{scope_type(user|group): {scope_id: {period: row}}}
+        self._usage_user: dict[str, dict[str, dict[str, Any]]] = {}
+        self._usage_group: dict[str, dict[str, dict[str, Any]]] = {}
 
         # M1：判定内核 / 提示冷却 / 后台任务
         self.gate = Gate(self._cfg)
@@ -114,6 +128,11 @@ class UserGatewayPlugin(Star):
         self._inflight: dict[str, dict[str, Any]] = {}
         self._maintenance_task: Optional[asyncio.Task] = None
         self._running = False
+
+        # M2：头像缓存（initialize() 里创建）
+        self.avatars: Optional[AvatarCache] = None
+        # M2：bot 最后消息的乱序保护（流式回复按段发送，可能乱序落库）
+        self._bot_msg_seq: dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -145,8 +164,24 @@ class UserGatewayPlugin(Star):
         except Exception as e:
             logger.error(f"[UserGateway] 控制台路由注册失败: {e}")
 
+        # 头像缓存（抓取 + 落盘）
+        try:
+            self.avatars = AvatarCache(
+                self.data_dir / "avatars",
+                timeout=float(self._cfg("avatar_timeout_sec", 8) or 8),
+                max_age_days=int(self._cfg("avatar_cache_days", 30) or 0),
+            )
+        except Exception as e:
+            logger.warning(f"[UserGateway] 头像缓存初始化失败（头像不可用）: {e}")
+            self.avatars = None
+
         # 把配置里的闸门优先级应用到已注册的钩子上
         self._apply_guard_priority()
+
+        # 「bot 最后一条消息」的记录钩子（patch AstrMessageEvent.send）
+        global _ACTIVE_PLUGIN
+        _ACTIVE_PLUGIN = self
+        self._install_send_hook()
 
         # 后台任务：好友/群定时同步 + 额度过期维护
         self._running = True
@@ -164,14 +199,23 @@ class UserGatewayPlugin(Star):
         )
 
     async def terminate(self) -> None:
-        """停止后台任务并关闭数据库连接。"""
+        """停止后台任务、还原本插件打的补丁、关闭数据库与头像会话。"""
+        global _ACTIVE_PLUGIN
         self._running = False
+        if _ACTIVE_PLUGIN is self:
+            _ACTIVE_PLUGIN = None
+        self._restore_send_hook()
         for task in (self._maintenance_task, getattr(self.scheduler, "_task", None)):
             if task is not None:
                 task.cancel()
         self._maintenance_task = None
         try:
             await self.scheduler.stop()
+        except Exception:
+            pass
+        try:
+            if self.avatars:
+                await self.avatars.close()
         except Exception:
             pass
         try:
@@ -215,9 +259,9 @@ class UserGatewayPlugin(Star):
             logger.warning(f"[UserGateway] 清理超期明细失败（忽略）: {e}")
 
     async def reload_rules(self) -> None:
-        """把权限规则与额度从 SQLite 重新加载进内存缓存（写操作后调用）。
+        """把权限、等级、限额、用量从 SQLite 重新加载进内存（任何写操作后调用）。
 
-        闸门（M1 的 on_llm_request 钩子）只读这些字典，保证热路径无 IO。
+        闸门热路径只读这些字典，保证判定过程**不做任何 SQL**。
         """
         if not (self.store and self.store.ready):
             return
@@ -225,24 +269,55 @@ class UserGatewayPlugin(Star):
             self._effect_user = await self.store.effect_map("user")
             self._effect_group = await self.store.effect_map("group")
 
-            def _group_by_scope(rows: list[dict]) -> dict[str, dict[str, dict[str, Any]]]:
+            # 等级默认权限：{(kind, level_id): effect}
+            self._level_effect = {
+                (str(lv["kind"]), int(lv["id"])): str(lv.get("effect") or "inherit")
+                for lv in await self.store.list_levels()
+            }
+            self._subject_level_user = await self.store.subject_level_map("user")
+            self._subject_level_group = await self.store.subject_level_map("group")
+
+            def _by_scope(rows: list[dict]) -> dict[str, dict[str, dict[str, Any]]]:
                 out: dict[str, dict[str, dict[str, Any]]] = {}
                 for row in rows:
                     out.setdefault(str(row["scope_id"]), {})[str(row["period"])] = row
                 return out
 
-            self._quota_user = _group_by_scope(await self.store.list_quotas("user"))
-            self._quota_group = _group_by_scope(await self.store.list_quotas("group"))
+            # 限额：用户专属 / 群专属 / 等级模板 / 全局模板
+            self._limits = {
+                st: _by_scope(await self.store.list_quotas(st))
+                for st in ("user", "group", "level", "global")
+            }
+            self._usage_user = await self.store.usage_map("user")
+            self._usage_group = await self.store.usage_map("group")
 
             if self._cfg("debug_log", False):
                 logger.info(
-                    f"[UserGateway] 规则已加载: 用户权限 {len(self._effect_user)} 条 / "
-                    f"群权限 {len(self._effect_group)} 条 / "
-                    f"用户额度 {len(self._quota_user)} 条 / 群额度 {len(self._quota_group)} 条",
+                    f"[UserGateway] 规则已加载: 好友权限 {len(self._effect_user)} / "
+                    f"群权限 {len(self._effect_group)} / 等级 {len(self._level_effect)} / "
+                    f"归级 {len(self._subject_level_user)}+{len(self._subject_level_group)} / "
+                    f"限额 {sum(len(v) for v in self._limits.values())} 条 / "
+                    f"用量计数 {len(self._usage_user)}+{len(self._usage_group)} 条"
                 )
         except Exception as e:
             # 加载失败按"没有规则"处理（全部继承默认策略），不影响消息通行
             logger.error(f"[UserGateway] 规则加载失败（按无规则处理）: {e}")
+
+    def _rules(self) -> Rules:
+        """组装判定快照（给 Gate 用）。
+
+        性能说明：这里只做 **引用拼装**（6 个 dict，不复制内容），所以每次 LLM 请求
+        都构造一次也几乎零开销；写操作后 ``reload_rules()`` 会整体替换这些字典对象，
+        因此不存在「快照过期」的问题。
+        """
+        return Rules(
+            effect_user=self._effect_user,
+            effect_group=self._effect_group,
+            level_effect=self._level_effect,
+            subject_level={"user": self._subject_level_user, "group": self._subject_level_group},
+            limits=self._limits,
+            usage={"user": self._usage_user, "group": self._usage_group},
+        )
 
     @staticmethod
     def quota_reset_at(period: str, now: Optional[datetime] = None) -> Optional[int]:
@@ -294,16 +369,13 @@ class UserGatewayPlugin(Star):
             if not (self.store and self.store.ready):
                 return  # fail-open：数据库不可用时不拦任何请求
             subject = self._subject_of(event)
-            verdict = self.gate.evaluate(
-                subject,
-                self._effect_user,
-                self._effect_group,
-                self._quota_user,
-                self._quota_group,
-            )
+            verdict = self.gate.evaluate(subject, self._rules())
             self._mark_request(event, req)
 
             if verdict.allow:
+                # 给事件打标：本条消息确实走了 LLM。
+                # 下面记录 bot 最后消息的 send 钩子据此把回复归类为「LLM 消息」。
+                event.set_extra("_ugw_llm", True)
                 if verdict.observed:
                     # 观察模式：本该被拦但放行，记一条流水便于灰度评估
                     await self._log_denied(subject, verdict, blocked=False)
@@ -440,48 +512,156 @@ class UserGatewayPlugin(Star):
         if total <= 0 or not self._cfg("quota_enabled", True):
             return
 
-        # 累加额度（未配置额度的对象是 no-op），并同步内存缓存让下一次判定立刻看到新用量
+        # 累加用量计数（v2 起**无条件**记账：等级/全局额度都是模板，必须用对象自己的用量判定）
+        reset_at_map = {p: quota_mod.next_reset_at(p) for p in quota_mod.PERIODS}
         warns: list[dict] = []
         for st, sid in (("user", subject.sender_id), ("group", subject.group_id)):
             if not sid:
                 continue
             try:
-                await self.store.add_used(st, sid, total)
+                await self.store.add_used(st, sid, total, reset_at_map=reset_at_map)
             except Exception as e:
-                logger.warning(f"[UserGateway] 累加额度失败（忽略）: {e}")
-            warns.extend(self._bump_memory_quota(st, sid, total))
+                logger.warning(f"[UserGateway] 累加用量失败（忽略）: {e}")
+            warns.extend(self._bump_memory_usage(st, sid, total))
 
         if warns and self._cfg("notify_admin", False):
             await self._notify_admins(
                 "额度预警：" + "；".join(
-                    f"{w['scope_type']}:{w['scope_id']} {w['period']} 已用 "
+                    f"{'群' if w['scope_type'] == 'group' else '好友'}{w['scope_id']}"
+                    f"（{layer_label(w.get('layer', ''))}）{w['period']} 已用 "
                     f"{w['used']}/{w['limit']}（{w['percent']}%）"
                     for w in warns
                 ),
                 subject.platform_id,
             )
 
-    def _bump_memory_quota(self, scope_type: str, scope_id: str, tokens: int) -> list[dict]:
-        """把刚消费的 token 同步进内存额度缓存，返回本次新触发的预警列表。"""
-        table = self._quota_user if scope_type == "user" else self._quota_group
-        rows = table.get(scope_id)
-        if not rows:
+    def quota_chain(self, scope_type: str, scope_id: str) -> list[dict[str, Any]]:
+        """列出某对象适用的**全部额度档位**（含每层限额、用量、是否生效/超限）。
+
+        控制台用它展示「这个人现在到底按哪条额度算」；与闸门判定共用
+        ``gate.layers_for`` 与 ``gate.quota_hit``，保证界面显示的生效档位
+        就是真正在生效的那一个（避免两套优先级逻辑漂移）。
+
+        Returns:
+            每项形如 ``{layer, label, scope_type, scope_id, limits, usage, effective, exceeded}``；
+            ``limits`` / ``usage`` 都是 ``{period: ...}`` 形式。
+        """
+        try:
+            subject = Subject(sender_id=scope_id) if scope_type == "user" else Subject(group_id=scope_id)
+            rules = self._rules()
+            refs = self.gate.layers_for(subject, rules)
+        except Exception:
             return []
+        out: list[dict[str, Any]] = []
+        taken = False  # 已经命中最具体的一层 → 更粗的层不再参与
+        for ref in refs:
+            rows = dict(rules.limits_of(ref.scope_type, ref.scope_id))
+            raw_usage = rules.usage_of(ref.usage_type, ref.usage_id)
+            limits = {
+                period: {
+                    "limit_tokens": int((row or {}).get("limit_tokens") or 0),
+                    "mode": str((row or {}).get("mode") or "enforce"),
+                    "reset_at": (row or {}).get("reset_at"),
+                }
+                for period, row in rows.items()
+                if int((row or {}).get("limit_tokens") or 0) > 0
+            }
+            usage = {
+                period: int((raw_usage.get(period) or {}).get("used_tokens") or 0)
+                for period in ("day", "month", "total")
+            }
+            hit = self.gate.quota_hit(rows, raw_usage) if rows else None
+            effective = bool(limits) and not taken
+            if effective:
+                taken = True
+            out.append(
+                {
+                    "layer": ref.layer,
+                    "label": ref.label,
+                    "scope_type": ref.scope_type,
+                    "scope_id": ref.scope_id,
+                    "limits": limits,
+                    "usage": usage,
+                    "effective": effective,
+                    "exceeded": bool(hit),
+                    "hit": hit or {},
+                },
+            )
+        return out
+
+    def _effective_limit(self, scope_type: str, scope_id: str) -> Optional[tuple[str, dict]]:
+        """取某对象**生效**的那一层限额 ``(layer, {period: row})``（与 Gate 档位链一致）。
+
+        仅用于额度预警文案（闸门判定另有 Gate.check_quota，两者顺序必须一致）。
+        """
+        sid = str(scope_id or "")
+        if not sid:
+            return None
+        if scope_type == "user":
+            chain = [
+                ("user", "user", sid),
+                ("user_level", "level", str(self._subject_level_user.get(sid) or "")),
+            ]
+        else:
+            chain = [
+                ("group", "group", sid),
+                ("group_level", "level", str(self._subject_level_group.get(sid) or "")),
+            ]
+        chain.append(("global", "global", "*"))
+        for layer, st, sid2 in chain:
+            if not sid2:
+                continue
+            limits = (self._limits.get(st) or {}).get(sid2) or {}
+            if limits:
+                return layer, limits
+        return None
+
+    def _bump_memory_usage(self, scope_type: str, scope_id: str, tokens: int) -> list[dict]:
+        """把刚消费的 token 同步进内存用量计数，返回本次新触发的额度预警。
+
+        用量计数表在内存里按需创建，保证下一次闸门判定立刻看到新用量
+        （不必等下一次 reload_rules）。
+        """
+        if tokens <= 0:
+            return []
+        table = self._usage_user if scope_type == "user" else self._usage_group
+        rows = table.setdefault(str(scope_id), {})
+        before: dict[str, int] = {}
+        for period in quota_mod.PERIODS:
+            row = rows.get(period)
+            if row is None:
+                row = {
+                    "scope_type": scope_type,
+                    "scope_id": str(scope_id),
+                    "period": period,
+                    "used_tokens": 0,
+                    "reset_at": None,
+                }
+                rows[period] = row
+            before[period] = int(row.get("used_tokens") or 0)
+            row["used_tokens"] = before[period] + tokens
+
+        found = self._effective_limit(scope_type, scope_id)
+        if not found:
+            return []
+        layer, limits = found
         ratio = float(self._cfg("warn_ratio", 0.8) or 0)
         warns: list[dict] = []
-        for period, row in rows.items():
-            before = int(row.get("used_tokens") or 0)
-            after = before + tokens
-            row["used_tokens"] = after
+        for period in quota_mod.PERIODS:
+            row = limits.get(period)
+            if not row:
+                continue
             limit = int(row.get("limit_tokens") or 0)
             if limit <= 0:
                 continue
+            after = before[period] + tokens
             # 只在「跨过阈值的那一刻」报一次，避免每次调用都刷屏
-            if quota_mod.should_warn(after, limit, ratio) and not quota_mod.should_warn(before, limit, ratio):
+            if quota_mod.should_warn(after, limit, ratio) and not quota_mod.should_warn(before[period], limit, ratio):
                 warns.append(
                     {
                         "scope_type": scope_type,
                         "scope_id": scope_id,
+                        "layer": layer,
                         "period": period,
                         "used": after,
                         "limit": limit,
@@ -580,15 +760,16 @@ class UserGatewayPlugin(Star):
                 logger.warning(f"[UserGateway] 维护任务异常（忽略）: {e}")
 
     async def _reset_stale_quotas(self) -> None:
-        """按 ``reset_at`` 清零过期额度（日/月周期），并重建内存缓存。"""
+        """按 ``reset_at`` 清零到期的用量计数（日 / 月周期），并重建内存缓存。
+
+        v2 起用量在 ``usage_counter``，额度行不再自带用量，所以重置的对象是计数行。
+        """
         if not (self.store and self.store.ready):
             return
-        rows = await self.store.list_quotas()
         now = int(time.time())
+        rows = await self.store.counters_due(now)
         reset_count = 0
         for row in rows:
-            if not quota_mod.is_stale(row.get("reset_at"), now):
-                continue
             period = str(row.get("period") or "")
             try:
                 await self.store.reset_used(
@@ -599,7 +780,147 @@ class UserGatewayPlugin(Star):
                 )
                 reset_count += 1
             except Exception as e:
-                logger.warning(f"[UserGateway] 重置额度失败（忽略）: {e}")
+                logger.warning(f"[UserGateway] 重置用量失败（忽略）: {e}")
         if reset_count:
-            logger.info(f"[UserGateway] 已重置 {reset_count} 条到期额度")
+            logger.info(f"[UserGateway] 已重置 {reset_count} 条到期用量计数")
             await self.reload_rules()
+
+    # ------------------------------------------------------------------ #
+    # M2：记录 bot 最后一条消息（控制台「最后回复」列的数据来源）
+    # ------------------------------------------------------------------ #
+    def _install_send_hook(self) -> None:
+        """给 ``AstrMessageEvent.send`` 挂上记录钩子（幂等，可重复调用）。
+
+        为什么不用官方的 ``@filter.after_message_sent``：该钩子只在 respond 阶段的
+        **非流式**路径触发（``respond/stage.py`` 里空消息链、流式结果、重复文本等多处
+        提前 return），拿不到 ① 流式回复；② 插件里直接 ``await event.send(...)`` 的主动
+        发送（本插件自己的拦截提示就属于这一类）。
+        而 ``send()`` 是所有适配器最终都会经过的公共出口（aiocqhttp 的 ``send()``
+        末尾同样是 ``await super().send(...)``），在这里记录覆盖最全。
+
+        钩子只做「读事件 + 写一行小表」，且整体包在 try 里：记录失败绝不影响发送。
+        """
+        try:
+            from astrbot.core.platform.astr_message_event import AstrMessageEvent as _Event
+        except Exception as e:
+            logger.warning(f"[UserGateway] 无法安装发送记录钩子（最后回复将不可见）: {e}")
+            return
+        if getattr(_Event.send, "_ugw_hooked", False):
+            return
+        original = _Event.send
+
+        async def _send_with_record(self, message, *args, **kwargs):
+            plugin = _ACTIVE_PLUGIN
+            if plugin is not None:
+                try:
+                    await plugin._record_bot_message(self, message)
+                except Exception as e:  # 记录失败绝不阻断发送
+                    logger.debug(f"[UserGateway] 记录最后消息失败（忽略）: {e}")
+            return await original(self, message, *args, **kwargs)
+
+        _send_with_record._ugw_hooked = True  # type: ignore[attr-defined]
+        _send_with_record._ugw_original = original  # type: ignore[attr-defined]
+        _Event.send = _send_with_record  # type: ignore[method-assign]
+        logger.info("[UserGateway] 已挂载「bot 最后消息」记录钩子（AstrMessageEvent.send）")
+
+    @staticmethod
+    def _restore_send_hook() -> None:
+        """还原 ``AstrMessageEvent.send``（插件卸载 / 重载时调用）。"""
+        try:
+            from astrbot.core.platform.astr_message_event import AstrMessageEvent as _Event
+
+            original = getattr(getattr(_Event, "send", None), "_ugw_original", None)
+            if original is not None:
+                _Event.send = original  # type: ignore[method-assign]
+        except Exception:
+            pass
+
+    @staticmethod
+    def _classify_reply(event: AstrMessageEvent) -> tuple[str, str]:
+        """判断这条 bot 消息属于哪一类：``llm`` / ``command`` / ``normal``。
+
+        依据（都用「事件上的既有标记」，不猜文本）：
+
+        - ``llm``：本插件在 ``on_llm_request`` 里给事件打了 ``_ugw_llm`` 标，
+          只有真的要走 LLM 才会打标；
+        - ``command``：waking 阶段会把命中的 handler 写进 ``activated_handlers``
+          （``waking_check/stage.py:253``），带指令过滤器的就是指令消息；
+        - 其余（其它插件主动推送、关键词回复等）算 ``normal``。
+
+        这里按**类名**判断过滤器类型而不是 import AstrBot 的过滤器类，跨版本更稳。
+        """
+        try:
+            if event.get_extra("_ugw_llm", False):
+                return "llm", ""
+        except Exception:
+            pass
+        try:
+            handlers = event.get_extra("activated_handlers") or []
+        except Exception:
+            handlers = []
+        for h in handlers:
+            for f in getattr(h, "event_filters", []) or []:
+                if type(f).__name__ in ("CommandFilter", "CommandGroupFilter"):
+                    return "command", str(getattr(f, "command_name", "") or "")
+        return "normal", ""
+
+    @staticmethod
+    def _chain_preview(chain: Any) -> str:
+        """把消息链压成一句预览：有文本取文本，纯富媒体给 ``[Image]`` 之类的占位。"""
+        try:
+            comps = list(getattr(chain, "chain", None) or [])
+        except Exception:
+            return ""
+        texts: list[str] = []
+        for comp in comps:
+            t = getattr(comp, "text", None)
+            if isinstance(t, str) and t.strip():
+                texts.append(t.strip())
+        if texts:
+            return " ".join(texts)[:120]
+        names = [type(c).__name__ for c in comps]
+        return ("[" + "/".join(names[:3]) + "]") if names else ""
+
+    async def _record_bot_message(self, event: AstrMessageEvent, chain: Any) -> None:
+        """记录「bot 在某会话里的最后一条消息 + 类型」（每个会话只留最新一条）。"""
+        if not (self.store and self.store.ready):
+            return
+        if not self._cfg("track_bot_messages", True):
+            return
+        try:
+            gid = str(event.get_group_id() or "")
+        except Exception:
+            gid = ""
+        try:
+            sid = str(event.get_sender_id() or "")
+        except Exception:
+            sid = ""
+        # 私聊记在对方（好友）名下，群聊记在群名下
+        scope_type, scope_id = ("group", gid) if gid else ("user", sid)
+        if not scope_id:
+            return
+        try:
+            platform_id = str(event.get_platform_id() or "")
+        except Exception:
+            platform_id = ""
+
+        kind, command = self._classify_reply(event)
+        ts = int(time.time())
+
+        # 流式回复按段多次调用 send，可能乱序到达 → 只接受更晚的时间戳
+        key = f"{scope_type}:{scope_id}"
+        if ts < self._bot_msg_seq.get(key, 0):
+            return
+        if len(self._bot_msg_seq) > 5000:  # 防御性清理，避免长期运行内存增长
+            self._bot_msg_seq.clear()
+        self._bot_msg_seq[key] = ts
+
+        await self.store.set_bot_message(
+            scope_type,
+            scope_id,
+            kind,
+            ts=ts,
+            command=command,
+            preview=self._chain_preview(chain),
+            platform_id=platform_id,
+        )

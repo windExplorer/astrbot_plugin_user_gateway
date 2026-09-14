@@ -33,7 +33,8 @@ const GROUPS: { name: string; hint: string; keys: string[] }[] = [
   { name: "策略", hint: "默认放行还是默认禁止、管理员是否豁免", keys: ["default_effect", "admin_exempt"] },
   { name: "拒绝行为", hint: "被拦截时如何提示用户与管理员", keys: ["deny_notice", "silent", "notice_cooldown_sec", "notify_admin"] },
   { name: "额度", hint: "token 限额的计数口径与工作模式", keys: ["quota_mode", "count_cached_tokens", "warn_ratio"] },
-  { name: "同步", hint: "好友 / 群列表的同步与头像加载", keys: ["sync_interval_min", "sync_timeout_sec", "load_avatars"] },
+  { name: "同步", hint: "好友 / 群列表的同步与头像", keys: ["sync_interval_min", "sync_timeout_sec", "load_avatars", "avatar_source", "avatar_cache_days", "avatar_timeout_sec"] },
+  { name: "最后回复", hint: "记录 bot 在每个好友 / 群里的最后一条回复", keys: ["track_bot_messages"] },
   { name: "统计", hint: "用量明细的保留策略", keys: ["retention_days"] },
   { name: "高级", hint: "排查问题时才需要改", keys: ["guard_priority", "debug_log"] },
 ];
