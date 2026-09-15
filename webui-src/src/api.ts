@@ -138,6 +138,13 @@ export interface PingInfo {
   };
   /** 头像缓存概况 */
   avatars?: Record<string, any>;
+  /** 指令权限概况 */
+  commands?: {
+    enabled: boolean;
+    default_effect: "allow" | "deny";
+    priority: number;
+    rules: number;
+  };
   /** 模型路由概况（熔断中的提供商会列在这里） */
   model_route?: {
     enabled: boolean;
@@ -394,6 +401,58 @@ export function apiSync() {
 }
 
 /** 等级列表（含额度模板与成员数）。 */
+/** 一条已注册的指令（AstrBot handler 注册表里带指令过滤器的处理器）。 */
+export interface CommandRow {
+  name: string;
+  aliases: string[];
+  desc: string;
+  plugin: string;
+  handler: string;
+  is_group: boolean;
+  /** 该指令的全局策略（inherit = 未配置，按「指令默认策略」走） */
+  global_effect: "allow" | "deny" | "inherit";
+  /** 例外规则（好友 / 群） */
+  rules: { scope_type: "user" | "group"; scope_id: string; effect: "allow" | "deny" | "inherit" }[];
+  rule_count: number;
+}
+
+export interface CommandsPayload {
+  items: CommandRow[];
+  default_effect: "allow" | "deny";
+  enabled: boolean;
+  priority: number;
+  /** 规则里引用了但已经不存在（指令被卸载）的指令名 */
+  stale: string[];
+}
+
+/** 指令清单 + 每条指令的权限规则。 */
+export function apiCommands() {
+  return apiGet<CommandsPayload>("/commands");
+}
+
+/** 清理已失效的指令规则（指令被卸载后残留）。 */
+export function apiPruneCommands() {
+  return apiPost<{ deleted: number; alive: number }>("/commands/prune", {});
+}
+
+export interface PolicyItem {
+  scope_type: "user" | "group" | "global";
+  scope_id: string;
+  effect: "allow" | "deny" | "inherit";
+  feature: string;
+}
+
+/** 批量写权限规则（LLM 用 feature="llm"，指令用 feature="command:<指令名>"）。 */
+export function apiSetPolicy(items: PolicyItem[]) {
+  return apiPost<{ applied: unknown[] }>("/policy", { items });
+}
+
+/** 读取某 feature 的规则。 */
+export function apiGetPolicy(feature: string, scopeType?: "user" | "group") {
+  const qs = `feature=${encodeURIComponent(feature)}${scopeType ? `&scope_type=${scopeType}` : ""}`;
+  return apiGet<{ items: Record<string, any>[] }>(`/policy?${qs}`);
+}
+
 /** 可用的对话模型提供商（等级里选「走哪个模型」）。 */
 export function apiProviders() {
   return apiGet<{ items: ProviderRow[]; circuit_open: string[]; route_enabled: boolean }>("/providers");

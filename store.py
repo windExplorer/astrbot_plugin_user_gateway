@@ -34,6 +34,24 @@ SCHEMA_VERSION = 4
 # 额度周期：越靠前越"紧凑"，超限时优先报告它
 PERIODS: tuple[str, ...] = ("day", "month", "total")
 
+# policy 表的 feature 维度：
+#   llm              → LLM 对话权限
+#   command:<指令名>  → 某条指令的权限（指令名取 AstrBot 注册表里的完整主名，
+#                      形如 "帮助" / "群管 禁言"，别名不单独建键）
+LLM_FEATURE = "llm"
+COMMAND_FEATURE_PREFIX = "command:"
+
+
+def command_feature(command: str) -> str:
+    """指令权限在 ``policy.feature`` 里的键。"""
+    return f"{COMMAND_FEATURE_PREFIX}{str(command or '').strip()}"
+
+
+def command_of_feature(feature: str) -> str:
+    """从 feature 键反解指令名（不是指令 feature 时返回空串）。"""
+    text = str(feature or "")
+    return text[len(COMMAND_FEATURE_PREFIX) :] if text.startswith(COMMAND_FEATURE_PREFIX) else ""
+
 SCHEMA_SQL = """
 -- 插件内部 KV（schema_version、上次同步时间等）
 CREATE TABLE IF NOT EXISTS settings (
@@ -431,11 +449,14 @@ class Store:
     async def list_policies(
         self,
         scope_type: Optional[str] = None,
-        feature: str = "llm",
+        feature: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """列出规则；可按作用域类型过滤。返回 ``{scope_id: effect}`` 形式之外的全量行。"""
-        sql = "SELECT scope_type, scope_id, feature, effect, note, updated_at FROM policy WHERE feature = ?"
-        args: list[Any] = [feature]
+        """列出规则；``scope_type`` / ``feature`` 都可选过滤（都不传 = 全部规则）。"""
+        sql = "SELECT scope_type, scope_id, feature, effect, note, updated_at FROM policy WHERE 1 = 1"
+        args: list[Any] = []
+        if feature:
+            sql += " AND feature = ?"
+            args.append(feature)
         if scope_type:
             sql += " AND scope_type = ?"
             args.append(scope_type)
@@ -450,6 +471,42 @@ class Store:
         """取某作用域下 ``{scope_id: effect}`` 映射，供闸门热路径全内存判定。"""
         rows = await self.list_policies(scope_type=scope_type, feature=feature)
         return {str(r["scope_id"]): str(r["effect"]) for r in rows}
+
+    async def command_policies(self) -> dict[str, dict[str, dict[str, str]]]:
+        """所有指令规则，形如 ``{指令名: {scope_type: {scope_id: effect}}}``（闸门热路径用）。"""
+        async with self._conn().execute(
+            "SELECT feature, scope_type, scope_id, effect FROM policy WHERE feature LIKE ?",
+            (f"{COMMAND_FEATURE_PREFIX}%",),
+        ) as cur:
+            out: dict[str, dict[str, dict[str, str]]] = {}
+            for r in await cur.fetchall():
+                cmd = command_of_feature(str(r["feature"]))
+                if cmd:
+                    out.setdefault(cmd, {}).setdefault(str(r["scope_type"]), {})[
+                        str(r["scope_id"])
+                    ] = str(r["effect"])
+            return out
+
+    async def delete_stale_command_policies(self, alive: list[str]) -> int:
+        """清理已失效的指令规则（指令被卸载/改名后残留的行）。返回删除行数。
+
+        Args:
+            alive: 当前注册表里仍然存在的指令名列表。
+        """
+        features = [command_feature(c) for c in alive if str(c or "").strip()]
+        db = self._conn()
+        if features:
+            marks = ", ".join("?" for _ in features)
+            cur = await db.execute(
+                f"DELETE FROM policy WHERE feature LIKE ? AND feature NOT IN ({marks})",
+                [f"{COMMAND_FEATURE_PREFIX}%", *features],
+            )
+        else:
+            cur = await db.execute(
+                "DELETE FROM policy WHERE feature LIKE ?", (f"{COMMAND_FEATURE_PREFIX}%",)
+            )
+        await db.commit()
+        return cur.rowcount or 0
 
     # ------------------------------------------------------------------ #
     # 额度

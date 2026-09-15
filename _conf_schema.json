@@ -30,6 +30,31 @@
     "options": ["allow", "deny"],
     "default": "allow"
   },
+  "command_guard_enabled": {
+    "description": "启用指令权限管控",
+    "hint": "开启后，可在控制台「指令」页按指令配置「好友 / 群 / 全局」的黑名单（默认放行）。关闭则所有指令都不拦。",
+    "type": "bool",
+    "default": true
+  },
+  "default_command_effect": {
+    "description": "指令默认策略",
+    "hint": "没有为某条指令配任何规则时的兜底：allow=默认可用（推荐）；deny=默认禁用（白名单模式，只有显式放行的对象能用该指令）。注意与 LLM 的「全局默认策略」相互独立。",
+    "type": "string",
+    "options": ["allow", "deny"],
+    "default": "allow"
+  },
+  "command_deny_notice": {
+    "description": "指令被禁用时的提示",
+    "hint": "用户触发被禁用的指令时收到的消息（可用 {command} 占位指令名）。留空 = 静默拦截。",
+    "type": "text",
+    "default": "该指令已被管理员禁用。"
+  },
+  "command_guard_priority": {
+    "description": "指令拦截优先级",
+    "hint": "指令闸门处理器的优先级，必须大于指令处理器（默认 1000）才能拦得住。若发现拦截不生效（其它插件用更高优先级抢先处理了指令），把它调更大。",
+    "type": "int",
+    "default": 1000
+  },
   "admin_exempt": {
     "description": "管理员豁免",
     "hint": "开启后，AstrBot 全局配置 admins_id 里的管理员永远不受权限与限额限制（推荐开启，避免把自己锁在外面）。",

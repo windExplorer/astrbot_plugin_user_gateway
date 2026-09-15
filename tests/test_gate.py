@@ -51,6 +51,7 @@ def R(**kw) -> G.Rules:
         limits=kw.get("limits") or {},
         usage=kw.get("usage") or {},
         level_model=kw.get("level_model") or {},
+        command_policy=kw.get("command_policy") or {},
     )
 
 
@@ -335,6 +336,34 @@ def main() -> int:
           "主提供商熔断后由备用接管")
     avail2 = {"p-a", "p-b"} - c2.open_ids(now=1400.0)
     check(G.Gate.pick_provider(route, avail2)["provider_id"] == "p-a", "冷却结束后主提供商重新被选中")
+
+    print("\n[13] 指令权限（每条指令一份规则）")
+    cp = {
+        "help": {"global": {"*": "deny"}, "user": {"10001": "allow"}, "group": {"88888": "deny"}},
+        "draw": {},
+    }
+    rules = R(command_policy=cp)
+    # evaluate() 只管 LLM，不看指令
+    check(gate.evaluate(G.Subject(sender_id="99999"), rules).allow, "指令规则不影响 LLM 判定（两套独立）")
+    v = gate.check_command(G.Subject(sender_id="99999"), "help", rules)
+    check(not v.allow and v.reason == "command" and v.layer == "global", "某指令全局禁用 → 拦截")
+    check(v.command == "help", "Verdict 带回指令名")
+    v = gate.check_command(G.Subject(sender_id="10001"), "help", rules)
+    check(v.allow and v.layer == "user", "好友显式放行覆盖全局禁用")
+    v = gate.check_command(G.Subject(sender_id="10001", group_id="88888"), "help", rules)
+    check(v.allow and v.layer == "user", "好友规则优先于群规则（最具体生效）")
+    v = gate.check_command(G.Subject(sender_id="99999", group_id="88888"), "help", rules)
+    check(not v.allow and v.layer == "group", "群禁用生效")
+    check(gate.check_command(G.Subject(sender_id="99999"), "draw", rules).allow, "没有规则的指令互不影响")
+    check(gate.check_command(G.Subject(sender_id="99999"), "", rules).allow, "空指令名 → 放行（不误伤）")
+    # 默认策略（白名单模式）
+    deny_default = make_gate(default_command_effect="deny")
+    v = deny_default.check_command(G.Subject(sender_id="99999"), "draw", R())
+    check(not v.allow and v.reason == "command", "默认禁止：未配规则的指令被拦")
+    check(deny_default.check_command(G.Subject(sender_id="10001"), "help", rules).allow, "白名单模式下显式放行可用")
+    # 与 LLM 的默认策略互不影响
+    check(make_gate(default_effect="deny").check_command(G.Subject(sender_id="99999"), "draw", R()).allow,
+          "LLM 全局默认设成禁止后，指令仍然默认可用（两套默认互不影响）")
 
     print()
     if _failures:

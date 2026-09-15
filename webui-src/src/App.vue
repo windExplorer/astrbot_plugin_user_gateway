@@ -73,6 +73,7 @@ const menuOptions = [
   { label: () => h(RouterLink, { to: "/friends" }, { default: () => "私聊" }), key: "/friends" },
   { label: () => h(RouterLink, { to: "/groups" }, { default: () => "群聊" }), key: "/groups" },
   { label: () => h(RouterLink, { to: "/quota" }, { default: () => "限额" }), key: "/quota" },
+  { label: () => h(RouterLink, { to: "/commands" }, { default: () => "指令" }), key: "/commands" },
   { label: () => h(RouterLink, { to: "/config" }, { default: () => "配置" }), key: "/config" },
 ];
 

@@ -288,6 +288,13 @@ async def h_ping(plugin) -> dict:
             "avatars": (
                 plugin.avatars.stats() if getattr(plugin, "avatars", None) is not None else {}
             ),
+            # 指令权限概况（有多少条指令、配了多少条规则、闸门优先级）
+            "commands": {
+                "enabled": bool(plugin._cfg("command_guard_enabled", True)),
+                "default_effect": plugin.gate.default_command_effect(),
+                "priority": int(plugin._cfg("command_guard_priority", 1000) or 1000),
+                "rules": sum(len(s) for s in (getattr(plugin, "_cmd_policy", {}) or {}).values()),
+            },
             # 模型路由概况（等级模型是否在生效、哪些提供商被熔断了）
             "model_route": {
                 "enabled": bool(plugin._cfg("model_route_enabled", True)),
@@ -594,15 +601,26 @@ async def h_subject(plugin) -> dict:
 
 
 async def h_get_policy(plugin) -> dict:
-    """读取权限规则（可按作用域过滤）。"""
+    """读取权限规则。
+
+    ``?feature=llm``（默认）或 ``?feature=command:<指令名>``；``scope_type`` 可再过滤。
+    """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
-    rows = await plugin.store.list_policies(scope_type=_q("scope_type") or None)
+    rows = await plugin.store.list_policies(
+        scope_type=_q("scope_type") or None,
+        feature=_q("feature") or "llm",
+    )
     return ok({"items": rows})
 
 
 async def h_set_policy(plugin) -> dict:
-    """写入权限规则。body: {scope_type, scope_id, effect, feature?} 或 {items: [...]}。"""
+    """写入权限规则。body: ``{scope_type, scope_id, effect, feature?}`` 或 ``{items: [...]}``。
+
+    - ``feature='llm'``：LLM 对话权限（``scope_type`` 只允许 ``user`` / ``group``）；
+    - ``feature='command:<指令名>'``：某条指令的权限，额外支持 ``scope_type='global'``
+      （``scope_id`` 固定 ``*``），即「这条指令全局禁用/放行」。
+    """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
     body = await _payload()
@@ -618,12 +636,18 @@ async def h_set_policy(plugin) -> dict:
         scope_id = str(it.get("scope_id") or "").strip()
         effect = str(it.get("effect") or "").strip()
         feature = str(it.get("feature") or "llm").strip() or "llm"
-        if scope_type not in ("user", "group"):
-            return err("scope_type 必须是 user 或 group")
+        if scope_type not in ("user", "group", "global"):
+            return err("scope_type 必须是 user / group / global")
+        if scope_type == "global":
+            if feature == "llm":
+                return err("LLM 权限的全局默认请在「配置」页用「全局默认策略」设置")
+            scope_id = "*"
         if not scope_id:
             return err("scope_id 不能为空")
         if effect not in ("allow", "deny", "inherit"):
             return err("effect 必须是 allow / deny / inherit")
+        if feature != "llm" and not feature.startswith("command:"):
+            return err("feature 必须是 llm 或 command:<指令名>")
         await plugin.store.set_policy(scope_type, scope_id, effect, feature=feature)
         applied.append({"scope_type": scope_type, "scope_id": scope_id, "effect": effect, "feature": feature})
 
@@ -1027,6 +1051,61 @@ async def h_set_subject_level(plugin) -> dict:
 
 
 # ---------------------------------------------------------------------- #
+# 指令权限
+# ---------------------------------------------------------------------- #
+async def h_commands(plugin) -> dict:
+    """指令清单 + 每条指令的权限规则（控制台「指令」页）。
+
+    指令来自 AstrBot 的 handler 注册表（``plugin.registered_commands()``）：
+    没注册的指令不会出现在这里；规则里引用了但已经不存在的指令名放在 ``stale``。
+    """
+    commands = plugin.registered_commands()
+    policy = getattr(plugin, "_cmd_policy", {}) or {}
+    items: list[dict] = []
+    for c in commands:
+        name = str(c.get("name") or "")
+        table = policy.get(name) or {}
+        rules: list[dict] = []
+        for scope_type, mapping in table.items():
+            for scope_id, effect in (mapping or {}).items():
+                if scope_type == "global":
+                    continue
+                rules.append(
+                    {"scope_type": scope_type, "scope_id": scope_id, "effect": effect}
+                )
+        rules.sort(key=lambda r: (r["scope_type"], r["scope_id"]))
+        items.append(
+            {
+                **c,
+                "global_effect": str((table.get("global") or {}).get("*") or "inherit"),
+                "rules": rules,
+                "rule_count": len(rules),
+            },
+        )
+    stale = sorted(set(policy) - {str(c.get("name") or "") for c in commands})
+    return ok(
+        {
+            "items": items,
+            "default_effect": plugin.gate.default_command_effect(),
+            "enabled": bool(plugin._cfg("command_guard_enabled", True)),
+            "priority": int(plugin._cfg("command_guard_priority", 1000) or 1000),
+            "stale": stale,
+        },
+    )
+
+
+async def h_prune_commands(plugin) -> dict:
+    """清理已失效的指令规则（指令被卸载/改名后残留的 policy 行）。"""
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    alive = [str(c.get("name") or "") for c in plugin.registered_commands()]
+    n = await plugin.store.delete_stale_command_policies(alive)
+    await plugin.store.log_audit("console", "prune_commands", json.dumps({"deleted": n}, ensure_ascii=False))
+    await plugin.reload_rules()
+    return ok({"deleted": n, "alive": len(alive)})
+
+
+# ---------------------------------------------------------------------- #
 # 头像
 # ---------------------------------------------------------------------- #
 async def h_avatars(plugin) -> dict:
@@ -1126,6 +1205,8 @@ def register_apis(plugin) -> None:
         ("/quota", h_get_quota, ["GET"]),
         ("/quota", h_set_quota, ["POST"]),
         ("/quota/reset", h_reset_quota, ["POST"]),
+        ("/commands", h_commands, ["GET"]),
+        ("/commands/prune", h_prune_commands, ["POST"]),
         ("/levels", h_levels, ["GET"]),
         ("/levels", h_set_level, ["POST"]),
         ("/levels/delete", h_delete_level, ["POST"]),

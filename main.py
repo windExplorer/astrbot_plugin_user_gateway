@@ -121,6 +121,8 @@ class UserGatewayPlugin(Star):
         # 用量计数：{scope_type(user|group): {scope_id: {period: row}}}
         self._usage_user: dict[str, dict[str, dict[str, Any]]] = {}
         self._usage_group: dict[str, dict[str, dict[str, Any]]] = {}
+        # 指令权限：{指令名: {scope_type: {scope_id: effect}}}
+        self._cmd_policy: dict[str, dict[str, dict[str, str]]] = {}
 
         # M1：判定内核 / 提示冷却 / 后台任务
         self.gate = Gate(self._cfg)
@@ -306,6 +308,7 @@ class UserGatewayPlugin(Star):
             }
             self._usage_user = await self.store.usage_map("user")
             self._usage_group = await self.store.usage_map("group")
+            self._cmd_policy = await self.store.command_policies()
 
             if self._cfg("debug_log", False):
                 logger.info(
@@ -313,7 +316,8 @@ class UserGatewayPlugin(Star):
                     f"群权限 {len(self._effect_group)} / 等级 {len(self._level_effect)} / "
                     f"归级 {len(self._subject_level_user)}+{len(self._subject_level_group)} / "
                     f"限额 {sum(len(v) for v in self._limits.values())} 条 / "
-                    f"用量计数 {len(self._usage_user)}+{len(self._usage_group)} 条"
+                    f"用量计数 {len(self._usage_user)}+{len(self._usage_group)} 条 / "
+                    f"指令规则 {sum(len(s) for s in self._cmd_policy.values())} 条"
                 )
         except Exception as e:
             # 加载失败按"没有规则"处理（全部继承默认策略），不影响消息通行
@@ -334,6 +338,7 @@ class UserGatewayPlugin(Star):
             limits=self._limits,
             usage={"user": self._usage_user, "group": self._usage_group},
             level_model=self._level_route,
+            command_policy=self._cmd_policy,
         )
 
     # ------------------------------------------------------------------ #
@@ -445,31 +450,37 @@ class UserGatewayPlugin(Star):
         return quota_mod.next_reset_at(period, now)
 
     def _apply_guard_priority(self) -> None:
-        """把 ``guard_priority`` 配置应用到已注册的 on_llm_request 钩子上。
+        """把配置里的优先级应用到本插件的两个闸门处理器上。
+
+        - ``guard_llm_request``（LLM 闸门）用 ``guard_priority``（默认 100，越大越先）；
+        - ``guard_commands``（指令闸门）用 ``command_guard_priority``（默认 1000）——
+          它必须**排在指令 handler 之前**才能拦住指令，见 ``star_request.py:36-38``。
 
         装饰器在类定义时就把优先级固定了，这里改 ``extras_configs`` 并对注册表**原地重排**
-        （只重排现有条目、不新增，幂等）。作用：当别的插件抢先 stop 了事件导致本插件闸门
-        不执行时，可以把这里调大写来抢在前面。
+        （只重排现有条目、不新增，幂等）。
         """
         try:
-            from astrbot.core.star.star_handler import EventType, star_handlers_registry
+            from astrbot.core.star.star_handler import star_handlers_registry
 
-            want = int(self._cfg("guard_priority", 100) or 100)
+            wanted = {
+                "guard_llm_request": int(self._cfg("guard_priority", 100) or 100),
+                "guard_commands": int(self._cfg("command_guard_priority", 1000) or 1000),
+            }
             handlers = getattr(star_handlers_registry, "_handlers", None)
             if not handlers:
                 return
             changed = False
             for md in handlers:
-                if (
-                    getattr(md, "event_type", None) is EventType.OnLLMRequestEvent
-                    and md.handler_module_path == __name__
-                    and md.extras_configs.get("priority") != want
-                ):
-                    md.extras_configs["priority"] = want
-                    changed = True
+                if md.handler_module_path != __name__:
+                    continue
+                want = wanted.get(str(getattr(md, "handler_name", "") or ""))
+                if want is None or md.extras_configs.get("priority") == want:
+                    continue
+                md.extras_configs["priority"] = want
+                changed = True
             if changed:
                 handlers.sort(key=lambda h: -h.extras_configs.get("priority", 0))
-                logger.info(f"[UserGateway] 闸门优先级已应用: priority={want}")
+                logger.info(f"[UserGateway] 闸门优先级已应用: {wanted}")
         except Exception as e:
             logger.warning(f"[UserGateway] 应用闸门优先级失败（忽略）: {e}")
 
@@ -530,6 +541,176 @@ class UserGatewayPlugin(Star):
             await self._record_usage(event, response)
         except Exception:
             logger.exception("[UserGateway] 用量记录异常（忽略，不影响对话）")
+
+    # ------------------------------------------------------------------ #
+    # M4：指令权限闸门
+    # ------------------------------------------------------------------ #
+    def registered_commands(self) -> list[dict[str, Any]]:
+        """列出 AstrBot 里已注册的指令（控制台「指令」页的数据源）。
+
+        来源：handler 注册表里 ``event_filters`` 含指令过滤器（CommandFilter /
+        CommandGroupFilter）的处理器。指令名取 ``get_complete_command_names()[0]``
+        —— 完整主名（子指令形如 ``父 子``），**别名不单独建键**（与主名共用一条规则）。
+        """
+        out: dict[str, dict[str, Any]] = {}
+        try:
+            from astrbot.core.star.star_handler import (  # type: ignore
+                EventType,
+                star_handlers_registry,
+            )
+        except Exception as e:
+            logger.debug(f"[UserGateway] 导入 handler 注册表失败（指令列表不可用）: {e}")
+            return []
+        try:
+            handlers = list(
+                star_handlers_registry.get_handlers_by_event_type(
+                    EventType.AdapterMessageEvent, only_activated=False
+                )
+                or []
+            )
+        except Exception:
+            handlers = list(getattr(star_handlers_registry, "_handlers", []) or [])
+        for h in handlers:
+            try:
+                if getattr(h, "event_type", None) is not EventType.AdapterMessageEvent:
+                    continue
+            except Exception:
+                continue
+            for f in getattr(h, "event_filters", []) or []:
+                if type(f).__name__ not in ("CommandFilter", "CommandGroupFilter"):
+                    continue
+                names: list[str] = []
+                try:
+                    names = [str(x) for x in (f.get_complete_command_names() or [])]
+                except Exception:
+                    nm = str(getattr(f, "command_name", "") or "")
+                    names = [nm] if nm else []
+                if not names or not names[0].strip():
+                    continue
+                key = names[0].strip()
+                out.setdefault(
+                    key,
+                    {
+                        "name": key,
+                        "aliases": [a for a in names[1:] if a],
+                        "desc": str(getattr(h, "desc", "") or "").strip(),
+                        "plugin": self._plugin_name_of(
+                            str(getattr(h, "handler_module_path", "") or "")
+                        ),
+                        "handler": str(getattr(h, "handler_full_name", "") or ""),
+                        "is_group": type(f).__name__ == "CommandGroupFilter",
+                    },
+                )
+        return sorted(out.values(), key=lambda it: it["name"])
+
+    @staticmethod
+    def _plugin_name_of(module_path: str) -> str:
+        """handler 所属插件的展示名（取 star_map；失败返回空串）。"""
+        try:
+            from astrbot.core.star.star import star_map  # type: ignore
+
+            md = star_map.get(module_path)
+            name = str(getattr(md, "name", "") or "")
+            if name:
+                return name
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _matched_commands(event: AstrMessageEvent) -> list[str]:
+        """本次消息命中了哪些指令（完整主名；别名与主名共用一条规则）。"""
+        names: list[str] = []
+        try:
+            handlers = event.get_extra("activated_handlers") or []
+        except Exception:
+            return names
+        for h in handlers:
+            for f in getattr(h, "event_filters", []) or []:
+                if type(f).__name__ not in ("CommandFilter", "CommandGroupFilter"):
+                    continue
+                got: list[str] = []
+                try:
+                    got = [str(x) for x in (f.get_complete_command_names() or [])]
+                except Exception:
+                    got = []
+                if not got:
+                    nm = str(getattr(f, "command_name", "") or "")
+                    got = [nm] if nm else []
+                if got and got[0].strip():
+                    names.append(got[0].strip())
+        return list(dict.fromkeys(names))
+
+    @astr_filter.event_message_type(astr_filter.EventMessageType.ALL, priority=1000)
+    async def guard_commands(self, event: AstrMessageEvent) -> None:
+        """指令权限闸门（PRD §8.2）。
+
+        为什么这样拦得住：waking 阶段（``waking_check/stage.py:253``）已经把「本次命中的
+        handler」写进 ``activated_handlers``；process 阶段按**优先级降序**依次执行这些
+        handler，并在每个 handler 之前检查 ``event.is_stopped()``（``star_request.py:36-38``）。
+        所以本插件用「所有消息 + 高优先级」注册一个处理器，在这里 ``stop_event()``
+        就能让后面的指令 handler 不执行 —— 与动画/图片类插件提前介入指令是同一套机制。
+
+        红线：判错一律放行（fail-open），绝不能因为权限插件把正常指令吞掉。
+        """
+        try:
+            if not self._cfg("enabled", True) or not self._cfg("command_guard_enabled", True):
+                return
+            if not (self.store and self.store.ready):
+                return
+            names = self._matched_commands(event)
+            if not names:
+                return
+            subject = self._subject_of(event)
+            if subject.is_admin and bool(self._cfg("admin_exempt", True)):
+                return
+            for name in names:
+                verdict = self.gate.check_command(subject, name, self._rules())
+                if verdict.allow:
+                    continue
+                await self._log_command_denied(subject, name, verdict)
+                await self._notify_command_denied(event, subject, name, verdict)
+                # 掐断本次消息：后面的指令 handler 不会再执行（也不会进 LLM）
+                event.stop_event()
+                logger.info(f"[UserGateway] 已拦截指令 {name} {subject.umo} → {verdict.detail}")
+                return
+        except Exception:
+            logger.exception("[UserGateway] 指令闸门异常，已放行（fail-open）")
+
+    async def _log_command_denied(self, subject: Subject, command: str, verdict: Any) -> None:
+        """写一条指令拦截流水（``kind=command``，不影响 LLM 的调用统计口径）。"""
+        try:
+            await self.store.log_usage(
+                platform_id=subject.platform_id,
+                umo=subject.umo,
+                scope_type=verdict.scope_type or ("group" if subject.group_id else "user"),
+                scope_id=verdict.scope_id or (subject.group_id or subject.sender_id),
+                sender_id=subject.sender_id,
+                group_id=subject.group_id,
+                kind="command",
+                command_name=command,
+                status="denied",
+                deny_reason=verdict.reason or "command",
+            )
+        except Exception as e:
+            logger.warning(f"[UserGateway] 写指令拦截流水失败（忽略）: {e}")
+
+    async def _notify_command_denied(
+        self, event: AstrMessageEvent, subject: Subject, command: str, verdict: Any
+    ) -> None:
+        """给被拒用户发提示（带冷却），必要时同时通知管理员。"""
+        if not self._notify_cooldown.allow(f"cmd:{command}:{verdict.scope_type}:{verdict.scope_id}"):
+            return
+        if not self._cfg("silent", False):
+            text = str(self._cfg("command_deny_notice", "") or "").strip()
+            if text:
+                await self._send(event, text.replace("{command}", command))
+        if self._cfg("notify_admin", False):
+            where = f"群 {subject.group_id}" if subject.group_id else "私聊"
+            await self._notify_admins(
+                f"已拦截指令 {command}：{subject.sender_id or subject.umo}（{where}）｜{verdict.detail}",
+                subject.platform_id,
+            )
 
     # ------------------------------------------------------------------ #
     # 闸门辅助

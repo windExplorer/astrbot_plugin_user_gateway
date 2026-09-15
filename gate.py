@@ -37,6 +37,7 @@ REASON_DISABLED = "disabled"
 REASON_ADMIN = "admin"
 REASON_PERMISSION = "permission"
 REASON_QUOTA = "quota"
+REASON_COMMAND = "command"
 
 # 档位名（与 store.LAYERS 对应）
 LAYER_USER = "user"
@@ -99,6 +100,8 @@ class Rules:
     usage: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     level_model: Mapping[Any, Mapping[str, str]] = field(default_factory=dict)
     """``{(kind, level_id): {"provider_id", "fallback_provider_id"}}`` —— 等级的模型路由。"""
+    command_policy: Mapping[str, Mapping[str, Mapping[str, str]]] = field(default_factory=dict)
+    """``{指令名: {scope_type: {scope_id: effect}}}`` —— 指令权限（每条指令一份规则）。"""
 
     def limits_of(self, scope_type: str, scope_id: str) -> Mapping[str, Mapping[str, Any]]:
         return (self.limits.get(scope_type) or {}).get(str(scope_id)) or {}
@@ -137,6 +140,8 @@ class Verdict:
     layer: str = ""  # user | user_level | group | group_level | global
     scope_type: str = ""  # user | group | level | global
     scope_id: str = ""
+    # 指令权限专用：命中的指令名
+    command: str = ""
     # 额度相关
     period: str = ""
     limit: int = 0
@@ -153,6 +158,8 @@ class Verdict:
     def detail(self) -> str:
         """给日志/审计用的一句话说明。"""
         parts = [f"reason={self.reason or 'ok'}"]
+        if self.command:
+            parts.append(f"command={self.command}")
         if self.layer:
             parts.append(f"layer={self.layer}({self.layer_label})")
         if self.scope_type:
@@ -269,6 +276,59 @@ class Gate:
                 scope_id=scope_id,
             )
         return Verdict(allow=True, layer=layer, scope_type=scope_type, scope_id=scope_id)
+
+    # ------------------------------------------------------------------ #
+    # 指令权限
+    # ------------------------------------------------------------------ #
+    def default_command_effect(self) -> str:
+        """没有为某条指令配任何规则时的兜底策略（默认放行，避免升级后指令突然不可用）。"""
+        eff = str(self._cfg("default_command_effect", "allow") or "allow").strip().lower()
+        return eff if eff in ("allow", "deny") else "allow"
+
+    def check_command(self, subject: Subject, command: str, rules: Rules) -> Verdict:
+        """指令权限判定：**每条指令一份规则**，链为 好友专属 → 群专属 → 全局 → 配置默认。
+
+        与 LLM 权限的两点差异（有意为之）：
+
+        1. **不参与等级档位**：等级是「模型 + 额度 + LLM 权限」的档位概念，
+          若让「等级=禁止」顺带把指令也禁掉，两件事会莫名其妙地互相牵连；
+        2. 链的末端是**每条指令自己的全局开关**（policy 里的 global 行），
+          再用配置 ``default_command_effect`` 兜底，而不是共用 LLM 的 ``default_effect``
+          —— 否则把 LLM 默认设成白名单模式会把所有指令一起关掉。
+
+        规则同样是「最具体的一层生效」：命中即返回，不再看更粗的层。
+        """
+        cmd = str(command or "")
+        table = (rules.command_policy.get(cmd) or {}) if cmd else {}
+        uid = str(subject.sender_id or "")
+        gid = str(subject.group_id or "")
+        for scope_type, scope_id in (("user", uid), ("group", gid), ("global", "*")):
+            if scope_type != "global" and not scope_id:
+                continue
+            eff = str((table.get(scope_type) or {}).get(scope_id) or "")
+            if eff == "deny":
+                return Verdict(
+                    allow=False,
+                    reason=REASON_COMMAND,
+                    layer=scope_type,
+                    scope_type=scope_type,
+                    scope_id=scope_id,
+                    command=cmd,
+                )
+            if eff == "allow":
+                return Verdict(
+                    allow=True, layer=scope_type, scope_type=scope_type, scope_id=scope_id, command=cmd
+                )
+        if self.default_command_effect() == "deny":
+            return Verdict(
+                allow=False,
+                reason=REASON_COMMAND,
+                layer=LAYER_GLOBAL,
+                scope_type="global",
+                scope_id="*",
+                command=cmd,
+            )
+        return Verdict(allow=True, command=cmd)
 
     # ------------------------------------------------------------------ #
     # 模型路由
