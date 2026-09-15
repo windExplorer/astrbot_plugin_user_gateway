@@ -43,7 +43,7 @@ async def main() -> int:
         check(Path(db_path).exists(), "数据库文件已创建")
 
         print("\n[2] settings")
-        check(await st.get_setting("schema_version") == "4", "schema_version 已写入 4")
+        check(await st.get_setting("schema_version") == "5", "schema_version 已写入 5")
         check(await st.get_setting("nope", "d") == "d", "缺省值回退")
         await st.set_setting("sync_last_at", "123")
         check(await st.get_setting("sync_last_at") == "123", "写入后可读")
@@ -260,6 +260,21 @@ async def main() -> int:
         check(lv["provider_id"] == "prov-a" and lv["fallback_provider_id"] == "prov-b",
               "等级模型路由字段可写可读")
         check("model" not in lv, "等级表已无 model 列（模型以提供商为单位）")
+        # 等级默认「指令」权限（与 LLM 权限分开，v5）
+        await st.upsert_level(
+            "user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9,
+            provider_id="prov-a", fallback_provider_id="prov-b", command_effect="deny",
+        )
+        lv = await st.get_level(lv_vip)
+        check(lv["effect"] == "deny" and lv["command_effect"] == "deny",
+              "等级的两套默认权限（LLM / 指令）互不影响、各自可读写")
+        await st.upsert_level("user", "VIP改名", level_id=lv_vip, effect="allow", sort_order=9)
+        lv = await st.get_level(lv_vip)
+        check(lv["command_effect"] == "inherit", "不传指令权限 → 回到 inherit（避免旧值阴魂不散）")
+        await st.upsert_level(
+            "user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9,
+            provider_id="prov-a", fallback_provider_id="prov-b",
+        )
         await st.upsert_level("user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9)
         lv = await st.get_level(lv_vip)
         check(lv["provider_id"] == "" and lv["fallback_provider_id"] == "",
@@ -342,7 +357,7 @@ async def main() -> int:
 
         st3 = Store(v1_path)
         await st3.open()
-        check(await st3.get_setting("schema_version") == "4", "版本号直接升到最新（v1 → v4 连续迁移）")
+        check(await st3.get_setting("schema_version") == "5", "版本号直接升到最新（v1 → v5 连续迁移）")
         q = await st3.get_quota("user", "10001", "day")
         check(q is not None and q["limit_tokens"] == 1000 and "used_tokens" not in q,
               "限额保留、用量的列已移除")
@@ -388,13 +403,14 @@ async def main() -> int:
 
         st5 = Store(v2_path)
         await st5.open()
-        check(await st5.get_setting("schema_version") == "4", "版本号升到 4（v2 → v3 → v4 连续迁移）")
+        check(await st5.get_setting("schema_version") == "5", "版本号升到 5（v2 → v3 → v4 → v5 连续迁移）")
         lv = await st5.get_level(1)
         check(lv is not None and lv["name"] == "老等级", "v2 的等级数据保留")
         check(
             lv.get("provider_id") == "" and lv.get("fallback_provider_id") == "" and "model" not in lv,
             "模型路由两列默认为空，且 v3 临时加的 model 列已被 v4 移除",
         )
+        check(lv.get("command_effect") == "inherit", "v5 新增的 level.command_effect 默认为 inherit")
         await st5.upsert_level("user", "老等级", level_id=1, provider_id="p1", fallback_provider_id="p2")
         lv = await st5.get_level(1)
         check(

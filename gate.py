@@ -101,7 +101,11 @@ class Rules:
     level_model: Mapping[Any, Mapping[str, str]] = field(default_factory=dict)
     """``{(kind, level_id): {"provider_id", "fallback_provider_id"}}`` —— 等级的模型路由。"""
     command_policy: Mapping[str, Mapping[str, Mapping[str, str]]] = field(default_factory=dict)
-    """``{指令名: {scope_type: {scope_id: effect}}}`` —— 指令权限（每条指令一份规则）。"""
+    """``{指令名: {scope_type: {scope_id: effect}}}`` —— 单条指令的权限规则。"""
+    command_master: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    """``{scope_type: {scope_id: effect}}`` —— **对象级指令总权限**（好友 / 群 / 全局）。"""
+    level_command_effect: Mapping[Any, str] = field(default_factory=dict)
+    """``{(kind, level_id): effect}`` —— 等级的默认**指令**权限（与 LLM 的 level_effect 分开）。"""
 
     def limits_of(self, scope_type: str, scope_id: str) -> Mapping[str, Mapping[str, Any]]:
         return (self.limits.get(scope_type) or {}).get(str(scope_id)) or {}
@@ -238,10 +242,38 @@ class Gate:
         return out
 
     # ------------------------------------------------------------------ #
-    # 权限
+    # 权限（LLM 权限与「指令总权限」共用同一条档位链）
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _level_key(ref: LayerRef) -> tuple[str, int]:
+        """等级层的键 ``(kind, level_id)``（群等级用 group，其余用 user）。"""
+        kind = "group" if ref.layer == LAYER_GROUP_LEVEL else "user"
+        return (kind, _as_int(ref.scope_id, -1))
+
+    def _first_effect(
+        self,
+        subject: Subject,
+        rules: Rules,
+        lookup: Callable[[LayerRef], str],
+    ) -> tuple[str, str, str, str]:
+        """沿档位链找**第一个显式规则**（最具体的一层生效）。
+
+        Args:
+            lookup: 给定档位返回该档位的显式效果（``allow`` / ``deny``）；没配置、
+                或者是 ``inherit`` 时返回空串 —— 那就继续看更粗的层。
+
+        Returns:
+            ``(effect, layer, scope_type, scope_id)``；整条链都没有显式规则时
+            effect 为空串（调用方自己决定怎么兜底）。
+        """
+        for ref in self.layers_for(subject, rules):
+            eff = str(lookup(ref) or "").strip()
+            if eff in ("allow", "deny"):
+                return eff, ref.layer, ref.scope_type, ref.scope_id
+        return "", LAYER_GLOBAL, "global", "*"
+
     def resolve_effect(self, subject: Subject, rules: Rules) -> tuple[str, str, str, str]:
-        """按档位链解析生效权限。
+        """按档位链解析生效的 **LLM 权限**。
 
         Returns:
             ``(effect, layer, scope_type, scope_id)``；effect 为 ``allow`` / ``deny``。
@@ -250,18 +282,19 @@ class Gate:
         注意：链上的「等级」只有在等级显式设了 allow / deny（非 inherit）时才截断链条，
         否则继续往下找更粗的规则 —— 这样「等级只配额度、不管权限」也能正常工作。
         """
-        for ref in self.layers_for(subject, rules):
+
+        def lookup(ref: LayerRef) -> str:
             if ref.layer == LAYER_USER:
-                if ref.scope_id in rules.effect_user:
-                    return str(rules.effect_user[ref.scope_id]), ref.layer, ref.scope_type, ref.scope_id
-            elif ref.layer == LAYER_GROUP:
-                if ref.scope_id in rules.effect_group:
-                    return str(rules.effect_group[ref.scope_id]), ref.layer, ref.scope_type, ref.scope_id
-            elif ref.layer in (LAYER_USER_LEVEL, LAYER_GROUP_LEVEL):
-                kind = "group" if ref.layer == LAYER_GROUP_LEVEL else "user"
-                eff = str(rules.level_effect.get((kind, _as_int(ref.scope_id)), "inherit") or "inherit")
-                if eff in ("allow", "deny"):
-                    return eff, ref.layer, ref.scope_type, ref.scope_id
+                return str(rules.effect_user.get(ref.scope_id) or "")
+            if ref.layer == LAYER_GROUP:
+                return str(rules.effect_group.get(ref.scope_id) or "")
+            if ref.layer in (LAYER_USER_LEVEL, LAYER_GROUP_LEVEL):
+                return str(rules.level_effect.get(self._level_key(ref)) or "")
+            return ""  # 全局层：交给配置 default_effect 兜底
+
+        eff, layer, scope_type, scope_id = self._first_effect(subject, rules, lookup)
+        if eff:
+            return eff, layer, scope_type, scope_id
         return self.default_effect(), LAYER_GLOBAL, "global", "*"
 
     def check_permission(self, subject: Subject, rules: Rules) -> Verdict:
@@ -285,50 +318,92 @@ class Gate:
         eff = str(self._cfg("default_command_effect", "allow") or "allow").strip().lower()
         return eff if eff in ("allow", "deny") else "allow"
 
+    def check_command_master(
+        self, subject: Subject, rules: Rules
+    ) -> tuple[str, str, str, str]:
+        """解析**对象级指令总权限**：好友专属 → 好友等级 → 群专属 → 群等级 → 全局。
+
+        与 LLM 权限用**同一条档位链**（等级也在链上），只是读写另一套规则，
+        所以「把某个等级设为禁止指令」能一次管住整档人。
+        返回 ``(effect, layer, scope_type, scope_id)``，没有显式规则时 effect 为空串。
+        """
+
+        def lookup(ref: LayerRef) -> str:
+            if ref.layer in (LAYER_USER_LEVEL, LAYER_GROUP_LEVEL):
+                return str(rules.level_command_effect.get(self._level_key(ref)) or "")
+            return str((rules.command_master.get(ref.scope_type) or {}).get(ref.scope_id) or "")
+
+        return self._first_effect(subject, rules, lookup)
+
     def check_command(self, subject: Subject, command: str, rules: Rules) -> Verdict:
-        """指令权限判定：**每条指令一份规则**，链为 好友专属 → 群专属 → 全局 → 配置默认。
+        """指令权限判定（**两段式**）。
 
-        与 LLM 权限的两点差异（有意为之）：
+        **第一段 · 对象级总权限**（好友专属 → 好友等级 → 群专属 → 群等级 → 全局）
+        —— 回答「这个人 / 这个群能不能用指令」；命中 ``deny`` 直接拦。
+        这是「等级设为禁止指令 → 整档人都用不了」的落点。
 
-        1. **不参与等级档位**：等级是「模型 + 额度 + LLM 权限」的档位概念，
-          若让「等级=禁止」顺带把指令也禁掉，两件事会莫名其妙地互相牵连；
-        2. 链的末端是**每条指令自己的全局开关**（policy 里的 global 行），
-          再用配置 ``default_command_effect`` 兜底，而不是共用 LLM 的 ``default_effect``
-          —— 否则把 LLM 默认设成白名单模式会把所有指令一起关掉。
+        **第二段 · 该条指令自己的规则**（好友专属 → 群专属 → 这条指令的全局开关）
+        —— 回答「这条指令能不能用」；都没有再用配置 ``default_command_effect`` 兜底。
 
-        规则同样是「最具体的一层生效」：命中即返回，不再看更粗的层。
+        为什么是这个顺序：
+
+        - 对象级 ``deny`` 必须是硬拦截，但要留后门：更具体的「好友专属 / 群专属」
+          会先命中，所以「整档禁止 + 给某人开白名单」依然做得到；
+        - 单条指令的规则**不带等级层**（等级只管整体开关，不管某一条指令）；
+        - 兜底用的是与 LLM 完全独立的 ``default_command_effect``
+          —— 把 LLM 设成白名单模式不会顺带关掉所有指令。
         """
         cmd = str(command or "")
+        m_eff, m_layer, m_st, m_sid = self.check_command_master(subject, rules)
+        if m_eff == "deny":
+            return Verdict(
+                allow=False,
+                reason=REASON_COMMAND,
+                layer=m_layer,
+                scope_type=m_st,
+                scope_id=m_sid,
+                command=cmd,
+            )
+
         table = (rules.command_policy.get(cmd) or {}) if cmd else {}
-        uid = str(subject.sender_id or "")
-        gid = str(subject.group_id or "")
-        for scope_type, scope_id in (("user", uid), ("group", gid), ("global", "*")):
-            if scope_type != "global" and not scope_id:
-                continue
-            eff = str((table.get(scope_type) or {}).get(scope_id) or "")
+        for ref in self.layers_for(subject, rules):
+            if ref.layer in (LAYER_USER_LEVEL, LAYER_GROUP_LEVEL):
+                continue  # 单条指令不参与等级层（等级只管「整体能不能用指令」）
+            eff = str((table.get(ref.scope_type) or {}).get(ref.scope_id) or "")
             if eff == "deny":
                 return Verdict(
                     allow=False,
                     reason=REASON_COMMAND,
-                    layer=scope_type,
-                    scope_type=scope_type,
-                    scope_id=scope_id,
+                    layer=ref.layer,
+                    scope_type=ref.scope_type,
+                    scope_id=ref.scope_id,
                     command=cmd,
                 )
             if eff == "allow":
                 return Verdict(
-                    allow=True, layer=scope_type, scope_type=scope_type, scope_id=scope_id, command=cmd
+                    allow=True,
+                    layer=ref.layer,
+                    scope_type=ref.scope_type,
+                    scope_id=ref.scope_id,
+                    command=cmd,
                 )
+
+        # 两段都没配到具体规则 → 用配置里的默认策略。
+        # 若第一段（对象级总权限）有显式结论，把它作为「结论来源」带上，便于排查
+        # 「为什么这条指令能/不能用」。
+        layer = m_layer if m_eff else LAYER_GLOBAL
+        scope_type = m_st if m_eff else "global"
+        scope_id = m_sid if m_eff else "*"
         if self.default_command_effect() == "deny":
             return Verdict(
                 allow=False,
                 reason=REASON_COMMAND,
-                layer=LAYER_GLOBAL,
-                scope_type="global",
-                scope_id="*",
+                layer=layer,
+                scope_type=scope_type,
+                scope_id=scope_id,
                 command=cmd,
             )
-        return Verdict(allow=True, command=cmd)
+        return Verdict(allow=True, layer=layer, scope_type=scope_type, scope_id=scope_id, command=cmd)
 
     # ------------------------------------------------------------------ #
     # 模型路由

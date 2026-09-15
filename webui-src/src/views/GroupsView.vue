@@ -148,21 +148,30 @@ function search() {
   load();
 }
 
-async function applyEffect(items: { scope_id: string; effect: string }[], silent = false) {
+/**
+ * 写权限规则。``feature`` 决定改的是哪一类：
+ * ``"llm"`` = LLM 对话权限，``"command"`` = 指令权限（对象级总开关）。
+ */
+async function applyPolicy(items: { scope_id: string; effect: string }[], feature = "llm", silent = false) {
   if (!items.length) {
     message.warning("请先选择群");
     return;
   }
+  const label = feature === "command" ? "指令权限" : "LLM 权限";
   try {
     await apiPost("/policy", {
-      items: items.map((i) => ({ scope_type: "group", scope_id: i.scope_id, effect: i.effect, feature: "llm" })),
+      items: items.map((i) => ({ scope_type: "group", scope_id: i.scope_id, effect: i.effect, feature })),
     });
-    if (!silent) message.success(`已更新 ${items.length} 个群的权限`);
+    if (!silent) message.success(`已更新 ${items.length} 个群的${label}`);
     checked.value = [];
     await load();
   } catch (e: any) {
     message.error(e?.message || String(e));
   }
+}
+
+function applyEffect(items: { scope_id: string; effect: string }[], silent = false) {
+  return applyPolicy(items, "llm", silent);
 }
 
 async function applyLevel(items: { scope_id: string; level_id: number | null }[]) {
@@ -181,14 +190,37 @@ async function applyLevel(items: { scope_id: string; level_id: number | null }[]
   }
 }
 
+// 批量下拉：LLM 权限与指令权限是两套独立规则，分开列，避免点错
 const batchOptions = [
-  { label: "批量放行", key: "allow" },
-  { label: "批量禁止", key: "deny" },
-  { label: "批量恢复继承", key: "inherit" },
+  {
+    type: "group",
+    label: "LLM 权限",
+    key: "g-llm",
+    children: [
+      { label: "放行", key: "llm:allow" },
+      { label: "禁止", key: "llm:deny" },
+      { label: "恢复继承", key: "llm:inherit" },
+    ],
+  },
+  {
+    type: "group",
+    label: "指令权限",
+    key: "g-cmd",
+    children: [
+      { label: "放行", key: "cmd:allow" },
+      { label: "禁止（不能用任何指令）", key: "cmd:deny" },
+      { label: "恢复继承", key: "cmd:inherit" },
+    ],
+  },
 ];
 
 async function onBatch(key: string) {
-  await applyEffect(checked.value.map((id) => ({ scope_id: id, effect: key })));
+  const [kind, effect] = String(key).split(":");
+  if (!effect) return;
+  await applyPolicy(
+    checked.value.map((id) => ({ scope_id: id, effect })),
+    kind === "cmd" ? "command" : "llm",
+  );
 }
 
 function quotaPercent(row: GroupRow): number {
@@ -243,6 +275,20 @@ const columns: DataTableColumns<GroupRow> = [
     width: 195,
     render: (row) =>
       h(EffectSegment, { effect: row.effect, onChange: (v: string) => applyEffect([{ scope_id: row.group_id, effect: v }]) }),
+  },
+  {
+    title: "指令权限",
+    key: "effect_command",
+    width: 195,
+    render: (row) =>
+      h(NTooltip, { trigger: "hover", placement: "top" }, {
+        trigger: () =>
+          h(EffectSegment, {
+            effect: row.effect_command || "inherit",
+            onChange: (v: string) => applyPolicy([{ scope_id: row.group_id, effect: v }], "command"),
+          }),
+        default: () => "指令权限：禁止 = 这个群用不了任何指令（不含等级与单条指令的细则）",
+      }),
   },
   {
     title: "生效额度",
@@ -401,7 +447,7 @@ onMounted(async () => {
         :loading="loading"
         :row-key="(row: GroupRow) => row.group_id"
         :bordered="false"
-        :scroll-x="1140"
+        :scroll-x="1350"
         size="small"
       />
       <n-space justify="end" style="margin-top: 12px">

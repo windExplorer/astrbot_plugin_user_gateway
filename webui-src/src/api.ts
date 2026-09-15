@@ -226,6 +226,8 @@ export interface FriendRow {
   avatar: string;
   avatar_id: string;
   effect: "allow" | "deny" | "inherit";
+  /** 对象级「指令权限」（feature=command）的显式值 */
+  effect_command: "allow" | "deny" | "inherit";
   level_id: number | null;
   level_name: string;
   quota: EffectiveQuota;
@@ -250,6 +252,8 @@ export interface GroupRow {
   owner: string;
   avatar_id: string;
   effect: "allow" | "deny" | "inherit";
+  /** 对象级「指令权限」（feature=command）的显式值 */
+  effect_command: "allow" | "deny" | "inherit";
   level_id: number | null;
   level_name: string;
   quota: EffectiveQuota;
@@ -292,6 +296,8 @@ export interface LevelRow {
   name: string;
   description: string;
   effect: "inherit" | "allow" | "deny";
+  /** 等级的默认**指令**权限（与 effect 分开配置） */
+  effect_command: "inherit" | "allow" | "deny";
   sort_order: number;
   /** 模型路由：主提供商 id / 备用提供商 id（一项 = 一个「提供商 · 模型」） */
   provider_id: string;
@@ -307,6 +313,7 @@ export interface LevelPayload {
   name: string;
   description?: string;
   effect?: "inherit" | "allow" | "deny";
+  effect_command?: "inherit" | "allow" | "deny";
   sort_order?: number;
   provider_id?: string;
   fallback_provider_id?: string;
@@ -372,6 +379,15 @@ export interface SubjectDetail {
   quota_chain: QuotaChainItem[];
   quota: EffectiveQuota;
   model_route: ModelRoute;
+  /** 对象级指令权限：自己配的值 + 实际生效的层 */
+  command_master: {
+    effect: "allow" | "deny" | "inherit";
+    resolved: "allow" | "deny";
+    layer: string;
+    layer_label: string;
+    scope_type: string;
+    scope_id: string;
+  };
   usage: Record<string, { used_tokens: number; reset_at: number | null }>;
   bot: LastBotMessage | null;
   days: number;

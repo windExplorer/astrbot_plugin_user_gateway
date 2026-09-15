@@ -203,6 +203,7 @@ def _fmt_group(row: dict, ctx: dict[str, Any]) -> dict:
         **row,
         "avatar_id": gid,
         "effect": ctx["policy"].get(gid, "inherit"),
+        "effect_command": ctx["cmd_master"].get(gid, "inherit"),
         "level_id": int(lv_id) if lv_id else None,
         "level_name": (lv or {}).get("name") or "",
         "quota": q,
@@ -231,6 +232,7 @@ def _fmt_friend(row: dict, ctx: dict[str, Any]) -> dict:
         "avatar": f"https://q1.qlogo.cn/g?b=qq&nk={uin}&s=100",
         "avatar_id": uin,
         "effect": ctx["policy"].get(uin, "inherit"),
+        "effect_command": ctx["cmd_master"].get(uin, "inherit"),
         "level_id": int(lv_id) if lv_id else None,
         "level_name": (lv or {}).get("name") or "",
         "quota": q,
@@ -332,6 +334,8 @@ async def _list_ctx(plugin, kind: str) -> dict[str, Any]:
             if kind == "user"
             else getattr(plugin, "_effect_group", {}) or {}
         ),
+        # 对象级「指令权限」（feature=command）的显式值：{scope_id: effect}
+        "cmd_master": dict((getattr(plugin, "_cmd_master", {}) or {}).get(kind) or {}),
         "last_bot": await store.bot_message_map(kind),
         "today": await store.usage_sums("sender_id" if kind == "user" else "group_id", from_ts, to_ts),
     }
@@ -576,6 +580,7 @@ async def h_subject(plugin) -> dict:
     bot = await plugin.store.get_bot_message(subject_type, subject_id)
     usage = await plugin.store.get_usage(subject_type, subject_id)
     model_route = plugin.model_route_of(subject_type, subject_id)
+    command_master = plugin.command_master_of(subject_type, subject_id)
 
     return ok(
         {
@@ -588,6 +593,7 @@ async def h_subject(plugin) -> dict:
             "level": level,
             "level_quotas": level_quotas,
             "model_route": model_route,
+            "command_master": command_master,
             "quota_chain": chain,
             "quota": _effective_from_chain(chain),
             "usage": usage,
@@ -646,8 +652,8 @@ async def h_set_policy(plugin) -> dict:
             return err("scope_id 不能为空")
         if effect not in ("allow", "deny", "inherit"):
             return err("effect 必须是 allow / deny / inherit")
-        if feature != "llm" and not feature.startswith("command:"):
-            return err("feature 必须是 llm 或 command:<指令名>")
+        if feature not in ("llm", "command") and not feature.startswith("command:"):
+            return err("feature 必须是 llm / command（对象级指令权限）/ command:<指令名>")
         await plugin.store.set_policy(scope_type, scope_id, effect, feature=feature)
         applied.append({"scope_type": scope_type, "scope_id": scope_id, "effect": effect, "feature": feature})
 
@@ -829,6 +835,7 @@ async def h_levels(plugin) -> dict:
                 "description": str(lv.get("description") or ""),
                 "effect": str(lv.get("effect") or "inherit"),
                 "sort_order": int(lv.get("sort_order") or 0),
+                "effect_command": str(lv.get("command_effect") or "inherit"),
                 "provider_id": str(lv.get("provider_id") or ""),
                 "fallback_provider_id": str(lv.get("fallback_provider_id") or ""),
                 "members": int(counts.get(lid, 0)),
@@ -903,9 +910,12 @@ async def h_providers(plugin) -> dict:
 async def h_set_level(plugin) -> dict:
     """新建 / 更新等级，并可同时写入该等级的额度模板。
 
-    body: ``{id?, kind, name, description?, effect?, sort_order?,
-    quotas?: [{period, limit_tokens, mode?}]}``
-    （``limit_tokens=0`` 表示删掉该周期的额度）
+    body: ``{id?, kind, name, description?, effect?, effect_command?, sort_order?,
+    provider_id?, fallback_provider_id?, quotas?: [{period, limit_tokens, mode?}]}``
+
+    - ``effect``：等级默认 **LLM** 权限；``effect_command``：等级默认 **指令** 权限
+      （``deny`` 即该等级不能用任何指令）；
+    - ``quotas`` 里 ``limit_tokens=0`` 表示「明确不限」，``null`` / ``delete=true`` 表示删掉该周期。
     """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
@@ -913,12 +923,16 @@ async def h_set_level(plugin) -> dict:
     kind = str(body.get("kind") or "user").strip()
     name = str(body.get("name") or "").strip()
     effect = str(body.get("effect") or "inherit").strip()
+    # 兼容两种写法：前端用 effect_command（与列表返回字段一致），也接受 command_effect
+    cmd_effect = str(body.get("effect_command") or body.get("command_effect") or "inherit").strip()
     if kind not in ("user", "group"):
         return err("kind 必须是 user 或 group")
     if not name:
         return err("等级名称不能为空")
     if effect not in ("inherit", "allow", "deny"):
         return err("effect 必须是 inherit / allow / deny（等级默认 LLM 权限）")
+    if cmd_effect not in ("inherit", "allow", "deny"):
+        return err("effect_command 必须是 inherit / allow / deny（等级默认指令权限）")
     try:
         sort_order = int(body.get("sort_order") or 0)
     except Exception:
@@ -941,6 +955,7 @@ async def h_set_level(plugin) -> dict:
         level_id=level_id,
         provider_id=str(body.get("provider_id") or "").strip(),
         fallback_provider_id=str(body.get("fallback_provider_id") or "").strip(),
+        command_effect=cmd_effect,
     )
     if not new_id:
         return err("等级写入失败")

@@ -44,7 +44,7 @@ try:  # 包内相对导入（AstrBot 正常加载路径）
     from . import quota as quota_mod
     from .avatar import AvatarCache
     from .gate import Cooldown, Gate, ProviderCircuit, Rules, Subject, layer_label
-    from .store import Store
+    from .store import COMMAND_MASTER_FEATURE, Store
     from .sync import SyncScheduler
     from .webui_api import register_apis
 except ImportError as _rel_err:
@@ -57,7 +57,7 @@ except ImportError as _rel_err:
         import quota as quota_mod  # type: ignore
         from avatar import AvatarCache  # type: ignore
         from gate import Cooldown, Gate, ProviderCircuit, Rules, Subject, layer_label  # type: ignore
-        from store import Store  # type: ignore
+        from store import COMMAND_MASTER_FEATURE, Store  # type: ignore
         from sync import SyncScheduler  # type: ignore
         from webui_api import register_apis  # type: ignore
     except ImportError as _flat_err:
@@ -121,8 +121,12 @@ class UserGatewayPlugin(Star):
         # 用量计数：{scope_type(user|group): {scope_id: {period: row}}}
         self._usage_user: dict[str, dict[str, dict[str, Any]]] = {}
         self._usage_group: dict[str, dict[str, dict[str, Any]]] = {}
-        # 指令权限：{指令名: {scope_type: {scope_id: effect}}}
+        # 指令权限：{指令名: {scope_type: {scope_id: effect}}}（单条指令的规则）
         self._cmd_policy: dict[str, dict[str, dict[str, str]]] = {}
+        # 对象级指令总权限：{scope_type(user|group): {scope_id: effect}}
+        self._cmd_master: dict[str, dict[str, str]] = {}
+        # 等级的默认「指令」权限：{(kind, level_id): effect}（与 LLM 的 _level_effect 分开）
+        self._level_cmd_effect: dict[tuple[str, int], str] = {}
 
         # M1：判定内核 / 提示冷却 / 后台任务
         self.gate = Gate(self._cfg)
@@ -285,6 +289,11 @@ class UserGatewayPlugin(Star):
                 (str(lv["kind"]), int(lv["id"])): str(lv.get("effect") or "inherit")
                 for lv in levels
             }
+            # 等级的默认「指令」权限（与 LLM 权限分开配置，避免互相牵连）
+            self._level_cmd_effect = {
+                (str(lv["kind"]), int(lv["id"])): str(lv.get("command_effect") or "inherit")
+                for lv in levels
+            }
             self._level_route = {
                 (str(lv["kind"]), int(lv["id"])): {
                     "provider_id": str(lv.get("provider_id") or ""),
@@ -308,7 +317,12 @@ class UserGatewayPlugin(Star):
             }
             self._usage_user = await self.store.usage_map("user")
             self._usage_group = await self.store.usage_map("group")
+            # 指令权限：单条指令的规则 + 对象级总权限（好友 / 群 / 全局）
             self._cmd_policy = await self.store.command_policies()
+            self._cmd_master = {
+                st: await self.store.effect_map(st, feature=COMMAND_MASTER_FEATURE)
+                for st in ("user", "group")
+            }
 
             if self._cfg("debug_log", False):
                 logger.info(
@@ -317,7 +331,9 @@ class UserGatewayPlugin(Star):
                     f"归级 {len(self._subject_level_user)}+{len(self._subject_level_group)} / "
                     f"限额 {sum(len(v) for v in self._limits.values())} 条 / "
                     f"用量计数 {len(self._usage_user)}+{len(self._usage_group)} 条 / "
-                    f"指令规则 {sum(len(s) for s in self._cmd_policy.values())} 条"
+                    f"指令规则 {sum(len(s) for s in self._cmd_policy.values())} 条 / "
+                    f"对象级指令权限 {len(self._cmd_master.get('user') or {})}"
+                    f"+{len(self._cmd_master.get('group') or {})} 条"
                 )
         except Exception as e:
             # 加载失败按"没有规则"处理（全部继承默认策略），不影响消息通行
@@ -339,6 +355,8 @@ class UserGatewayPlugin(Star):
             usage={"user": self._usage_user, "group": self._usage_group},
             level_model=self._level_route,
             command_policy=self._cmd_policy,
+            command_master=self._cmd_master,
+            level_command_effect=self._level_cmd_effect,
         )
 
     # ------------------------------------------------------------------ #
@@ -911,6 +929,39 @@ class UserGatewayPlugin(Star):
             return out
         except Exception as e:
             logger.debug(f"[UserGateway] 解析模型路由失败（忽略）: {e}")
+            return {}
+
+    def command_master_of(self, scope_type: str, scope_id: str) -> dict[str, Any]:
+        """给控制台用：某对象的**指令权限**（自己配的值 + 实际生效的层）。
+
+        - ``effect``：该对象自己配的三态值（``inherit`` = 没单独配）；
+        - ``resolved``：按档位链算出来的最终结论（含等级 / 全局 / 配置默认）；
+        - ``layer_label``：这个结论是哪来的（好友专属 / 好友等级 / … / 系统默认）。
+        """
+        try:
+            subject = (
+                Subject(sender_id=scope_id) if scope_type == "user" else Subject(group_id=scope_id)
+            )
+            eff, layer, st, sid = self.gate.check_command_master(subject, self._rules())
+            if not eff:
+                return {
+                    "effect": "inherit",
+                    "resolved": self.gate.default_command_effect(),
+                    "layer": "",
+                    "layer_label": "系统默认",
+                    "scope_type": "global",
+                    "scope_id": "*",
+                }
+            return {
+                "effect": str((self._cmd_master.get(scope_type) or {}).get(scope_id) or "inherit"),
+                "resolved": eff,
+                "layer": layer,
+                "layer_label": layer_label(layer),
+                "scope_type": st,
+                "scope_id": sid,
+            }
+        except Exception as e:
+            logger.debug(f"[UserGateway] 解析指令权限失败（忽略）: {e}")
             return {}
 
     def _effective_limit(self, scope_type: str, scope_id: str) -> Optional[tuple[str, dict]]:

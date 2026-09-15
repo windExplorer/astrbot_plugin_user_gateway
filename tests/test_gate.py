@@ -52,6 +52,8 @@ def R(**kw) -> G.Rules:
         usage=kw.get("usage") or {},
         level_model=kw.get("level_model") or {},
         command_policy=kw.get("command_policy") or {},
+        command_master=kw.get("command_master") or {},
+        level_command_effect=kw.get("level_command_effect") or {},
     )
 
 
@@ -364,6 +366,42 @@ def main() -> int:
     # 与 LLM 的默认策略互不影响
     check(make_gate(default_effect="deny").check_command(G.Subject(sender_id="99999"), "draw", R()).allow,
           "LLM 全局默认设成禁止后，指令仍然默认可用（两套默认互不影响）")
+
+    print("\n[14] 指令权限 · 对象级总权限（好友 / 群 / 等级）")
+    master = {"group": {"88888": "deny"}, "user": {"10001": "allow"}}
+    m_rules = R(
+        command_master=master,
+        level_command_effect={("user", 3): "deny"},
+        subject_level={"user": {"10002": 3}},
+    )
+    v = gate.check_command(G.Subject(sender_id="99999", group_id="88888"), "draw", m_rules)
+    check(not v.allow and v.layer == "group", "群级指令总权限=禁止 → 该群任何指令都拦")
+    v = gate.check_command(G.Subject(sender_id="10001", group_id="88888"), "draw", m_rules)
+    check(v.allow and v.layer == "user", "好友专属「放行」更具体 → 在禁用的群里开白名单成功")
+    v = gate.check_command(G.Subject(sender_id="10002"), "draw", m_rules)
+    check(not v.allow and v.layer == "user_level", "等级默认指令权限=禁止 → 该等级所有人不能用指令")
+    check(gate.check_command(G.Subject(sender_id="10003"), "draw", m_rules).allow, "没归级的其它人不受影响")
+    check(gate.check_command(G.Subject(sender_id="10002"), "help", m_rules).allow is False,
+          "等级禁止时任何指令都被拦（不是只拦某一条）")
+
+    # 两段式的优先级：对象级 deny 是硬拦截；对象级 allow 之后仍受单条指令规则约束
+    both = R(command_master={"group": {"88888": "deny"}}, command_policy={"draw": {"user": {"10003": "deny"}}})
+    v = gate.check_command(G.Subject(sender_id="10003"), "draw", both)
+    check(not v.allow and v.layer == "user", "单条指令规则照常生效")
+    v = gate.check_command(G.Subject(sender_id="99999", group_id="88888"), "draw", both)
+    check(not v.allow and v.layer == "group", "对象级禁止优先于单条指令（硬拦截）")
+    allowed = R(
+        command_master={"user": {"10003": "allow"}},
+        command_policy={"draw": {"global": {"*": "deny"}}},
+    )
+    v = gate.check_command(G.Subject(sender_id="10003"), "draw", allowed)
+    check(not v.allow and v.layer == "global", "对象级放行后，单条指令的全局禁止仍然生效")
+    check(gate.check_command(G.Subject(sender_id="10003"), "help", allowed).allow, "其它指令不受影响")
+    # 等级层不参与单条指令链：等级只管「整体能不能用指令」
+    lv_only = R(level_command_effect={("user", 1): "deny"}, subject_level={"user": {"10001": 1}},
+                command_policy={"draw": {"user": {"10001": "allow"}}})
+    v = gate.check_command(G.Subject(sender_id="10001"), "draw", lv_only)
+    check(not v.allow and v.layer == "user_level", "等级禁止指令时，单条指令的放行压不过它（需在对象级开白名单）")
 
     print()
     if _failures:

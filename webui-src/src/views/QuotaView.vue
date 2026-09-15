@@ -173,11 +173,12 @@ const levelForm = ref<
   name: "",
   description: "",
   effect: "inherit",
+  effect_command: "inherit",
   sort_order: 0,
   provider_id: "",
   fallback_provider_id: "",
   quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
-  });
+});
 
   function openLevelEditor(row?: LevelRow) {
   if (row) {
@@ -187,6 +188,7 @@ const levelForm = ref<
   name: row.name,
   description: row.description || "",
   effect: row.effect || "inherit",
+  effect_command: row.effect_command || "inherit",
   sort_order: row.sort_order || 0,
   provider_id: row.provider_id || "",
   fallback_provider_id: row.fallback_provider_id || "",
@@ -203,9 +205,9 @@ const levelForm = ref<
       name: "",
       description: "",
       effect: "inherit",
+      effect_command: "inherit",
       sort_order: (levels.value.length + 1) * 10,
       provider_id: "",
-      model: "",
       fallback_provider_id: "",
       quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
     };
@@ -232,6 +234,7 @@ async function saveLevel() {
       name: f.name.trim(),
       description: f.description?.trim() || "",
       effect: f.effect,
+      effect_command: f.effect_command,
       sort_order: f.sort_order,
       provider_id: f.provider_id || "",
       fallback_provider_id: f.fallback_provider_id || "",
@@ -287,26 +290,52 @@ const levelColumns: DataTableColumns<LevelRow> = [
     render: (row) => h(NTag, { size: "small", bordered: false }, { default: () => (row.kind === "group" ? "群聊" : "好友") }),
   },
   {
-    title: "默认 LLM 权限",
+    title: "默认权限",
     key: "effect",
-    width: 120,
+    width: 150,
     render: (row) =>
-      h(
-        NTooltip,
-        { trigger: "hover" },
-        {
-          trigger: () =>
-            h(
-              NTag,
-              { size: "small", bordered: false, type: row.effect === "deny" ? "error" : row.effect === "allow" ? "success" : "default" },
-              { default: () => effectText[row.effect] || row.effect },
-            ),
-          default: () =>
-            row.effect === "inherit"
-              ? "该等级不管权限，只看更具体的规则与全局默认"
-              : `属于该等级的对象默认${effectText[row.effect]}（优先级低于好友/群专属规则）`,
-        },
-      ),
+      h("div", { style: "line-height:1.5" }, [
+        h(
+          NTooltip,
+          { trigger: "hover" },
+          {
+            trigger: () =>
+              h("div", { style: "font-size:12.5px" }, [
+                "LLM：",
+                h(
+                  NTag,
+                  { size: "tiny", bordered: false, type: row.effect === "deny" ? "error" : row.effect === "allow" ? "success" : "default" },
+                  { default: () => effectText[row.effect] || row.effect },
+                ),
+              ]),
+            default: () =>
+              row.effect === "inherit"
+                ? "该等级不管 LLM 对话权限，只看更具体的规则与全局默认"
+                : `属于该等级的对象默认${effectText[row.effect]}（优先级低于好友/群专属规则）`,
+          },
+        ),
+        h(
+          NTooltip,
+          { trigger: "hover" },
+          {
+            trigger: () =>
+              h("div", { style: "font-size:12.5px" }, [
+                "指令：",
+                h(
+                  NTag,
+                  { size: "tiny", bordered: false, type: row.effect_command === "deny" ? "error" : row.effect_command === "allow" ? "success" : "default" },
+                  { default: () => effectText[row.effect_command || "inherit"] || "继承" },
+                ),
+              ]),
+            default: () =>
+              row.effect_command === "deny"
+                ? "该等级下的好友 / 群不能用任何指令（可在「私聊 / 群聊」页给个别人开白名单）"
+                : row.effect_command === "allow"
+                  ? "该等级默认允许使用指令"
+                  : "该等级不管指令权限，按更具体的规则与「指令默认策略」走",
+          },
+        ),
+      ]),
   },
   {
     title: "模型",
@@ -599,8 +628,21 @@ onMounted(load);
             <n-radio-button value="deny">禁止</n-radio-button>
           </n-radio-group>
           <span style="font-size: 12px; opacity: 0.6; margin-left: 8px">
-            「继承」= 该等级只管额度，权限交给更具体的规则与全局默认
+            「继承」= 该等级不管 LLM 对话权限
           </span>
+        </n-form-item>
+        <n-form-item label="默认指令权限">
+          <n-space vertical :size="4" style="width: 100%">
+            <n-radio-group v-model:value="levelForm.effect_command">
+              <n-radio-button value="inherit">继承</n-radio-button>
+              <n-radio-button value="allow">放行</n-radio-button>
+              <n-radio-button value="deny">禁止</n-radio-button>
+            </n-radio-group>
+            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
+              与上面的 LLM 权限<b>相互独立</b>：设成「禁止」= 该等级下的好友 / 群<b>不能用任何指令</b>；<br />
+              要给个别人开白名单，去「私聊 / 群聊」页把那个人的指令权限设为「放行」。
+            </span>
+          </n-space>
         </n-form-item>
         <n-form-item label="排序值">
           <n-input-number v-model:value="levelForm.sort_order" size="small" style="width: 140px" />

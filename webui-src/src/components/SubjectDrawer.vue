@@ -44,6 +44,18 @@ const loading = ref(false);
 const saving = ref(false);
 const detail = ref<SubjectDetail | null>(null);
 const effect = ref<string>("inherit");
+// 对象级「指令权限」（feature=command）：禁止 = 这个人/这个群用不了任何指令
+const cmdEffect = ref<string>("inherit");
+
+const cmdResolvedText = computed(() => {
+  const m = detail.value?.command_master as any;
+  if (!m) return "";
+  const word = m.resolved === "deny" ? "禁止" : "放行";
+  if (!m.layer || m.layer_label === "系统默认") {
+    return `跟随系统默认（当前：${word}）`;
+  }
+  return `生效：${word}｜来源：${m.layer_label}`;
+});
 
 // 等级
 const levels = ref<LevelRow[]>([]);
@@ -114,6 +126,7 @@ async function load() {
     const d = await apiSubject(props.type, props.id, 7);
     detail.value = d;
     effect.value = d.effect || "inherit";
+    cmdEffect.value = String((d as any).command_master?.effect || "inherit");
     levelId.value = d.level_id || 0;
     // 额度的初值：优先日额度，否则月、累计
     const rows = d.quotas || [];
@@ -188,6 +201,32 @@ async function saveEffect(next: string) {
       feature: "llm",
     });
     message.success(`已设为「${next === "allow" ? "放行" : next === "deny" ? "禁止" : "继承"}」`);
+    emit("changed");
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function saveCommandEffect(next: string) {
+  cmdEffect.value = next;
+  saving.value = true;
+  try {
+    await apiPost("/policy", {
+      scope_type: props.type,
+      scope_id: props.id,
+      effect: next,
+      feature: "command",
+    });
+    message.success(
+      next === "deny"
+        ? "已禁止该对象使用任何指令"
+        : next === "allow"
+          ? "已允许该对象使用指令"
+          : "已恢复继承",
+    );
     emit("changed");
     await load();
   } catch (e: any) {
@@ -354,12 +393,20 @@ watch(
             />
           </n-card>
 
-          <n-card size="small" title="LLM 权限">
+          <n-card size="small" title="权限">
             <n-space vertical :size="10">
               <n-space align="center" :size="10">
+                <span style="font-size: 13px; width: 56px">LLM</span>
                 <effect-segment :effect="effect" :disabled="saving" @change="saveEffect" />
                 <span style="font-size: 12px; opacity: 0.6">
-                  三者是同一个开关的互斥状态；「继承」= 不写专属规则，跟随等级 / 群 / 全局默认
+                  三者互斥；「继承」= 不写专属规则，跟随等级 / 群 / 全局默认
+                </span>
+              </n-space>
+              <n-space align="center" :size="10">
+                <span style="font-size: 13px; width: 56px">指令</span>
+                <effect-segment :effect="cmdEffect" :disabled="saving" @change="saveCommandEffect" />
+                <span style="font-size: 12px; opacity: 0.6">
+                  {{ cmdResolvedText }}（禁止 = 用不了任何指令）
                 </span>
               </n-space>
               <n-space align="center" :size="10">

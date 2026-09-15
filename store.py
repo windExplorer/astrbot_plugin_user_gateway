@@ -29,16 +29,19 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
     ) from e
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # 额度周期：越靠前越"紧凑"，超限时优先报告它
 PERIODS: tuple[str, ...] = ("day", "month", "total")
 
 # policy 表的 feature 维度：
 #   llm              → LLM 对话权限
+#   command          → **对象级指令总权限**（M5：这个好友/群/等级能不能用指令）
 #   command:<指令名>  → 某条指令的权限（指令名取 AstrBot 注册表里的完整主名，
 #                      形如 "帮助" / "群管 禁言"，别名不单独建键）
+# 注意 `command` 与 `command:%` 前缀不重叠，所以两类规则互不干扰。
 LLM_FEATURE = "llm"
+COMMAND_MASTER_FEATURE = "command"
 COMMAND_FEATURE_PREFIX = "command:"
 
 
@@ -111,7 +114,9 @@ CREATE TABLE IF NOT EXISTS llm_quota (
 );
 CREATE INDEX IF NOT EXISTS idx_quota_scope ON llm_quota(scope_type, scope_id);
 
--- 自定义等级：私聊与群聊各一套（kind 区分），等级本身可带默认 LLM 权限与模型路由
+-- 自定义等级：私聊与群聊各一套（kind 区分），等级本身可带默认权限与模型路由
+-- effect         → 默认 **LLM** 权限（inherit | allow | deny）
+-- command_effect → 默认 **指令** 权限（M5；inherit | allow | deny，deny 即该等级不能用任何指令）
 -- provider_id / fallback_provider_id 存 AstrBot 的**提供商 id**（在 AstrBot「模型提供商」里配置的那个）。
 -- 模型选择以「提供商」为单位：AstrBot 里一个提供商就对应一个模型，
 -- 再单独存一个模型名只会让配置变含混（v0.4.0 的教训），故不设该列。
@@ -121,6 +126,7 @@ CREATE TABLE IF NOT EXISTS quota_level (
     name                 TEXT    NOT NULL,
     description          TEXT    NOT NULL DEFAULT '',
     effect               TEXT    NOT NULL DEFAULT 'inherit',
+    command_effect       TEXT    NOT NULL DEFAULT 'inherit',
     sort_order           INTEGER NOT NULL DEFAULT 0,
     provider_id          TEXT    NOT NULL DEFAULT '',
     fallback_provider_id TEXT    NOT NULL DEFAULT '',
@@ -271,6 +277,17 @@ class Store:
             await cls._migrate_v2_to_v3(db)
         if old_version < 4:
             await cls._migrate_v3_to_v4(db)
+        if old_version < 5:
+            await cls._migrate_v4_to_v5(db)
+
+    @staticmethod
+    async def _migrate_v4_to_v5(db: aiosqlite.Connection) -> None:
+        """v4 → v5：等级新增「默认指令权限」列（``command_effect``）。"""
+        if "command_effect" in await Store._table_columns(db, "quota_level"):
+            return
+        await db.execute(
+            "ALTER TABLE quota_level ADD COLUMN command_effect TEXT NOT NULL DEFAULT 'inherit'"
+        )
 
     @staticmethod
     async def _migrate_v3_to_v4(db: aiosqlite.Connection) -> None:
@@ -677,23 +694,26 @@ class Store:
         level_id: Optional[int] = None,
         provider_id: str = "",
         fallback_provider_id: str = "",
+        command_effect: str = "inherit",
     ) -> int:
         """新建 / 更新等级，返回等级 id（``level_id`` 为空则按 ``(kind, name)`` 新建）。
 
-        ``provider_id`` / ``fallback_provider_id`` 是模型路由：属于该等级的对象
-        走指定提供商，主提供商不可用（未加载 / 熔断）时用备用那个。
+        - ``effect``：等级默认 **LLM** 权限；``command_effect``：等级默认 **指令** 权限；
+        - ``provider_id`` / ``fallback_provider_id`` 是模型路由：属于该等级的对象
+          走指定提供商，主提供商不可用（未加载 / 熔断）时用备用那个。
         """
         db = self._conn()
         if level_id:
             await db.execute(
                 "UPDATE quota_level SET kind = ?, name = ?, description = ?, effect = ?, "
-                "sort_order = ?, provider_id = ?, fallback_provider_id = ?, "
+                "command_effect = ?, sort_order = ?, provider_id = ?, fallback_provider_id = ?, "
                 "updated_at = ? WHERE id = ?",
                 (
                     kind,
                     name,
                     description,
                     effect,
+                    command_effect,
                     int(sort_order),
                     str(provider_id or ""),
                     str(fallback_provider_id or ""),
@@ -704,11 +724,12 @@ class Store:
             await db.commit()
             return int(level_id)
         await db.execute(
-            "INSERT INTO quota_level(kind, name, description, effect, sort_order, "
+            "INSERT INTO quota_level(kind, name, description, effect, command_effect, sort_order, "
             "provider_id, fallback_provider_id, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, name) DO UPDATE SET "
             "description = excluded.description, effect = excluded.effect, "
+            "command_effect = excluded.command_effect, "
             "sort_order = excluded.sort_order, provider_id = excluded.provider_id, "
             "fallback_provider_id = excluded.fallback_provider_id, "
             "updated_at = excluded.updated_at",
@@ -717,6 +738,7 @@ class Store:
                 name,
                 description,
                 effect,
+                command_effect,
                 int(sort_order),
                 str(provider_id or ""),
                 str(fallback_provider_id or ""),
