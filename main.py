@@ -432,6 +432,16 @@ class UserGatewayPlugin(Star):
             logger.debug(f"[UserGateway] 读取提供商列表失败（忽略）: {e}")
         return out
 
+    def _provider_by_id(self, pid: str) -> Optional[Any]:
+        """按 id 从已加载的提供商里找对象（找不到返回 None）。"""
+        try:
+            for p in self.context.get_all_providers() or []:
+                if str((getattr(p, "provider_config", {}) or {}).get("id") or "") == pid:
+                    return p
+        except Exception:
+            pass
+        return None
+
     @astr_filter.on_waiting_llm_request()
     async def route_model(self, event: AstrMessageEvent) -> None:
         """按等级把「本次请求走哪个模型」下发给 AstrBot。
@@ -469,7 +479,11 @@ class UserGatewayPlugin(Star):
             event.set_extra("selected_provider", picked["provider_id"])
             if len(self._last_route) > 2000:  # 防御性清理
                 self._last_route.clear()
-            self._last_route[subject.umo] = {**route, **picked}
+            # 把实际下发的提供商与它的模型名一起存下来：用量记录要记「真的用了谁」，
+            # 而不是 get_using_provider_async 返回的会话默认（按次下发不改会话默认）
+            prov = self._provider_by_id(picked["provider_id"])
+            model_name = str(prov.get_model() or "") if prov is not None else ""
+            self._last_route[subject.umo] = {**route, **picked, "model": model_name}
             if self._cfg("debug_log", False):
                 logger.info(
                     f"[UserGateway] 模型路由：{subject.umo} → {picked['provider_id']}"
@@ -887,14 +901,23 @@ class UserGatewayPlugin(Star):
         if ts:
             latency_ms = max(0, int((time.time() - float(ts)) * 1000))
 
-        provider_id = model = ""
-        try:
-            prov = await self.context.get_using_provider_async(subject.umo)
-            if prov is not None:
-                provider_id = str((getattr(prov, "provider_config", {}) or {}).get("id", "") or "")
-                model = str(prov.get_model() or "")
-        except Exception:
-            pass
+        # 记「真的用了谁」：本插件按等级路由过的请求，用下发时的提供商 / 模型
+        # （route_model 存在 _last_route 里）。get_using_provider_async 返回的是
+        # **会话默认**——按次下发不改会话默认，读它会错记成系统默认模型（v1.0.4 修复）。
+        # 注意 _update_circuit 只读不弹，这里弹；且 route_model 在每次请求开头都会清键，
+        # 所以不会被上一次的路由结果污染。
+        routed = self._last_route.pop(subject.umo, None) or {}
+        provider_id = str(routed.get("provider_id") or "")
+        model = str(routed.get("model") or "")
+        if not provider_id:
+            # 没经过路由 → 记 AstrBot 的会话默认
+            try:
+                prov = await self.context.get_using_provider_async(subject.umo)
+                if prov is not None:
+                    provider_id = str((getattr(prov, "provider_config", {}) or {}).get("id", "") or "")
+                    model = str(prov.get_model() or "")
+            except Exception:
+                pass
 
         # 归属对象：群消息记在群上、私聊记在人上（sender_id / group_id 另行保留，可细查）
         scope_type = "group" if subject.group_id else "user"
