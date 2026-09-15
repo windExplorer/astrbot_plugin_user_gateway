@@ -644,6 +644,31 @@ async def main() -> int:
         gs = await st.usage_sums_in_group("88888", 0, 10**12)
         check(gs.get("10002") == 42, f"群内按发言人聚合（实得 {gs}）")
         check(gs.get("10001", 0) == 0, "没有 token 的记录聚合为 0")
+
+        print("\n[15] 群成员维度的用量计数与额度（按成员设额度的基础）")
+        await st.add_used(
+            "member", "88888:10001", 120, reset_at_map={"day": 999, "month": None, "total": None}
+        )
+        await st.add_used("member", "88888:10001", 30, reset_at_map={"day": 111})
+        um = await st.usage_map("member")
+        check(um["88888:10001"]["day"]["used_tokens"] == 150,
+              f"成员用量累加（实得 {um['88888:10001']['day']['used_tokens']}）")
+        check(um["88888:10001"]["day"]["reset_at"] == 999,
+              "reset_at 只在首次创建时写入（不会被后续调用推后）")
+        check((await st.get_usage("member", "88888:10001"))["month"]["used_tokens"] == 150,
+              "月周期一起累加（与现有三维度记账一致）")
+        # 成员额度：表结构与 user/group 共用（scope_type='member'）
+        await st.upsert_quota("member", "88888:10001", "day", 500)
+        rows = await st.list_quotas_of("member", "88888:10001")
+        check(len(rows) == 1 and rows[0]["limit_tokens"] == 500, "成员额度可读")
+        check((await st.list_quotas("member"))[0]["scope_id"] == "88888:10001", "按维度列出成员额度")
+        n = await st.reset_used(scope_type="member", scope_id="88888:10001", period="day", reset_at=12345)
+        check(
+            n == 1 and (await st.get_usage("member", "88888:10001"))["day"]["used_tokens"] == 0,
+            "成员用量可单独清零",
+        )
+        check((await st.get_usage("member", "88888:10001"))["month"]["used_tokens"] == 150,
+              "清零只作用于指定周期（月用量不受影响）")
         await st.close()
 
     print()

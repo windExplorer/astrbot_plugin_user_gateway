@@ -279,9 +279,11 @@ export interface Paged<T> {
   sort?: string;
 }
 
-/** 一条限额规则。``used_tokens``：对象专属 → 该对象用量；模板（level/global）→ null。 */
+/** 一条限额规则。``used_tokens``：对象专属 → 该对象用量；模板（level/global）→ null。
+ *
+ *  ``scope_type='member'`` 时 ``scope_id`` 是「群号:QQ」（群成员维度，只影响该群）。 */
 export interface QuotaRow {
-  scope_type: "user" | "group" | "level" | "global";
+  scope_type: "user" | "group" | "member" | "level" | "global";
   scope_id: string;
   period: "day" | "month" | "total";
   limit_tokens: number;
@@ -289,6 +291,35 @@ export interface QuotaRow {
   mode: "enforce" | "observe";
   reset_at: number | null;
   updated_at: number;
+}
+
+/** 读额度规则；传 scopeId 只取这一个对象的（成员抽屉读初值用）。 */
+export function apiGetQuota(scopeType: string, scopeId?: string) {
+  const p = new URLSearchParams({ scope_type: scopeType });
+  if (scopeId) p.set("scope_id", scopeId);
+  return apiGet<{ items: QuotaRow[] }>(`/quota?${p.toString()}`);
+}
+
+/** 写额度规则。``limit_tokens=null`` = 删掉该周期（恢复继承）；``0`` = 明确「不限」。 */
+export function apiSetQuota(
+  items: {
+    scope_type: string;
+    scope_id: string;
+    period: string;
+    limit_tokens: number | null;
+    mode?: string;
+  }[],
+) {
+  return apiPost<{ applied: unknown[] }>("/quota", { items });
+}
+
+/** 清零用量（只动用量计数，不删额度配置）。 */
+export function apiResetQuota(scopeType: string, scopeId: string, period?: string) {
+  return apiPost<{ reset: number }>("/quota/reset", {
+    scope_type: scopeType,
+    scope_id: scopeId,
+    period: period || undefined,
+  });
 }
 
 /** 自定义等级（好友 / 群各一套）。 */
@@ -638,6 +669,12 @@ export interface GroupMemberRow {
   effect_command: "allow" | "deny" | "inherit";
   /** 该成员在**这个群**里的今日 token 用量 */
   today_tokens: number;
+  /** 生效额度档位（命中哪一层就展示哪一层；`layer` 为空 = 不限量） */
+  quota: EffectiveQuota;
+  quota_limit: number | null;
+  quota_used: number | null;
+  quota_mode: "enforce" | "observe" | null;
+  quota_layer: string;
 }
 
 /** 某个群的成员列表（读本地缓存，不打协议端）。 */

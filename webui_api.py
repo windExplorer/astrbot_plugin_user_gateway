@@ -329,10 +329,12 @@ async def h_ping(plugin) -> dict:
 
 
 def _fmt_member(row: dict, ctx: dict[str, Any]) -> dict:
-    """把群成员缓存行补上权限状态与本群今日用量（供「群成员」抽屉直接渲染）。"""
+    """把群成员缓存行补上权限状态、生效额度与本群今日用量（供「群成员」抽屉直接渲染）。"""
     gid = str(row.get("group_id") or "")
     uid = str(row.get("user_id") or "")
     sid = member_scope_id(gid, uid)
+    # 额度档位链与闸门同源：命中哪一层（成员专属 / 好友等级 / 群 / 全局）就展示哪一层
+    q = _effective_from_chain(ctx["plugin"].quota_chain("member", sid))
     return {
         **row,
         "avatar_id": uid,
@@ -342,6 +344,11 @@ def _fmt_member(row: dict, ctx: dict[str, Any]) -> dict:
         or uid,
         "effect": effect_in_scene(ctx["policy"].get(sid), "group") or "inherit",
         "effect_command": effect_in_scene(ctx["cmd_master"].get(sid), "group") or "inherit",
+        "quota": q,
+        "quota_limit": q["limit"] or None,
+        "quota_used": q["used"] if q["limit"] else None,
+        "quota_mode": q["mode"] or None,
+        "quota_layer": q["layer"],
         "today_tokens": int(ctx["today"].get(uid, 0)),
     }
 
@@ -635,7 +642,7 @@ async def h_group_members(plugin) -> dict:
     except Exception as e:
         logger.warning(f"[UserGateway] 统计群内成员用量失败（忽略）: {e}")
         usage = {}
-    ctx = {"policy": policy, "cmd_master": cmd_master, "today": usage}
+    ctx = {"policy": policy, "cmd_master": cmd_master, "today": usage, "plugin": plugin}
     rows = [_fmt_member(r, ctx) for r in res.get("rows", [])]
     synced_at = max([int(r.get("updated_at") or 0) for r in rows], default=0)
     return ok(
@@ -847,10 +854,18 @@ async def h_get_quota(plugin) -> dict:
     """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
-    rows = await plugin.store.list_quotas(_q("scope_type") or None)
+    st = _q("scope_type") or None
+    sid = _q("scope_id") or None
+    # 传了 scope_id 就只取这个对象的（成员抽屉设置额度时读初值用）
+    rows = (
+        await plugin.store.list_quotas_of(st, sid)
+        if (st and sid)
+        else await plugin.store.list_quotas(st)
+    )
     usage = {
         "user": getattr(plugin, "_usage_user", {}) or {},
         "group": getattr(plugin, "_usage_group", {}) or {},
+        "member": getattr(plugin, "_usage_member", {}) or {},
     }
     out = []
     for row in rows:
@@ -858,7 +873,7 @@ async def h_get_quota(plugin) -> dict:
         sid = str(row.get("scope_id") or "")
         period = str(row.get("period") or "")
         used = None
-        if st in ("user", "group"):
+        if st in ("user", "group", "member"):
             used = int(((usage.get(st) or {}).get(sid) or {}).get(period, {}).get("used_tokens") or 0)
         out.append({**row, "used_tokens": used})
     return ok({"items": out})
@@ -891,10 +906,16 @@ async def h_set_quota(plugin) -> dict:
         scope_id = str(it.get("scope_id") or "").strip()
         period = str(it.get("period") or "day").strip()
         mode = str(it.get("mode") or "enforce").strip()
-        if scope_type not in ("user", "group", "level", "global"):
-            return err("scope_type 必须是 user / group / level / global")
+        if scope_type not in ("user", "group", "member", "level", "global"):
+            return err("scope_type 必须是 user / group / member / level / global")
         if scope_type == "global":
             scope_id = "*"
+        if scope_type == "member":
+            # 按成员设额度：scope_id 是「群号:QQ」，判定时用的是他在这个群里的用量
+            gid, uid = parse_member_scope_id(scope_id)
+            if not (gid and uid):
+                return err("群成员额度的 scope_id 必须是「群号:QQ」")
+            scope_id = member_scope_id(gid, uid)
         if not scope_id:
             return err("scope_id 不能为空")
         if period not in ("day", "month", "total"):
@@ -943,8 +964,8 @@ async def h_reset_quota(plugin) -> dict:
         return err("数据库未就绪")
     body = await _payload()
     scope_type = str(body.get("scope_type") or "").strip()
-    if scope_type and scope_type not in ("user", "group"):
-        return err("scope_type 必须是 user / group（留空则全部清零）")
+    if scope_type and scope_type not in ("user", "group", "member"):
+        return err("scope_type 必须是 user / group / member（留空则全部清零）")
     n = await plugin.store.reset_used(
         scope_type=scope_type or None,
         scope_id=str(body.get("scope_id") or "").strip() or None,

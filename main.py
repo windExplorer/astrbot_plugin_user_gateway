@@ -52,7 +52,12 @@ try:  # 包内相对导入（AstrBot 正常加载路径）
         effect_in_scene,
         layer_label,
     )
-    from .store import COMMAND_MASTER_FEATURE, Store
+    from .store import (
+        COMMAND_MASTER_FEATURE,
+        Store,
+        member_scope_id,
+        parse_member_scope_id,
+    )
     from .sync import SyncScheduler
     from .webui_api import register_apis
 except ImportError as _rel_err:
@@ -73,7 +78,12 @@ except ImportError as _rel_err:
             effect_in_scene,
             layer_label,
         )
-        from store import COMMAND_MASTER_FEATURE, Store  # type: ignore
+        from store import (  # type: ignore
+            COMMAND_MASTER_FEATURE,
+            Store,
+            member_scope_id,
+            parse_member_scope_id,
+        )
         from sync import SyncScheduler  # type: ignore
         from webui_api import register_apis  # type: ignore
     except ImportError as _flat_err:
@@ -137,9 +147,11 @@ class UserGatewayPlugin(Star):
         self._level_route: dict[tuple[str, int], dict[str, str]] = {}
         # 限额规则：{scope_type(user|group|level|global): {scope_id: {period: row}}}
         self._limits: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
-        # 用量计数：{scope_type(user|group): {scope_id: {period: row}}}
+        # 用量计数：{scope_type(user|group|member): {scope_id: {period: row}}}
         self._usage_user: dict[str, dict[str, dict[str, Any]]] = {}
         self._usage_group: dict[str, dict[str, dict[str, Any]]] = {}
+        # 群成员维度：「群号:QQ」→ {period: row}（按成员设额度要用它）
+        self._usage_member: dict[str, dict[str, dict[str, Any]]] = {}
         # 指令权限：{指令名: {scope_type: {scope_id: {scene: effect}}}}（单条指令的规则）
         self._cmd_policy: dict[str, dict[str, dict[str, dict[str, str]]]] = {}
         # 对象级指令总权限：{scope_type: {scope_id: {scene: effect}}}
@@ -350,6 +362,7 @@ class UserGatewayPlugin(Star):
             }
             self._usage_user = await self.store.usage_map("user")
             self._usage_group = await self.store.usage_map("group")
+            self._usage_member = await self.store.usage_map("member")
             # 指令权限：单条指令的规则 + 对象级总权限（好友 / 群 / 全局）
             self._cmd_policy = await self.store.command_policies()
             self._cmd_master = {
@@ -387,7 +400,11 @@ class UserGatewayPlugin(Star):
             level_effect=self._level_effect,
             subject_level={"user": self._subject_level_user, "group": self._subject_level_group},
             limits=self._limits,
-            usage={"user": self._usage_user, "group": self._usage_group},
+            usage={
+                "user": self._usage_user,
+                "group": self._usage_group,
+                "member": self._usage_member,
+            },
             level_model=self._level_route,
             command_policy=self._cmd_policy,
             command_master=self._cmd_master,
@@ -901,11 +918,23 @@ class UserGatewayPlugin(Star):
             return
 
         # 累加用量计数（v2 起**无条件**记账：等级/全局额度都是模板，必须用对象自己的用量判定）
+        #
+        # 三个维度一起记：
+        #   user   = 这个人（跨群 + 私聊的合计口径）
+        #   group  = 这个群
+        #   member = 「这个人 + 这个群」（按成员设额度时要用它，群聊里才有）
+        # 只对群聊多记 member 一套，私聊没有「群成员」这个概念。
         reset_at_map = {p: quota_mod.next_reset_at(p) for p in quota_mod.PERIODS}
+        targets: list[tuple[str, str]] = []
+        if subject.sender_id:
+            targets.append(("user", subject.sender_id))
+        if subject.group_id:
+            targets.append(("group", subject.group_id))
+        if subject.group_id and subject.sender_id:
+            targets.append(("member", member_scope_id(subject.group_id, subject.sender_id)))
+
         warns: list[dict] = []
-        for st, sid in (("user", subject.sender_id), ("group", subject.group_id)):
-            if not sid:
-                continue
+        for st, sid in targets:
             try:
                 await self.store.add_used(st, sid, total, reset_at_map=reset_at_map)
             except Exception as e:
@@ -915,13 +944,25 @@ class UserGatewayPlugin(Star):
         if warns and self._cfg("notify_admin", False):
             await self._notify_admins(
                 "额度预警：" + "；".join(
-                    f"{'群' if w['scope_type'] == 'group' else '好友'}{w['scope_id']}"
+                    f"{self._scope_label(w['scope_type'], w['scope_id'])}"
                     f"（{layer_label(w.get('layer', ''))}）{w['period']} 已用 "
                     f"{w['used']}/{w['limit']}（{w['percent']}%）"
                     for w in warns
                 ),
                 subject.platform_id,
             )
+
+    @staticmethod
+    def _scope_label(scope_type: str, scope_id: str) -> str:
+        """把额度/权限对象写成一句人话（「群 88888 的成员 10001」这种）。"""
+        if scope_type == "member":
+            gid, uid = parse_member_scope_id(scope_id)
+            return f"群 {gid} 的成员 {uid}"
+        if scope_type == "group":
+            return f"群 {scope_id}"
+        if scope_type == "user":
+            return f"好友 {scope_id}"
+        return f"{scope_type} {scope_id}"
 
     def quota_chain(self, scope_type: str, scope_id: str) -> list[dict[str, Any]]:
         """列出某对象适用的**全部额度档位**（含每层限额、用量、是否生效/超限）。
@@ -935,7 +976,9 @@ class UserGatewayPlugin(Star):
             ``limits`` / ``usage`` 都是 ``{period: ...}`` 形式。
         """
         try:
-            subject = Subject(sender_id=scope_id) if scope_type == "user" else Subject(group_id=scope_id)
+            subject = self._quota_subject(scope_type, scope_id)
+            if subject is None:
+                return []
             rules = self._rules()
             refs = self.gate.layers_for(subject, rules)
         except Exception:
@@ -1050,32 +1093,49 @@ class UserGatewayPlugin(Star):
             return Subject(sender_id=scope_id, group_id="__scene_probe__")
         return Subject(sender_id=scope_id)
 
-    def _effective_limit(self, scope_type: str, scope_id: str) -> Optional[tuple[str, dict]]:
-        """取某对象**生效**的那一层限额 ``(layer, {period: row})``（与 Gate 档位链一致）。
+    def _quota_subject(self, scope_type: str, scope_id: str) -> Optional[Subject]:
+        """把「额度作用对象」转成一个用于跑档位链的 ``Subject``。
 
-        仅用于额度预警文案（闸门判定另有 Gate.check_quota，两者顺序必须一致）。
+        - ``user``   → 私聊里的这个人（会走 好友专属 → 好友等级 → 全局）
+        - ``group``  → 这个群（会走 群专属 → 群等级 → 全局）
+        - ``member`` → 这个人在这个群（会走 群成员专属 → 好友专属 → … → 群 → 全局）
         """
         sid = str(scope_id or "")
         if not sid:
             return None
-        if scope_type == "user":
-            chain = [
-                ("user", "user", sid),
-                ("user_level", "level", str(self._subject_level_user.get(sid) or "")),
-            ]
-        else:
-            chain = [
-                ("group", "group", sid),
-                ("group_level", "level", str(self._subject_level_group.get(sid) or "")),
-            ]
-        chain.append(("global", "global", "*"))
-        for layer, st, sid2 in chain:
-            if not sid2:
-                continue
-            limits = (self._limits.get(st) or {}).get(sid2) or {}
-            if limits:
-                return layer, limits
+        if scope_type == "member":
+            gid, uid = parse_member_scope_id(sid)
+            if not (gid and uid):
+                return None
+            return Subject(sender_id=uid, group_id=gid)
+        if scope_type == "group":
+            return Subject(group_id=sid)
+        return Subject(sender_id=sid)
+
+    def _effective_limit(self, scope_type: str, scope_id: str) -> Optional[tuple[str, dict]]:
+        """取某对象**生效**的那一层限额 ``(layer, {period: row})``。
+
+        直接复用闸门的档位链（``gate.layers_for``），而不是再手写一条 ——
+        以前这里是手写的副本，加了「群成员」这一层后很容易和闸门漂移。
+        仅用于额度预警文案（真正的拦截判定在 ``Gate.check_quota``）。
+        """
+        subject = self._quota_subject(scope_type, scope_id)
+        if subject is None:
+            return None
+        rules = self._rules()
+        for ref in self.gate.layers_for(subject, rules):
+            rows = rules.limits_of(ref.scope_type, ref.scope_id)
+            if rows:
+                return ref.layer, dict(rows)
         return None
+
+    def _usage_table(self, scope_type: str) -> dict[str, dict[str, dict[str, Any]]]:
+        """取某维度的内存用量计数表（闸门热路径与预警共用同一份）。"""
+        if scope_type == "user":
+            return self._usage_user
+        if scope_type == "group":
+            return self._usage_group
+        return self._usage_member
 
     def _bump_memory_usage(self, scope_type: str, scope_id: str, tokens: int) -> list[dict]:
         """把刚消费的 token 同步进内存用量计数，返回本次新触发的额度预警。
@@ -1085,7 +1145,7 @@ class UserGatewayPlugin(Star):
         """
         if tokens <= 0:
             return []
-        table = self._usage_user if scope_type == "user" else self._usage_group
+        table = self._usage_table(scope_type)
         rows = table.setdefault(str(scope_id), {})
         before: dict[str, int] = {}
         for period in quota_mod.PERIODS:

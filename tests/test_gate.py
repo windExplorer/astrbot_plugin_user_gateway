@@ -549,6 +549,60 @@ def main() -> int:
           "指令：只禁该成员 → 他被拦")
     check(gate.check_command(G.Subject(sender_id="10001"), "draw", mc2).allow, "指令：私聊不受影响")
 
+    print("\n[17] 按成员的额度（member 维度）")
+    mq = R(
+        limits={"member": {"88888:10001": {"day": lim(100)}}},
+        usage={"member": {"88888:10001": {"day": used(90)}}},
+    )
+    v = gate.check_quota(G.Subject(sender_id="10001", group_id="88888"), mq)
+    check(v.allow and v.layer == "member", "未超限 → 放行，且生效档位是「群成员专属」")
+    check(v.limit == 100 and v.used == 90, f"报告的是成员额度（实得 {v.used}/{v.limit}）")
+    mq2 = R(
+        limits={"member": {"88888:10001": {"day": lim(100)}}},
+        usage={"member": {"88888:10001": {"day": used(100)}}},
+    )
+    v = gate.check_quota(G.Subject(sender_id="10001", group_id="88888"), mq2)
+    check(not v.allow and v.layer == "member", "达到上限 → 拦下，来源 member 层")
+    check(gate.check_quota(G.Subject(sender_id="10001", group_id="99999"), mq2).allow,
+          "同一份成员额度只作用于配置的那个群")
+    check(gate.check_quota(G.Subject(sender_id="10002", group_id="88888"), mq2).allow,
+          "同群别的成员不受影响")
+    mq3 = R(
+        limits={
+            "member": {"88888:10001": {"day": lim(100)}},
+            "user": {"10001": {"day": lim(10)}},
+            "group": {"88888": {"day": lim(1)}},
+        },
+        usage={
+            "member": {"88888:10001": {"day": used(50)}},
+            "user": {"10001": {"day": used(9999)}},
+            "group": {"88888": {"day": used(9999)}},
+        },
+    )
+    v = gate.check_quota(G.Subject(sender_id="10001", group_id="88888"), mq3)
+    check(v.allow and v.layer == "member", "成员额度优先于好友与群额度（各层用量互不干扰）")
+    v = gate.check_quota(G.Subject(sender_id="10001"), mq3)
+    check(not v.allow and v.layer == "user", "私聊里没有成员层 → 仍按好友额度拦下")
+    mq4 = R(
+        limits={"member": {"88888:10001": {"day": lim(100)}}},
+        usage={"user": {"10001": {"day": used(9999)}}},  # 跨群合计很大，但他在这个群里没用过
+    )
+    check(gate.check_quota(G.Subject(sender_id="10001", group_id="88888"), mq4).allow,
+          "member 层取「他在这个群」的用量，不受跨群合计影响")
+    # 成员层配了额度后就不再往更粗的层回落（与既有的「占位」语义一致）
+    mq5 = R(
+        limits={
+            "member": {"88888:10001": {"day": lim(100)}},
+            "group": {"88888": {"day": lim(10)}},
+        },
+        usage={
+            "member": {"88888:10001": {"day": used(10)}},
+            "group": {"88888": {"day": used(9999)}},
+        },
+    )
+    check(gate.check_quota(G.Subject(sender_id="10001", group_id="88888"), mq5).allow,
+          "成员层有额度 → 群层的超额不再影响他（档位占位语义）")
+
     print()
     if _failures:
         print(f"失败 {len(_failures)} 项：")

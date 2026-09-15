@@ -99,7 +99,10 @@ async function load() {
     ]);
     levels.value = lv.items || [];
     globalRows.value = glob.items || [];
-    specificRows.value = (all.items || []).filter((r) => r.scope_type === "user" || r.scope_type === "group");
+    // 对象专属额度：好友 / 群 / 群成员（member 的 scope_id 是「群号:QQ」）
+    specificRows.value = (all.items || []).filter(
+      (r) => r.scope_type === "user" || r.scope_type === "group" || r.scope_type === "member",
+    );
     providers.value = prov.items || [];
     circuitOpen.value = prov.circuit_open || [];
     defaultProviderId.value = (prov as any).default_id || "";
@@ -408,7 +411,7 @@ const levelColumns: DataTableColumns<LevelRow> = [
 const showQuotaEditor = ref(false);
 const quotaSaving = ref(false);
 const quotaForm = ref({
-  scope_type: "user" as "user" | "group",
+  scope_type: "user" as "user" | "group" | "member",
   scope_id: "",
   period: "day" as "day" | "month" | "total",
   limit_tokens: 100000,
@@ -418,7 +421,7 @@ const quotaForm = ref({
 function openQuotaEditor(row?: QuotaRow) {
   quotaForm.value = row
     ? {
-        scope_type: row.scope_type as "user" | "group",
+        scope_type: row.scope_type as "user" | "group" | "member",
         scope_id: row.scope_id,
         period: row.period,
         limit_tokens: row.limit_tokens,
@@ -429,9 +432,17 @@ function openQuotaEditor(row?: QuotaRow) {
 }
 
 async function saveQuota() {
-  if (!quotaForm.value.scope_id.trim()) {
+  const sid = quotaForm.value.scope_id.trim();
+  if (!sid) {
     message.warning("请填写 QQ 号或群号");
     return;
+  }
+  if (quotaForm.value.scope_type === "member") {
+    const [gid, uid] = sid.split(":");
+    if (!gid || !uid) {
+      message.warning("群成员额度要填「群号:QQ」，例如 123456789:987654321");
+      return;
+    }
   }
   quotaSaving.value = true;
   try {
@@ -470,6 +481,12 @@ async function removeQuota(row: QuotaRow) {
   }
 }
 
+/** 成员额度的 scope_id 是「群号:QQ」，展示成人话才看得懂。 */
+function memberLabel(scopeId: string): string {
+  const [gid, uid] = String(scopeId || "").split(":");
+  return `群 ${gid} 的成员 ${uid}`;
+}
+
 function pct(row: QuotaRow): number {
   if (!row.limit_tokens) return 0;
   return Math.min(100, Math.round((Number(row.used_tokens || 0) / row.limit_tokens) * 100));
@@ -480,11 +497,16 @@ const quotaColumns: DataTableColumns<QuotaRow> = [
     title: "对象",
     key: "scope_id",
     minWidth: 160,
-    render: (row) =>
-      h("div", { style: "line-height:1.3" }, [
-        h("div", { style: "font-weight:500" }, row.scope_id),
-        h("div", { style: "font-size:12px;opacity:.65" }, row.scope_type === "user" ? "QQ 好友" : "群聊"),
-      ]),
+    render: (row) => {
+      const [kindText, idText] =
+        row.scope_type === "member"
+          ? ["群成员", memberLabel(row.scope_id)]
+          : [row.scope_type === "user" ? "QQ 好友" : "群聊", row.scope_id];
+      return h("div", { style: "line-height:1.3" }, [
+        h("div", { style: "font-weight:500" }, idText),
+        h("div", { style: "font-size:12px;opacity:.65" }, kindText),
+      ]);
+    },
   },
   { title: "周期", key: "period", width: 80, render: (row) => periodLabel[row.period] || row.period },
   {
@@ -763,10 +785,19 @@ onMounted(load);
           <n-radio-group v-model:value="quotaForm.scope_type">
             <n-radio-button value="user">QQ 好友</n-radio-button>
             <n-radio-button value="group">群聊</n-radio-button>
+            <n-radio-button value="member">群成员</n-radio-button>
           </n-radio-group>
         </n-form-item>
-        <n-form-item :label="quotaForm.scope_type === 'user' ? 'QQ 号' : '群号'">
-          <n-input v-model:value="quotaForm.scope_id" placeholder="如 123456789" />
+        <n-form-item
+          :label="quotaForm.scope_type === 'user' ? 'QQ 号' : quotaForm.scope_type === 'group' ? '群号' : '群号:QQ'"
+        >
+          <n-input
+            v-model:value="quotaForm.scope_id"
+            :placeholder="quotaForm.scope_type === 'member' ? '如 123456789:987654321（群号:QQ）' : '如 123456789'"
+          />
+          <span v-if="quotaForm.scope_type === 'member'" style="font-size: 12px; opacity: 0.6">
+            只统计他在这个群里的用量，是「群成员级」额度
+          </span>
         </n-form-item>
         <n-form-item label="周期">
           <n-select

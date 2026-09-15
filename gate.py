@@ -281,14 +281,16 @@ class Gate:
 
         # 群成员专属放在**最前面**：它限定了「这个人 + 这个群」，是范围最窄的一层，
         # 所以能覆盖好友 / 等级 / 群规则（例如「整群禁止，但给某个成员放行」）。
+        # 额度也走这一层：用量必须是「他在**这个群**里的量」，
+        # 所以 usage_type 用 member（键同样是「群号:QQ」），而不是该用户跨群的合计。
         if uid and gid:
             out.append(
                 LayerRef(
                     LAYER_MEMBER,
                     "member",
                     member_scope_id(gid, uid),
-                    "user",
-                    uid,
+                    "member",
+                    member_scope_id(gid, uid),
                     scene,
                 )
             )

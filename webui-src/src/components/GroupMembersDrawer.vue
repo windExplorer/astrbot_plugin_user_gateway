@@ -16,7 +16,12 @@ import {
   NDrawerContent,
   NEmpty,
   NInput,
+  NInputNumber,
+  NModal,
   NPagination,
+  NProgress,
+  NRadioButton,
+  NRadioGroup,
   NSpace,
   NSpin,
   NTag,
@@ -26,8 +31,11 @@ import {
 } from "naive-ui";
 
 import {
+  apiGetQuota,
   apiGroupMembers,
   apiPost,
+  apiResetQuota,
+  apiSetQuota,
   apiSyncGroupMembers,
   type GroupMemberRow,
 } from "../api";
@@ -73,6 +81,16 @@ const roleMeta: Record<string, { text: string; type: "success" | "info" | "defau
 function fmtTime(ts: number): string {
   return ts ? new Date(ts * 1000).toLocaleString() : "从未";
 }
+
+function fmtNum(n: number | undefined | null): string {
+  const v = Number(n || 0);
+  if (v >= 1_000_000) return (v / 1_000_000).toFixed(2) + "M";
+  if (v >= 1_000) return (v / 1_000).toFixed(1) + "K";
+  return String(v);
+}
+
+const periodText = (p: string) => (p === "day" ? "每日" : p === "month" ? "每月" : "累计");
+const PERIODS = ["day", "month", "total"] as const;
 
 async function load() {
   if (!props.groupId) return;
@@ -172,6 +190,129 @@ function search() {
   load();
 }
 
+// ------ 额度：给「这个人 + 这个群」单独设 token 限额 ------
+// 判定时用的是**他在这个群里的用量**（member 维度），所以不会与别的群互相干扰。
+const quotaShow = ref(false);
+const quotaTargets = ref<string[]>([]);
+const quotaSaving = ref(false);
+const quotaMode = ref<"enforce" | "observe">("enforce");
+// 三个周期各自填值：null = 不修改，0 = 明确「不限」，>0 = 设上限
+const quotaForm = ref<{ day: number | null; month: number | null; total: number | null }>({
+  day: null,
+  month: null,
+  total: null,
+});
+// 被点「清除」的周期 → 写成 null（删掉规则、恢复继承）
+const quotaCleared = ref<string[]>([]);
+
+const quotaTargetLabel = computed(() =>
+  quotaTargets.value.length === 1
+    ? `成员 ${quotaTargets.value[0]}`
+    : `${quotaTargets.value.length} 个成员`,
+);
+
+function sidOf(uid: string): string {
+  return `${props.groupId}:${uid}`;
+}
+
+function quotaPercent(row: GroupMemberRow): number {
+  const q = row.quota;
+  if (!q?.limit) return 0;
+  return Math.min(100, Math.round(((q.used || 0) / q.limit) * 100));
+}
+
+/** 打开额度弹窗；``row`` 为空表示对勾选的成员批量设置。 */
+async function openQuota(row?: GroupMemberRow) {
+  quotaTargets.value = row ? [row.user_id] : [...checked.value];
+  if (!quotaTargets.value.length) {
+    message.warning("请先选择成员");
+    return;
+  }
+  quotaForm.value = { day: null, month: null, total: null };
+  quotaCleared.value = [];
+  quotaMode.value = "enforce";
+  quotaShow.value = true;
+  if (row) {
+    // 单个成员：把已配的额度读出来当初值
+    try {
+      const res = await apiGetQuota("member", sidOf(row.user_id));
+      for (const it of res.items || []) {
+        if (it.period === "day" || it.period === "month" || it.period === "total") {
+          quotaForm.value[it.period] = Number(it.limit_tokens);
+          quotaMode.value = (it.mode as "enforce" | "observe") || "enforce";
+        }
+      }
+    } catch {
+      /* 读不到就当没配过 */
+    }
+  }
+}
+
+function clearPeriod(p: "day" | "month" | "total") {
+  quotaForm.value[p] = null;
+  if (!quotaCleared.value.includes(p)) quotaCleared.value.push(p);
+}
+
+async function saveQuota() {
+  const items: {
+    scope_type: string;
+    scope_id: string;
+    period: string;
+    limit_tokens: number | null;
+    mode?: string;
+  }[] = [];
+  for (const uid of quotaTargets.value) {
+    for (const p of ["day", "month", "total"] as const) {
+      const sid = sidOf(uid);
+      if (quotaCleared.value.includes(p)) {
+        items.push({ scope_type: "member", scope_id: sid, period: p, limit_tokens: null });
+        continue;
+      }
+      const v = quotaForm.value[p];
+      if (v === null || v === undefined) continue; // 留空 = 不动这个周期
+      items.push({
+        scope_type: "member",
+        scope_id: sid,
+        period: p,
+        limit_tokens: Number(v),
+        mode: quotaMode.value,
+      });
+    }
+  }
+  if (!items.length) {
+    message.warning("没有要修改的周期（留空表示不修改）");
+    return;
+  }
+  quotaSaving.value = true;
+  try {
+    await apiSetQuota(items);
+    message.success(`已更新 ${quotaTargets.value.length} 个成员的额度（仅本群生效）`);
+    quotaShow.value = false;
+    await load();
+    emit("changed");
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    quotaSaving.value = false;
+  }
+}
+
+async function resetUsage() {
+  if (!quotaTargets.value.length) return;
+  quotaSaving.value = true;
+  try {
+    for (const uid of quotaTargets.value) {
+      await apiResetQuota("member", sidOf(uid));
+    }
+    message.success("已清零这些成员在本群的用量");
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    quotaSaving.value = false;
+  }
+}
+
 const columns: DataTableColumns<GroupMemberRow> = [
   {
     title: "成员",
@@ -221,6 +362,62 @@ const columns: DataTableColumns<GroupMemberRow> = [
         effect: row.effect_command,
         onChange: (v: string) => applyPolicy([{ user_id: row.user_id, effect: v }], "command"),
       }),
+  },
+  {
+    title: () =>
+      h(NTooltip, { trigger: "hover" }, {
+        trigger: () => h("span", {}, "额度（本群）"),
+        default: () =>
+          "给这个人单独设 token 限额（本群专属）：判定用的是他在这个群里的用量，" +
+          "不影响别的群，也不受「好友级额度」的跨群合计干扰",
+      }),
+    key: "quota",
+    width: 200,
+    render: (row) => {
+      const q = row.quota;
+      if (!q || !q.limit) {
+        return h("div", { style: "display:flex;align-items:center;gap:6px" }, [
+          h(NTag, { size: "tiny", bordered: false }, { default: () => "不限量" }),
+          h(NButton, { size: "tiny", quaternary: true, onClick: () => openQuota(row) }, { default: () => "设额度" }),
+        ]);
+      }
+      return h("div", { style: "min-width:170px" }, [
+        h(
+          "div",
+          { style: "font-size:12px;margin-bottom:2px;display:flex;justify-content:space-between;gap:8px" },
+          [
+            h("span", {}, `${fmtNum(q.used)} / ${fmtNum(q.limit)}`),
+            h(NTooltip, { trigger: "hover" }, {
+              trigger: () =>
+                h(
+                  NTag,
+                  {
+                    size: "tiny",
+                    bordered: false,
+                    type: q.mode === "observe" ? "warning" : "default",
+                  },
+                  { default: () => q.layer_label },
+                ),
+              default: () =>
+                `生效档位：${q.layer_label}｜周期：${periodText(q.period)}` +
+                `${q.mode === "observe" ? "｜观察模式（只记账不拦截）" : ""}`,
+            }),
+          ],
+        ),
+        h(NProgress, {
+          type: "line",
+          percentage: quotaPercent(row),
+          height: 6,
+          showIndicator: false,
+          status: q.exceeded ? "error" : undefined,
+        }),
+        h(
+          NButton,
+          { size: "tiny", quaternary: true, style: "margin-top:2px", onClick: () => openQuota(row) },
+          { default: () => "设额度" },
+        ),
+      ]);
+    },
   },
   {
     title: "本群今日用量",
@@ -289,6 +486,7 @@ watch(
           <n-dropdown trigger="click" :options="batchOptions" @select="onBatch">
             <n-button size="small" type="primary" ghost>批量权限</n-button>
           </n-dropdown>
+          <n-button size="small" ghost @click="openQuota()">批量额度</n-button>
         </n-space>
 
         <n-spin :show="loading">
@@ -334,5 +532,48 @@ watch(
         </n-spin>
       </n-space>
     </n-drawer-content>
+
+    <n-modal
+      v-model:show="quotaShow"
+      preset="card"
+      :title="`设置额度：${quotaTargetLabel}（仅本群生效）`"
+      style="width: 640px"
+    >
+      <n-space vertical :size="12">
+        <span style="font-size: 12px; opacity: 0.7; line-height: 1.6">
+          留空 = <b>不修改</b>该周期；填 <b>0</b> = 明确「<b>不限</b>」（会占住档位，更粗的额度不再生效）；
+          填数字 = 设上限。<br />
+          判定用的是<b>他在这个群里的用量</b>，所以不影响别的群、也不受「好友级额度」的跨群合计干扰。
+        </span>
+        <n-space v-for="p in PERIODS" :key="p" align="center" :size="8">
+          <span style="width: 44px; font-size: 13px">{{ periodText(p) }}</span>
+          <n-input-number
+            v-model:value="quotaForm[p]"
+            :min="0"
+            :show-button="false"
+            clearable
+            placeholder="留空 = 不修改"
+            style="width: 190px"
+          >
+            <template #suffix>token</template>
+          </n-input-number>
+          <n-button size="tiny" quaternary @click="clearPeriod(p)">清除该周期额度</n-button>
+        </n-space>
+        <n-space align="center" :size="10">
+          <span style="font-size: 13px">超限处理</span>
+          <n-radio-group v-model:value="quotaMode" size="small">
+            <n-radio-button value="enforce">拦截</n-radio-button>
+            <n-radio-button value="observe">只观察</n-radio-button>
+          </n-radio-group>
+        </n-space>
+        <n-space justify="space-between" align="center">
+          <n-button size="small" quaternary @click="resetUsage">清零本群用量</n-button>
+          <n-space :size="8">
+            <n-button size="small" @click="quotaShow = false">取消</n-button>
+            <n-button size="small" type="primary" :loading="quotaSaving" @click="saveQuota">保存</n-button>
+          </n-space>
+        </n-space>
+      </n-space>
+    </n-modal>
   </n-drawer>
 </template>
