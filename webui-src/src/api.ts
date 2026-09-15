@@ -700,6 +700,32 @@ export function apiSyncGroupMembers(groupId: string, platformId = "") {
   );
 }
 
+// ---------------------------------------------------------------- 规则备份 / 迁移
+
+/** 导出全部**规则类**配置（权限 / 等级 / 归级 / 额度）为 JSON 文本。 */
+export function apiExportRules() {
+  return apiGet<{ filename: string; content: string; meta: Record<string, any> }>(
+    "/rules/export",
+    60000,
+  );
+}
+
+/** 导入统计。 */
+export interface ImportStats {
+  mode: "merge" | "replace";
+  levels: number;
+  subject_levels: number;
+  quotas: number;
+  policies: number;
+  /** 被跳过的不合法行数（导入是「尽量恢复」，坏行不会让整次失败） */
+  skipped: number;
+}
+
+/** 导入规则。``replace`` 会先清空「权限 / 等级 / 归级 / 额度」再导入（用量与日志不动）。 */
+export function apiImportRules(mode: "merge" | "replace", content: string) {
+  return apiPost<ImportStats>("/rules/import", { mode, content }, 60000);
+}
+
 /** 管理员操作审计（谁在什么时候改了什么规则）。 */
 export interface AuditRow {
   id: number;

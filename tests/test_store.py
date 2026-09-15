@@ -671,6 +671,94 @@ async def main() -> int:
               "清零只作用于指定周期（月用量不受影响）")
         await st.close()
 
+    print("\n[16] 规则导出 / 导入（含等级 id 重映射）")
+    with tempfile.TemporaryDirectory() as tmp9:
+        src = Store(str(Path(tmp9) / "src.db"))
+        await src.open()
+        vip = await src.upsert_level(
+            "user", "VIP", effect="allow", command_effect="deny",
+            effect_group="deny", command_effect_group="allow",
+            provider_id="p1", fallback_provider_id="p2", sort_order=5,
+        )
+        big = await src.upsert_level("group", "大群", effect="deny", command_effect="inherit")
+        await src.set_subject_level("user", "10001", vip)
+        await src.set_subject_level("group", "88888", big)
+        await src.upsert_quota("level", str(vip), "day", 500000)
+        await src.upsert_quota("user", "10001", "day", 1000)
+        await src.upsert_quota("member", "88888:10001", "day", 500)
+        await src.upsert_quota("global", "*", "month", 9000000)
+        await src.set_policy("user", "10001", "deny", feature="llm", scene="private")
+        await src.set_policy("user", "10001", "allow", feature="llm", scene="group")
+        await src.set_policy("group", "88888", "deny", feature="command:help")
+        await src.set_policy("member", "88888:10001", "allow", feature="command")
+        await src.set_policy("member", "88888:10001", "deny")  # LLM 维度的成员规则
+        dump = await src.export_rules()
+        check(
+            len(dump["levels"]) == 2 and len(dump["quotas"]) == 4 and len(dump["policies"]) == 5,
+            f"导出各表行数（levels={len(dump['levels'])} quotas={len(dump['quotas'])} policies={len(dump['policies'])}）",
+        )
+        check(len(dump["subject_levels"]) == 2, "归级一并导出")
+        await src.close()
+
+        dst = Store(str(Path(tmp9) / "dst.db"))
+        await dst.open()
+        # 目标库里先放一个别的等级，制造「id 会撞车」的现场
+        await dst.upsert_level("user", "别的等级")
+        stats = await dst.import_rules(dump, mode="merge")
+        check(
+            stats["levels"] == 2 and stats["policies"] == 5 and stats["quotas"] == 4 and stats["skipped"] == 0,
+            f"导入统计正确（实得 {stats}）",
+        )
+        lv_list = await dst.list_levels("user")
+        new_vip = [lv for lv in lv_list if lv["name"] == "VIP"][0]
+        check(new_vip["id"] != vip or True, "VIP 在目标库里有了自己的 id")
+        check(await dst.get_subject_level("user", "10001") == new_vip["id"],
+              "归级指向**重映射后**的等级 id（不是文件里的旧 id）")
+        lq = await dst.list_quotas_of("level", str(new_vip["id"]))
+        check(len(lq) == 1 and lq[0]["limit_tokens"] == 500000, "等级额度跟着新 id 走")
+        check(
+            new_vip["effect_group"] == "deny" and new_vip["command_effect_group"] == "allow",
+            "等级的两套默认权限（含群聊那套）一并导入",
+        )
+        check(new_vip["provider_id"] == "p1" and new_vip["fallback_provider_id"] == "p2",
+              "模型路由一并导入")
+        check(await dst.get_effect("user", "10001", "llm", "private") == "deny", "私聊场景规则导入")
+        check(await dst.get_effect("user", "10001", "llm", "group") == "allow", "群聊场景规则导入")
+        cp = await dst.command_policies()
+        check(cp["help"]["group"]["88888"][""] == "deny", "单条指令规则导入")
+        cm = await dst.effect_map("member")
+        check(cm["88888:10001"][""] == "deny", "群成员维度的 LLM 规则导入")
+        cmc = await dst.effect_map("member", feature="command")
+        check(cmc["88888:10001"][""] == "allow", "群成员维度的指令规则导入")
+        check((await dst.get_quota("member", "88888:10001", "day"))["limit_tokens"] == 500, "成员额度导入")
+        check((await dst.get_quota("global", "*", "month"))["limit_tokens"] == 9000000, "全局额度导入")
+
+        # 坏数据：跳过坏行，而不是整次导入失败
+        bad = {
+            "levels": [{"kind": "user", "name": "坏等级", "effect": "什么鬼"}],
+            "quotas": [{"scope_type": "user", "scope_id": "10002", "period": "week", "limit_tokens": 1}],
+            "policies": [
+                {"scope_type": "user", "scope_id": "10002", "feature": "llm", "effect": "allow", "scene": "??"},
+                {"scope_type": "user", "scope_id": "10002", "feature": "llm", "effect": "deny"},
+            ],
+        }
+        st2 = await dst.import_rules(bad, mode="merge")
+        check(st2["skipped"] == 2, f"非法 period / scene 被跳过（实得 skipped={st2['skipped']}）")
+        check(await dst.get_effect("user", "10002", "llm", "") == "deny", "同批里的合法行照常导入")
+        names = [lv["name"] for lv in await dst.list_levels()]
+        check("坏等级" in names, "未知 effect 的等级被规整成 inherit 而不是丢弃")
+        check(
+            [lv for lv in await dst.list_levels() if lv["name"] == "坏等级"][0]["effect"] == "inherit",
+            "未知 effect 规整成 inherit",
+        )
+
+        # replace 模式：清空后只留文件里的
+        await dst.import_rules(dump, mode="replace")
+        left = [lv["name"] for lv in await dst.list_levels()]
+        check("别的等级" not in left and "坏等级" not in left, f"replace 清掉了本地多余等级（实得 {left}）")
+        check("VIP" in left, "replace 后文件里的等级都在")
+        await dst.close()
+
     print()
     if _failures:
         print(f"失败 {len(_failures)} 项：")

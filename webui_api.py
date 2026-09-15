@@ -36,10 +36,12 @@ except Exception:  # pragma: no cover - 仅本地静态检查时缺失
 
 try:  # 与 main.py 同样的双形态导入（包内正常加载 / 平铺调试）
     from .gate import effect_in_scene
+    from .store import SCHEMA_VERSION as STORE_SCHEMA_VERSION
     from .store import member_scope_id, parse_member_scope_id
     from .sync import sync_group_members
 except ImportError:  # pragma: no cover - 本地平铺调试
     from gate import effect_in_scene  # type: ignore
+    from store import SCHEMA_VERSION as STORE_SCHEMA_VERSION  # type: ignore
     from store import member_scope_id, parse_member_scope_id  # type: ignore
     from sync import sync_group_members  # type: ignore
 
@@ -1043,6 +1045,84 @@ async def h_stats_commands(plugin) -> dict:
     )
 
 
+async def h_export_rules(plugin) -> dict:
+    """导出全部**规则类**配置（权限 / 等级 / 归级 / 额度）为一个 JSON 文件。
+
+    不含用量、明细、审计与成员缓存（历史数据跟着规则搬没意义，也会让文件很大）。
+    返回 ``{filename, content, meta}``，前端用 Blob 落地（桥接下拿不到下载 URL）。
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    try:
+        data = await plugin.store.export_rules()
+    except Exception as e:
+        logger.error(f"[UserGateway] 导出规则失败: {e}")
+        return err(f"导出失败：{e}")
+    meta = {
+        "plugin": "astrbot_plugin_user_gateway",
+        "version": str(getattr(plugin, "plugin_version", "") or ""),
+        # 结构版本：导入时会拿它和当前版本比，来自更新版本的备份直接拒绝（避免丢字段）
+        "schema_version": int(STORE_SCHEMA_VERSION),
+        "exported_at": int(time.time()),
+        "counts": {k: len(v) for k, v in data.items()},
+    }
+    payload = {"meta": meta, **data}
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return ok(
+        {
+            "filename": f"user_gateway_rules_{stamp}.json",
+            "content": json.dumps(payload, ensure_ascii=False, indent=2),
+            "meta": meta,
+        }
+    )
+
+
+async def h_import_rules(plugin) -> dict:
+    """导入规则。body: ``{mode?: "merge"|"replace", content?: "json 文本", data?: {...}}``。
+
+    - ``merge``（默认）只覆盖文件里出现的条目；
+    - ``replace`` 先清空「权限 / 等级 / 归级 / 额度」四类规则再导入（用量与日志不动）。
+
+    导入会**重映射等级 id**（详见 ``store.import_rules`` 的说明）。
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    body = await _payload()
+    mode = "replace" if str(body.get("mode") or "").lower() == "replace" else "merge"
+
+    data = body.get("data")
+    if data is None:
+        content = body.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return err("缺少导入内容（data 或 content）")
+        try:
+            data = json.loads(content)
+        except Exception as e:
+            return err(f"JSON 解析失败：{e}")
+    if not isinstance(data, dict):
+        return err("导入内容必须是一个 JSON 对象")
+
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    file_ver = int(meta.get("schema_version") or 0)
+    if file_ver and file_ver > int(STORE_SCHEMA_VERSION):
+        return err(
+            f"这份备份来自更新的插件版本（结构 v{file_ver} > 当前 v{STORE_SCHEMA_VERSION}），"
+            "请先升级插件再导入，否则可能丢字段。"
+        )
+
+    try:
+        stats = await plugin.store.import_rules(data, mode=mode)
+    except Exception as e:
+        logger.exception("[UserGateway] 导入规则失败")
+        return err(f"导入失败：{e}")
+    await plugin.store.log_audit(
+        "console", "import_rules", json.dumps(stats, ensure_ascii=False)
+    )
+    # 导入后立刻重建内存规则，让闸门用上新配置
+    await plugin.reload_rules()
+    return ok(stats)
+
+
 async def h_audit(plugin) -> dict:
     """管理员操作审计。"""
     if not (plugin.store and plugin.store.ready):
@@ -1495,6 +1575,8 @@ def register_apis(plugin) -> None:
         ("/usage", h_usage, ["GET"]),
         ("/usage/export", h_usage_export, ["GET"]),
         ("/stats/commands", h_stats_commands, ["GET"]),
+        ("/rules/export", h_export_rules, ["GET"]),
+        ("/rules/import", h_import_rules, ["POST"]),
         ("/audit", h_audit, ["GET"]),
     ]
     for path, fn, methods in routes:

@@ -21,7 +21,7 @@ from __future__ import annotations
 import csv
 import io
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 try:
     import aiosqlite
@@ -42,6 +42,29 @@ MEMBER_SCOPE_SEP = ":"
 def member_scope_id(group_id: Any, user_id: Any) -> str:
     """拼出群成员规则的 ``scope_id``（``群号:QQ``）。"""
     return f"{str(group_id or '').strip()}{MEMBER_SCOPE_SEP}{str(user_id or '').strip()}"
+
+
+def _as_list(value: Any) -> list[Any]:
+    """把导入的字段当列表用；不是列表就返回空。
+
+    导入是「尽量恢复」：一条坏数据不该让整次导入炸掉，所以这里与 :func:`_norm_effect`
+    都做宽松处理，坏行由调用方计入 ``skipped``。
+    """
+    return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def _norm_effect(value: Any) -> str:
+    """把 effect 规整成 ``allow`` / ``deny`` / ``inherit``（未知值一律当 ``inherit``）。"""
+    got = str(value or "").strip().lower()
+    return got if got in ("allow", "deny", "inherit") else "inherit"
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """宽松转 int（导入的数据可能有 ``null`` / 字符串 / 脏值）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def parse_member_scope_id(scope_id: Any) -> tuple[str, str]:
@@ -1556,6 +1579,162 @@ class Store:
             parts.append("(" + " OR ".join(f"{c} LIKE ?" for c in search_cols) + ")")
             args.extend([like] * len(search_cols))
         return (" WHERE " + " AND ".join(parts)) if parts else "", args
+
+    # ------------------------------------------------------------------ #
+    # 规则备份 / 迁移（导出、导入）
+    # ------------------------------------------------------------------ #
+    # 参与备份的表（都只存「规则」；用量、明细、审计、成员缓存、头像不在其中）
+    _RULE_TABLES = ("policy", "quota_level", "subject_level", "llm_quota")
+
+    async def _all_rows(self, table: str) -> list[dict[str, Any]]:
+        """整表读取（``table`` 只允许来自 :attr:`_RULE_TABLES` 白名单，防注入）。"""
+        if table not in self._RULE_TABLES:
+            raise ValueError(f"不允许读取的表：{table}")
+        async with self._conn().execute(f"SELECT * FROM {table}") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def export_rules(self) -> dict[str, Any]:
+        """导出全部**规则类**配置：权限 / 等级 / 归级 / 额度。
+
+        刻意**不导出**用量、明细、审计、群成员缓存：它们是历史数据，
+        跟着规则一起搬没意义，还会让文件变得很大（要连历史一起备份就直接备份 ``.db`` 文件）。
+        """
+        return {
+            "policies": await self.list_policies(),
+            "levels": await self._all_rows("quota_level"),
+            "subject_levels": await self._all_rows("subject_level"),
+            "quotas": await self._all_rows("llm_quota"),
+        }
+
+    async def import_rules(self, data: Mapping[str, Any], mode: str = "merge") -> dict[str, Any]:
+        """导入规则；``mode='merge'``（默认）只覆盖文件里出现的条目，``'replace'`` 先清空再导入。
+
+        ⚠️ **等级 id 必须重映射**：``quota_level.id`` 是自增主键，换一台机器导入时
+        必然与本地已有的 id 撞车，所以这里按 ``(kind, name)`` 找到/新建等级拿到**新 id**，
+        再把「对象归级」与「等级额度」里引用的旧 id 改写成新 id。
+        少了这一步，导入后归级和等级额度会全部指向别人的等级（而且不报错）。
+
+        非法行会被跳过并计数（``skipped``），不会让整次导入失败 ——
+        导入是「尽量恢复」，遇到一条坏数据就全盘不导入反而更糟。
+
+        Returns:
+            ``{mode, levels, subject_levels, quotas, policies, skipped}``
+        """
+        mode = "replace" if str(mode or "").lower() == "replace" else "merge"
+        db = self._conn()
+        stats = {"mode": mode, "levels": 0, "subject_levels": 0, "quotas": 0, "policies": 0, "skipped": 0}
+
+        if mode == "replace":
+            # 先清空这四张表（不动用量 / 日志 / 成员 / 最后消息）
+            await db.execute("DELETE FROM subject_level")
+            await db.execute("DELETE FROM llm_quota")
+            await db.execute("DELETE FROM quota_level")
+            await db.execute("DELETE FROM policy")
+            await db.commit()
+
+        # 1) 等级：按 (kind, name) upsert，并记下 旧id → 新id
+        id_map: dict[str, int] = {}
+        for lv in _as_list(data.get("levels")):
+            kind = str(lv.get("kind") or "").strip()
+            name = str(lv.get("name") or "").strip()
+            if kind not in ("user", "group") or not name:
+                stats["skipped"] += 1
+                continue
+            new_id = await self.upsert_level(
+                kind,
+                name,
+                description=str(lv.get("description") or ""),
+                effect=_norm_effect(lv.get("effect")),
+                command_effect=_norm_effect(lv.get("command_effect")),
+                effect_group=_norm_effect(lv.get("effect_group")),
+                command_effect_group=_norm_effect(lv.get("command_effect_group")),
+                sort_order=_as_int(lv.get("sort_order"), 0),
+                provider_id=str(lv.get("provider_id") or ""),
+                fallback_provider_id=str(lv.get("fallback_provider_id") or ""),
+            )
+            old_id = lv.get("id")
+            if old_id is not None:
+                id_map[str(old_id)] = int(new_id)
+            stats["levels"] += 1
+
+        def _map_level(raw: Any) -> Optional[int]:
+            """把旧的等级 id 换算成导入后的新 id；映射不到就返回 None（跳过该行）。"""
+            if raw in (None, ""):
+                return None
+            got = id_map.get(str(raw))
+            return int(got) if got else None
+
+        # 2) 对象归级
+        for row in _as_list(data.get("subject_levels")):
+            scope_type = str(row.get("scope_type") or "").strip()
+            scope_id = str(row.get("scope_id") or "").strip()
+            level_id = _map_level(row.get("level_id"))
+            if scope_type not in ("user", "group") or not scope_id or not level_id:
+                stats["skipped"] += 1
+                continue
+            await self.set_subject_level(scope_type, scope_id, level_id)
+            stats["subject_levels"] += 1
+
+        # 3) 额度（level 维度的 scope_id 同样要换成新 id）
+        for row in _as_list(data.get("quotas")):
+            scope_type = str(row.get("scope_type") or "").strip()
+            scope_id = str(row.get("scope_id") or "").strip()
+            period = str(row.get("period") or "").strip()
+            if scope_type not in ("user", "group", "member", "level", "global"):
+                stats["skipped"] += 1
+                continue
+            if period not in PERIODS:
+                stats["skipped"] += 1
+                continue
+            if scope_type == "level":
+                mapped = _map_level(scope_id)
+                if mapped is None:
+                    stats["skipped"] += 1
+                    continue
+                scope_id = str(mapped)
+            elif scope_type == "global":
+                scope_id = "*"
+            elif not scope_id:
+                stats["skipped"] += 1
+                continue
+            await self.upsert_quota(
+                scope_type,
+                scope_id,
+                period,
+                _as_int(row.get("limit_tokens"), 0),
+                mode=str(row.get("mode") or "enforce"),
+                reset_at=row.get("reset_at"),
+            )
+            stats["quotas"] += 1
+
+        # 4) 权限规则（LLM / 指令 / 群成员；scene 一并带上）
+        for row in _as_list(data.get("policies")):
+            scope_type = str(row.get("scope_type") or "").strip()
+            scope_id = str(row.get("scope_id") or "").strip()
+            feature = str(row.get("feature") or "llm").strip() or "llm"
+            scene = str(row.get("scene") or "").strip()
+            if scope_type not in ("user", "group", "member", "global"):
+                stats["skipped"] += 1
+                continue
+            if scope_type != "user":
+                scene = ""
+            if scope_type == "global":
+                scope_id = "*"
+            if not scope_id or scene not in ("", "private", "group"):
+                stats["skipped"] += 1
+                continue
+            await self.set_policy(
+                scope_type,
+                scope_id,
+                _norm_effect(row.get("effect")),
+                feature=feature,
+                note=str(row.get("note") or ""),
+                scene=scene,
+            )
+            stats["policies"] += 1
+
+        await db.commit()
+        return stats
 
     # ------------------------------------------------------------------ #
     # 群成员缓存（v7：群成员级管控用）
