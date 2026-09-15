@@ -348,7 +348,8 @@ const recentColumns = [
   },
   { title: "模型", key: "model", width: 130 },
   { title: "token", key: "tok_total", width: 90 },
-  { title: "延迟", key: "latency_ms", width: 90, render: (row: any) => `${row.latency_ms || 0}ms` },
+  // 指令流水没有「延迟」概念（latency 恒为 0），显示 0ms 会让人误以为异常
+  { title: "延迟", key: "latency_ms", width: 90, render: (row: any) => (row.latency_ms ? `${row.latency_ms}ms` : "-") },
 ];
 
 // 近期流水补一个 token 合计列

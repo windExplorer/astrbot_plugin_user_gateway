@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 群聊：QQ 群列表 + 等级 / LLM 权限 / 生效额度 / 最后回复，支持逐个与批量管控。
 // 群成员级管控（展开成员列表）按 PRD 排期在 M3，此处预留入口。
-import { computed, h, onMounted, ref } from "vue";
+import { computed, h, onMounted, onUnmounted, ref } from "vue";
 import {
   NButton,
   NCard,
@@ -415,9 +415,19 @@ const columns: DataTableColumns<GroupRow> = [
   },
 ];
 
+// 静默刷新定时器（见 onMounted）
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
 onMounted(async () => {
   await loadLevels();
   await load();
+  // 同好友页：页面可见时每 30s 静默刷新，最后回复 / 今日用量跟着实际对话走
+  refreshTimer = setInterval(() => {
+    if (document.visibilityState === "visible") load();
+  }, 30_000);
+});
+onUnmounted(() => {
+  if (refreshTimer) clearInterval(refreshTimer);
 });
 </script>
 
@@ -463,7 +473,7 @@ onMounted(async () => {
         <n-select
           v-model:value="levelFilter"
           size="small"
-          style="width: 140px"
+          style="width: 200px"
           :options="levelFilterOptions"
           @update:value="search"
         />

@@ -3,7 +3,7 @@
 //
 // 「场景」：好友的权限分**私聊**与**群聊**两个维度（同一个人可以「私聊禁用、群里照用」），
 // 顶部切换器决定权限列读写哪一套；群专属 / 群等级规则则天然只属于群聊场景。
-import { computed, h, onMounted, ref } from "vue";
+import { computed, h, onMounted, onUnmounted, ref } from "vue";
 import {
   NButton,
   NCard,
@@ -415,9 +415,20 @@ const columns: DataTableColumns<FriendRow> = [
   },
 ];
 
+// 静默刷新定时器（见 onMounted）
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
 onMounted(async () => {
   await loadLevels();
   await load();
+  // 列表数据只在进页时加载一次，「最后回复 / 今日用量」会随实际对话过期——
+  // 页面可见时每 30s 静默刷新一轮（不可见时跳过，避免无谓请求）
+  refreshTimer = setInterval(() => {
+    if (document.visibilityState === "visible") load();
+  }, 30_000);
+});
+onUnmounted(() => {
+  if (refreshTimer) clearInterval(refreshTimer);
 });
 </script>
 
@@ -467,7 +478,7 @@ onMounted(async () => {
         <n-select
           v-model:value="levelFilter"
           size="small"
-          style="width: 140px"
+          style="width: 200px"
           :options="levelFilterOptions"
           @update:value="search"
         />
