@@ -286,9 +286,8 @@ export interface LevelRow {
   description: string;
   effect: "inherit" | "allow" | "deny";
   sort_order: number;
-  /** 模型路由：主提供商 id / 具体模型名 / 备用提供商 id */
+  /** 模型路由：主提供商 id / 备用提供商 id（一项 = 一个「提供商 · 模型」） */
   provider_id: string;
-  model: string;
   fallback_provider_id: string;
   members: number;
   quotas: Record<string, { limit_tokens: number; mode: string; reset_at: number | null }>;
@@ -303,17 +302,23 @@ export interface LevelPayload {
   effect?: "inherit" | "allow" | "deny";
   sort_order?: number;
   provider_id?: string;
-  model?: string;
   fallback_provider_id?: string;
   quotas?: { period: string; limit_tokens: number | null; mode?: string; delete?: boolean }[];
 }
 
-/** AstrBot 里已加载的对话模型提供商。 */
+/** AstrBot 里已加载的对话模型提供商（一项 = 一个模型，对应一个提供商）。 */
 export interface ProviderRow {
   id: string;
+  /** 提供商（供应商）名 */
+  name: string;
+  /** 该提供商绑定的模型名 */
   model: string;
+  /** 展示用：「名称 · 模型」 */
+  label: string;
   type: string;
   modalities: string[];
+  /** 是否是 AstrBot 当前默认的对话提供商 */
+  is_default: boolean;
 }
 
 /** 某对象当前会走的模型（含来源等级与是否落到备用）。 */
@@ -322,7 +327,6 @@ export interface ModelRoute {
   label?: string;
   level_id?: number;
   provider_id?: string;
-  model?: string;
   fallback_provider_id?: string;
   used_fallback?: boolean;
   reason?: string;

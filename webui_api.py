@@ -806,7 +806,6 @@ async def h_levels(plugin) -> dict:
                 "effect": str(lv.get("effect") or "inherit"),
                 "sort_order": int(lv.get("sort_order") or 0),
                 "provider_id": str(lv.get("provider_id") or ""),
-                "model": str(lv.get("model") or ""),
                 "fallback_provider_id": str(lv.get("fallback_provider_id") or ""),
                 "members": int(counts.get(lid, 0)),
                 "quotas": limits.get(str(lid), {}),
@@ -818,9 +817,18 @@ async def h_levels(plugin) -> dict:
 async def h_providers(plugin) -> dict:
     """列出可用的对话模型提供商（等级里选「走哪个模型」用）。
 
+    **模型选择以「提供商」为单位**（参考 model_panel 的做法）：AstrBot 里一个提供商就绑定
+    一个模型，所以下拉里一项 = 一个提供商，显示成「名称 · 模型」。
     只列**已加载**的：AstrBot 遇到不存在的提供商 id 会直接放弃本次 LLM 请求，
-    所以必须让前端只能从这份名单里选。附带返回当前熔断中的提供商。
+    所以必须让前端只能从这份名单里选。附带返回当前熔断中的提供商与 AstrBot 的默认提供商。
     """
+    default_id = ""
+    try:
+        prov = await plugin.context.get_using_provider_async()
+        default_id = str((getattr(prov, "provider_config", {}) or {}).get("id") or "")
+    except Exception:
+        default_id = ""
+
     items: list[dict] = []
     try:
         for p in plugin.context.get_all_providers() or []:
@@ -828,24 +836,40 @@ async def h_providers(plugin) -> dict:
             pid = str(cfg.get("id") or "")
             if not pid:
                 continue
+            # 供应商名取自提供商源/名称，**不能**退化成 type（openai_chat_completion 这类）
+            name = str(
+                cfg.get("provider_source_id") or cfg.get("name") or cfg.get("provider") or pid
+            )
             try:
                 model = str(p.get_model() or "")
             except Exception:
-                model = str(cfg.get("model") or "")
+                model = ""
+            if not model:
+                model = str(cfg.get("model") or cfg.get("default_model") or "")
+            if name and model and name != model:
+                label = f"{name} · {model}"
+            else:
+                label = name or model or pid
             items.append(
                 {
                     "id": pid,
+                    "name": name,
                     "model": model,
-                    "type": str(cfg.get("type") or ""),
+                    "label": label,
+                    "type": str(cfg.get("type") or cfg.get("provider_type") or ""),
                     "modalities": list(cfg.get("modalities") or []),
+                    "is_default": bool(default_id and pid == default_id),
                 },
             )
     except Exception as e:
         logger.warning(f"[UserGateway] 读取提供商列表失败: {e}")
+
+    items.sort(key=lambda it: (not it["is_default"], it["label"]))
     circuit = getattr(plugin, "circuit", None)
     return ok(
         {
             "items": items,
+            "default_id": default_id,
             "circuit_open": sorted(circuit.open_ids()) if circuit else [],
             "route_enabled": bool(plugin._cfg("model_route_enabled", True)),
         },
@@ -892,7 +916,6 @@ async def h_set_level(plugin) -> dict:
         sort_order=sort_order,
         level_id=level_id,
         provider_id=str(body.get("provider_id") or "").strip(),
-        model=str(body.get("model") or "").strip(),
         fallback_provider_id=str(body.get("fallback_provider_id") or "").strip(),
     )
     if not new_id:

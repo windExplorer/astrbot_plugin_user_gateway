@@ -61,8 +61,8 @@ const isUser = computed(() => props.type === "user");
 const modelRouteText = computed(() => {
   const r = detail.value?.model_route as any;
   if (!r || !r.layer) return "未配置（跟随 AstrBot 默认模型）";
-  if (!r.provider_id) return r.reason || "配置的提供商当前不可用，本次走 AstrBot 默认模型";
-  return `${r.provider_id}${r.model ? " · " + r.model : ""}${r.used_fallback ? "（备用）" : ""}｜来源：${r.label}`;
+  if (!r.provider_id) return r.reason || "配置的模型当前不可用，本次走 AstrBot 默认模型";
+  return `${r.provider_id}${r.used_fallback ? "（备用）" : ""}｜来源：${r.label}`;
 });
 
 const displayName = computed(() => {

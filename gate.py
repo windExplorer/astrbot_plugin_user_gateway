@@ -98,7 +98,7 @@ class Rules:
     limits: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     usage: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     level_model: Mapping[Any, Mapping[str, str]] = field(default_factory=dict)
-    """``{(kind, level_id): {"provider_id", "model", "fallback_provider_id"}}`` —— 等级的模型路由。"""
+    """``{(kind, level_id): {"provider_id", "fallback_provider_id"}}`` —— 等级的模型路由。"""
 
     def limits_of(self, scope_type: str, scope_id: str) -> Mapping[str, Mapping[str, Any]]:
         return (self.limits.get(scope_type) or {}).get(str(scope_id)) or {}
@@ -282,8 +282,8 @@ class Gate:
         同一个群会因谁说话而换模型，上下文与计费口径都会串味。
 
         Returns:
-            ``{layer, label, level_id, provider_id, model, fallback_provider_id}``；
-            该等级没配模型时返回 ``None``（表示不干预，走 AstrBot 的默认模型）。
+            ``{layer, label, level_id, provider_id, fallback_provider_id}``；
+            该等级没配提供商时返回 ``None``（表示不干预，走 AstrBot 的默认模型）。
         """
         kind = ""
         sid = ""
@@ -298,14 +298,13 @@ class Gate:
         if not level_id:
             return None
         got = rules.level_model.get((kind, int(level_id))) or {}
-        if not (got.get("provider_id") or got.get("fallback_provider_id") or got.get("model")):
+        if not (got.get("provider_id") or got.get("fallback_provider_id")):
             return None
         return {
             "layer": layer,
             "label": MODEL_SOURCE_LABELS.get(layer, layer),
             "level_id": int(level_id),
             "provider_id": str(got.get("provider_id") or ""),
-            "model": str(got.get("model") or ""),
             "fallback_provider_id": str(got.get("fallback_provider_id") or ""),
         }
 
@@ -317,17 +316,18 @@ class Gate:
         绝不能拿一个不存在的 id 去设 ``selected_provider``：
         AstrBot 遇到未知提供商 id 会**直接放弃本次 LLM 请求**（`astr_main_agent.py:242`）。
 
+        以「提供商」为单位选模型：AstrBot 里一个提供商就绑定一个模型，
+        所以不额外传模型名（`selected_provider` 换上后，模型自然就是它自己的那个）。
+
         Returns:
-            ``{provider_id, model, used_fallback}``；用备用时不沿用主提供商的模型名
-            （模型名可能不存在于备用提供商上，AstrBot 自己切换提供商时也是这么做的）。
+            ``{provider_id, used_fallback}``。
         """
         pid = str(route.get("provider_id") or "")
         fb = str(route.get("fallback_provider_id") or "")
-        model = str(route.get("model") or "")
         if pid and pid in available:
-            return {"provider_id": pid, "model": model, "used_fallback": False}
+            return {"provider_id": pid, "used_fallback": False}
         if fb and fb in available:
-            return {"provider_id": fb, "model": "", "used_fallback": True}
+            return {"provider_id": fb, "used_fallback": True}
         return None
 
     # ------------------------------------------------------------------ #

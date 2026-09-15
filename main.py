@@ -286,7 +286,6 @@ class UserGatewayPlugin(Star):
             self._level_route = {
                 (str(lv["kind"]), int(lv["id"])): {
                     "provider_id": str(lv.get("provider_id") or ""),
-                    "model": str(lv.get("model") or ""),
                     "fallback_provider_id": str(lv.get("fallback_provider_id") or ""),
                 }
                 for lv in levels
@@ -387,8 +386,6 @@ class UserGatewayPlugin(Star):
                     )
                 return
             event.set_extra("selected_provider", picked["provider_id"])
-            if picked["model"]:
-                event.set_extra("selected_model", picked["model"])
             if len(self._last_route) > 2000:  # 防御性清理
                 self._last_route.clear()
             self._last_route[subject.umo] = {**route, **picked}
@@ -396,7 +393,6 @@ class UserGatewayPlugin(Star):
                 logger.info(
                     f"[UserGateway] 模型路由：{subject.umo} → {picked['provider_id']}"
                     f"{'（备用）' if picked['used_fallback'] else ''}"
-                    f"{'｜model=' + picked['model'] if picked['model'] else ''}"
                     f"｜来源 {route['label']}"
                 )
         except Exception:
@@ -495,7 +491,6 @@ class UserGatewayPlugin(Star):
             subject = self._subject_of(event)
             verdict = self.gate.evaluate(subject, self._rules())
             self._mark_request(event, req)
-            self._apply_model_to_request(subject.umo, req)
 
             if verdict.allow:
                 # 给事件打标：本条消息确实走了 LLM。
@@ -535,21 +530,6 @@ class UserGatewayPlugin(Star):
             await self._record_usage(event, response)
         except Exception:
             logger.exception("[UserGateway] 用量记录异常（忽略，不影响对话）")
-
-    def _apply_model_to_request(self, umo: str, req: Any) -> None:
-        """双保险：把路由到的模型名再写进 ``req.model``。
-
-        ``selected_model`` extra 由 AstrBot 在构造 ``req`` 时读取；这里再兜一次，
-        因为 ``req.model`` 才是 Agent 真正传给 provider 的字段
-        （``tool_loop_agent_runner.py:514``，且只有主提供商才带模型名，备用提供商
-        用自己的默认模型 —— 与 AstrBot 切提供商时的处理一致）。
-        """
-        try:
-            model = str((self._last_route.get(umo) or {}).get("model") or "")
-            if model and not getattr(req, "model", None):
-                req.model = model
-        except Exception:
-            pass
 
     # ------------------------------------------------------------------ #
     # 闸门辅助

@@ -47,18 +47,26 @@ const specificRows = ref<QuotaRow[]>([]);
 // 不存在的提供商 id 会让 AstrBot 直接放弃本次请求）
 const providers = ref<ProviderRow[]>([]);
 const circuitOpen = ref<string[]>([]);
+const defaultProviderId = ref("");
 
+// 下拉选项：一项 = 一个「提供商 · 模型」（与 AstrBot / model_panel 的口径一致）
 const providerOptions = computed(() =>
-  providers.value.map((p) => ({
-    label: `${p.model || p.id}${p.id ? " · " + p.id : ""}${circuitOpen.value.includes(p.id) ? "（熔断中）" : ""}`,
-    value: p.id,
-  })),
+  providers.value.map((p) => {
+    const marks = [
+      p.is_default ? "当前默认" : "",
+      circuitOpen.value.includes(p.id) ? "熔断中" : "",
+    ].filter(Boolean);
+    return {
+      label: (p.label || p.model || p.id) + (marks.length ? `（${marks.join("、")}）` : ""),
+      value: p.id,
+    };
+  }),
 );
 
 function providerLabel(id: string): string {
   if (!id) return "";
   const p = providers.value.find((x) => x.id === id);
-  return p ? p.model || p.id : id;
+  return p ? p.label || p.model || p.id : id;
 }
 
 const PERIODS: { value: "day" | "month" | "total"; label: string }[] = [
@@ -94,6 +102,7 @@ async function load() {
     specificRows.value = (all.items || []).filter((r) => r.scope_type === "user" || r.scope_type === "group");
     providers.value = prov.items || [];
     circuitOpen.value = prov.circuit_open || [];
+    defaultProviderId.value = (prov as any).default_id || "";
   } catch (e: any) {
     message.error(e?.message || String(e));
   } finally {
@@ -166,23 +175,21 @@ const levelForm = ref<
   effect: "inherit",
   sort_order: 0,
   provider_id: "",
-  model: "",
   fallback_provider_id: "",
   quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
-});
+  });
 
-function openLevelEditor(row?: LevelRow) {
+  function openLevelEditor(row?: LevelRow) {
   if (row) {
-    levelForm.value = {
-      id: row.id,
-      kind: row.kind,
-      name: row.name,
-      description: row.description || "",
-      effect: row.effect || "inherit",
-      sort_order: row.sort_order || 0,
-      provider_id: row.provider_id || "",
-      model: row.model || "",
-      fallback_provider_id: row.fallback_provider_id || "",
+  levelForm.value = {
+  id: row.id,
+  kind: row.kind,
+  name: row.name,
+  description: row.description || "",
+  effect: row.effect || "inherit",
+  sort_order: row.sort_order || 0,
+  provider_id: row.provider_id || "",
+  fallback_provider_id: row.fallback_provider_id || "",
       quotas: {
         day: row.quotas?.day ? { limit: row.quotas.day.limit_tokens, mode: row.quotas.day.mode as "enforce" | "observe" } : { limit: null, mode: "enforce" },
         month: row.quotas?.month ? { limit: row.quotas.month.limit_tokens, mode: row.quotas.month.mode as "enforce" | "observe" } : { limit: null, mode: "enforce" },
@@ -227,7 +234,6 @@ async function saveLevel() {
       effect: f.effect,
       sort_order: f.sort_order,
       provider_id: f.provider_id || "",
-      model: f.model?.trim() || "",
       fallback_provider_id: f.fallback_provider_id || "",
       quotas,
     });
@@ -318,10 +324,10 @@ const levelColumns: DataTableColumns<LevelRow> = [
         {
           trigger: () =>
             h("div", { style: "line-height:1.35" }, [
-              h("div", { style: "font-size:12.5px" }, `${main}${row.model ? " · " + row.model : ""}`),
+              h("div", { style: "font-size:12.5px" }, main),
               fb ? h("div", { style: "font-size:12px;opacity:.65" }, `备用：${fb}`) : null,
             ]),
-          default: () => `主提供商：${row.provider_id || "（未配置）"}${row.model ? "\n模型名：" + row.model : ""}\n备用提供商：${row.fallback_provider_id || "（未配置）"}`,
+          default: () => `主模型：${main}\n备用模型：${fb || "（未配置）"}`,
         },
       );
     },
@@ -600,37 +606,31 @@ onMounted(load);
           <n-input-number v-model:value="levelForm.sort_order" size="small" style="width: 140px" />
         </n-form-item>
         <n-form-item label="主模型">
-          <n-space vertical :size="6" style="width: 100%">
-            <n-space align="center" :size="8">
-              <n-select
-                v-model:value="levelForm.provider_id"
-                size="small"
-                style="width: 260px"
-                clearable
-                placeholder="选择提供商（留空 = 跟随 AstrBot 默认）"
-                :options="providerOptions"
-              />
-              <n-input
-                v-model:value="levelForm.model"
-                size="small"
-                style="width: 170px"
-                placeholder="模型名（可选）"
-              />
-            </n-space>
-            <n-space align="center" :size="8">
-              <span style="font-size: 12.5px; width: 48px">备用</span>
-              <n-select
-                v-model:value="levelForm.fallback_provider_id"
-                size="small"
-                style="width: 260px"
-                clearable
-                placeholder="主提供商不可用时用它（可选）"
-                :options="providerOptions"
-              />
-            </n-space>
+          <n-select
+            v-model:value="levelForm.provider_id"
+            size="small"
+            style="width: 360px"
+            clearable
+            filterable
+            placeholder="搜索并选择模型（留空 = 跟随 AstrBot 默认）"
+            :options="providerOptions"
+          />
+        </n-form-item>
+        <n-form-item label="备用模型">
+          <n-space vertical :size="4" style="width: 100%">
+            <n-select
+              v-model:value="levelForm.fallback_provider_id"
+              size="small"
+              style="width: 360px"
+              clearable
+              filterable
+              placeholder="主模型不可用时改用它（可选）"
+              :options="providerOptions"
+            />
             <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
-              私聊按「好友等级」、群聊按「群等级」决定模型（一个群一个模型，避免同群上下文串味）。<br />
-              主提供商未加载或连续失败（熔断）时自动落到备用；模型名只作用于主提供商（备用用它自己的默认模型）。
+              选项就是「供应商 · 模型」（一项对应 AstrBot 里的一个模型提供商）。<br />
+              私聊按「好友等级」、群聊按「群等级」决定模型（一个群一个模型，避免同群上下文串味）；
+              主模型未加载或连续失败（熔断）时自动落到备用。
             </span>
           </n-space>
         </n-form-item>

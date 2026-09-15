@@ -298,16 +298,15 @@ def main() -> int:
     check(G.Gate.resolve_model(G.Subject(sender_id="10001"), empty) is None, "三个字段都空 → 不干预")
 
     print("\n[11] 提供商选择与降级")
-    route = {"provider_id": "p-a", "model": "model-x", "fallback_provider_id": "p-b"}
+    route = {"provider_id": "p-a", "fallback_provider_id": "p-b"}
     picked = G.Gate.pick_provider(route, {"p-a", "p-b"})
-    check(bool(picked) and picked["provider_id"] == "p-a" and picked["model"] == "model-x"
-          and not picked["used_fallback"], "主可用 → 用主（带模型名）")
+    check(bool(picked) and picked["provider_id"] == "p-a" and not picked["used_fallback"], "主可用 → 用主")
     picked = G.Gate.pick_provider(route, {"p-b"})
-    check(bool(picked) and picked["provider_id"] == "p-b" and picked["model"] == ""
-          and picked["used_fallback"], "主不可用 → 用备用，且不沿用主的模型名")
+    check(bool(picked) and picked["provider_id"] == "p-b" and picked["used_fallback"],
+          "主不可用 → 用备用")
     check(G.Gate.pick_provider(route, set()) is None,
           "都不可用 → 返回 None（绝不设未知 id：AstrBot 会直接放弃本次请求）")
-    check(G.Gate.pick_provider({"provider_id": "p-a", "model": "", "fallback_provider_id": ""}, set()) is None,
+    check(G.Gate.pick_provider({"provider_id": "p-a", "fallback_provider_id": ""}, set()) is None,
           "无备用且主不可用 → 不干预")
 
     print("\n[12] 提供商熔断")
@@ -327,7 +326,7 @@ def main() -> int:
     check(not off.note_failure("p-a", now=1.0) and not off.is_open("p-a", now=1.0), "cooldown=0 → 关闭熔断")
     check(isinstance(c.snapshot(now=10.0), dict), "snapshot 可序列化给控制台")
     # 搭配使用：主被熔断 → 自动落到备用（用独立的熔断器避免与上面的时间线耦合）
-    route = {"provider_id": "p-a", "model": "model-x", "fallback_provider_id": "p-b"}
+    route = {"provider_id": "p-a", "fallback_provider_id": "p-b"}
     c2 = G.ProviderCircuit(threshold=1, cooldown_sec=300)
     c2.note_failure("p-a", now=1000.0)
     avail = {"p-a", "p-b"} - c2.open_ids(now=1100.0)
