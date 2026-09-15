@@ -370,6 +370,15 @@ const columns: DataTableColumns<FriendRow> = [
     width: 140,
     render: (row) => {
       if (!row.last_bot_ts) {
+        // 「今日用量」按人头聚合（含他在群里的消费），而「最后回复」只记**私聊**——
+        // bot 在群里的回复记在群名下。只在群里聊过的人就会出现「有用量、无回复记录」。
+        if (row.today_tokens) {
+          return h(NTooltip, { trigger: "hover" }, {
+            trigger: () => h("span", { style: "opacity:.4" }, "无私聊记录"),
+            default: () =>
+              "bot 没有私聊过这个人：今日用量来自群聊（群里的回复记在群上，\n不记到个人）。私聊过之后这里才会出现记录。",
+          });
+        }
         return h("span", { style: "opacity:.4" }, "无记录");
       }
       const meta = kindMeta(row.last_bot_kind);
