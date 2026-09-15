@@ -28,9 +28,11 @@ import {
   apiGet,
   apiLevels,
   apiPost,
+  apiProviders,
   apiSetLevel,
   type LevelPayload,
   type LevelRow,
+  type ProviderRow,
   type QuotaRow,
 } from "../api";
 
@@ -41,6 +43,23 @@ const saving = ref(false);
 const levels = ref<LevelRow[]>([]);
 const globalRows = ref<QuotaRow[]>([]);
 const specificRows = ref<QuotaRow[]>([]);
+// AstrBot 里已加载的对话模型提供商（等级里「走哪个模型」只能从这里选：
+// 不存在的提供商 id 会让 AstrBot 直接放弃本次请求）
+const providers = ref<ProviderRow[]>([]);
+const circuitOpen = ref<string[]>([]);
+
+const providerOptions = computed(() =>
+  providers.value.map((p) => ({
+    label: `${p.model || p.id}${p.id ? " · " + p.id : ""}${circuitOpen.value.includes(p.id) ? "（熔断中）" : ""}`,
+    value: p.id,
+  })),
+);
+
+function providerLabel(id: string): string {
+  if (!id) return "";
+  const p = providers.value.find((x) => x.id === id);
+  return p ? p.model || p.id : id;
+}
 
 const PERIODS: { value: "day" | "month" | "total"; label: string }[] = [
   { value: "day", label: "每日" },
@@ -64,14 +83,17 @@ function rowOf(rows: QuotaRow[], period: string): QuotaRow | undefined {
 async function load() {
   loading.value = true;
   try {
-    const [lv, glob, all] = await Promise.all([
+    const [lv, glob, all, prov] = await Promise.all([
       apiLevels(),
       apiGet<{ items: QuotaRow[] }>("/quota?scope_type=global"),
       apiGet<{ items: QuotaRow[] }>("/quota"),
+      apiProviders().catch(() => ({ items: [], circuit_open: [], route_enabled: true })),
     ]);
     levels.value = lv.items || [];
     globalRows.value = glob.items || [];
     specificRows.value = (all.items || []).filter((r) => r.scope_type === "user" || r.scope_type === "group");
+    providers.value = prov.items || [];
+    circuitOpen.value = prov.circuit_open || [];
   } catch (e: any) {
     message.error(e?.message || String(e));
   } finally {
@@ -132,13 +154,20 @@ async function saveGlobal() {
 // ------------------------------------------------------------------ //
 const showLevelEditor = ref(false);
 const levelSaving = ref(false);
-const levelForm = ref<Required<Omit<LevelPayload, "quotas">> & { quotas: Record<string, { limit: number | null; mode: "enforce" | "observe" }> }>({
+const levelForm = ref<
+  Required<Omit<LevelPayload, "quotas">> & {
+    quotas: Record<string, { limit: number | null; mode: "enforce" | "observe" }>;
+  }
+>({
   id: 0,
   kind: "user",
   name: "",
   description: "",
   effect: "inherit",
   sort_order: 0,
+  provider_id: "",
+  model: "",
+  fallback_provider_id: "",
   quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
 });
 
@@ -151,6 +180,9 @@ function openLevelEditor(row?: LevelRow) {
       description: row.description || "",
       effect: row.effect || "inherit",
       sort_order: row.sort_order || 0,
+      provider_id: row.provider_id || "",
+      model: row.model || "",
+      fallback_provider_id: row.fallback_provider_id || "",
       quotas: {
         day: row.quotas?.day ? { limit: row.quotas.day.limit_tokens, mode: row.quotas.day.mode as "enforce" | "observe" } : { limit: null, mode: "enforce" },
         month: row.quotas?.month ? { limit: row.quotas.month.limit_tokens, mode: row.quotas.month.mode as "enforce" | "observe" } : { limit: null, mode: "enforce" },
@@ -165,6 +197,9 @@ function openLevelEditor(row?: LevelRow) {
       description: "",
       effect: "inherit",
       sort_order: (levels.value.length + 1) * 10,
+      provider_id: "",
+      model: "",
+      fallback_provider_id: "",
       quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
     };
   }
@@ -191,6 +226,9 @@ async function saveLevel() {
       description: f.description?.trim() || "",
       effect: f.effect,
       sort_order: f.sort_order,
+      provider_id: f.provider_id || "",
+      model: f.model?.trim() || "",
+      fallback_provider_id: f.fallback_provider_id || "",
       quotas,
     });
     message.success("等级已保存");
@@ -263,6 +301,30 @@ const levelColumns: DataTableColumns<LevelRow> = [
               : `属于该等级的对象默认${effectText[row.effect]}（优先级低于好友/群专属规则）`,
         },
       ),
+  },
+  {
+    title: "模型",
+    key: "provider_id",
+    minWidth: 190,
+    render: (row) => {
+      if (!row.provider_id && !row.fallback_provider_id) {
+        return h(NTag, { size: "small", bordered: false }, { default: () => "跟随 AstrBot 默认" });
+      }
+      const main = row.provider_id ? providerLabel(row.provider_id) : "未配置";
+      const fb = row.fallback_provider_id ? providerLabel(row.fallback_provider_id) : "";
+      return h(
+        NTooltip,
+        { trigger: "hover" },
+        {
+          trigger: () =>
+            h("div", { style: "line-height:1.35" }, [
+              h("div", { style: "font-size:12.5px" }, `${main}${row.model ? " · " + row.model : ""}`),
+              fb ? h("div", { style: "font-size:12px;opacity:.65" }, `备用：${fb}`) : null,
+            ]),
+          default: () => `主提供商：${row.provider_id || "（未配置）"}${row.model ? "\n模型名：" + row.model : ""}\n备用提供商：${row.fallback_provider_id || "（未配置）"}`,
+        },
+      );
+    },
   },
   { title: "额度模板", key: "quotas", minWidth: 200, render: (row) => levelQuotaText(row) },
   { title: "成员数", key: "members", width: 90 },
@@ -425,6 +487,10 @@ onMounted(load);
         <span>· 命中那一层内部，日 / 月 / 累计同时生效，任何一个超限就拦（模式为「观察」时只记账不拦）。</span>
         <span>· 留空 = 该周期不配置（继续看更粗的档位）；<b>填 0 = 明确不限</b>（占住档位，更粗的不再参与）。</span>
         <span>· 用量按「每个对象自己」记账（与是否配置额度无关），等级额度是「每人一份」，不是整组合计。</span>
+        <span>
+          · <b>模型路由</b>：等级可指定「主模型 + 备用模型」。<b>私聊看好友等级、群聊看群等级</b>
+          （一个群只用一个模型，避免同群上下文串味）；主提供商不可用或连续失败熔断时自动走备用。
+        </span>
       </n-space>
     </n-card>
 
@@ -532,6 +598,41 @@ onMounted(load);
         </n-form-item>
         <n-form-item label="排序值">
           <n-input-number v-model:value="levelForm.sort_order" size="small" style="width: 140px" />
+        </n-form-item>
+        <n-form-item label="主模型">
+          <n-space vertical :size="6" style="width: 100%">
+            <n-space align="center" :size="8">
+              <n-select
+                v-model:value="levelForm.provider_id"
+                size="small"
+                style="width: 260px"
+                clearable
+                placeholder="选择提供商（留空 = 跟随 AstrBot 默认）"
+                :options="providerOptions"
+              />
+              <n-input
+                v-model:value="levelForm.model"
+                size="small"
+                style="width: 170px"
+                placeholder="模型名（可选）"
+              />
+            </n-space>
+            <n-space align="center" :size="8">
+              <span style="font-size: 12.5px; width: 48px">备用</span>
+              <n-select
+                v-model:value="levelForm.fallback_provider_id"
+                size="small"
+                style="width: 260px"
+                clearable
+                placeholder="主提供商不可用时用它（可选）"
+                :options="providerOptions"
+              />
+            </n-space>
+            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
+              私聊按「好友等级」、群聊按「群等级」决定模型（一个群一个模型，避免同群上下文串味）。<br />
+              主提供商未加载或连续失败（熔断）时自动落到备用；模型名只作用于主提供商（备用用它自己的默认模型）。
+            </span>
+          </n-space>
         </n-form-item>
         <n-form-item label="额度模板">
           <n-space vertical :size="8" style="width: 100%">

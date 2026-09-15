@@ -50,6 +50,7 @@ def R(**kw) -> G.Rules:
         subject_level=kw.get("subject_level") or {},
         limits=kw.get("limits") or {},
         usage=kw.get("usage") or {},
+        level_model=kw.get("level_model") or {},
     )
 
 
@@ -263,6 +264,78 @@ def main() -> int:
     check(Q.estimate_tokens("", None) == 0, "空文本 → 0")
     check(Q.should_warn(80, 100, 0.8) and not Q.should_warn(79, 100, 0.8), "80% 预警阈值")
     check(not Q.should_warn(999, 100, 0), "ratio=0 关闭预警")
+
+    print("\n[10] 模型路由（等级 → 主 / 备提供商）")
+    rules = R(
+        level_model={("user", 1): {"provider_id": "p-a", "model": "model-x", "fallback_provider_id": "p-b"}},
+        subject_level={"user": {"10001": 1}},
+    )
+    route = G.Gate.resolve_model(G.Subject(sender_id="10001"), rules)
+    check(bool(route) and route["provider_id"] == "p-a" and route["layer"] == "user_level", "私聊按好友等级取模型")
+    check(G.Gate.resolve_model(G.Subject(sender_id="20002"), rules) is None, "没归级的对象不干预模型")
+    # 群聊只看群等级，不回落到发言人的好友等级（否则同一个群会按人切模型）
+    grp = R(
+        level_model={
+            ("user", 1): {"provider_id": "p-user", "model": "", "fallback_provider_id": ""},
+            ("group", 2): {"provider_id": "p-group", "model": "", "fallback_provider_id": ""},
+        },
+        subject_level={"user": {"10001": 1}, "group": {"88888": 2}},
+    )
+    route = G.Gate.resolve_model(G.Subject(sender_id="10001", group_id="88888"), grp)
+    check(bool(route) and route["provider_id"] == "p-group" and route["layer"] == "group_level",
+          "群聊按群等级取模型（不按发言人）")
+    check(G.Gate.resolve_model(G.Subject(sender_id="10001", group_id="77777"), grp) is None,
+          "群没归级 → 不干预（不会回落到发言人的好友等级）")
+    only_fb = R(
+        level_model={("user", 1): {"provider_id": "", "model": "", "fallback_provider_id": "p-b"}},
+        subject_level={"user": {"10001": 1}},
+    )
+    route = G.Gate.resolve_model(G.Subject(sender_id="10001"), only_fb)
+    check(bool(route), "只配了备用提供商也算配置了模型路由")
+    check(G.Gate.pick_provider(route, {"p-b"})["used_fallback"] is True, "主为空 → 直接用备用")
+    empty = R(level_model={("user", 1): {"provider_id": "", "model": "", "fallback_provider_id": ""}},
+              subject_level={"user": {"10001": 1}})
+    check(G.Gate.resolve_model(G.Subject(sender_id="10001"), empty) is None, "三个字段都空 → 不干预")
+
+    print("\n[11] 提供商选择与降级")
+    route = {"provider_id": "p-a", "model": "model-x", "fallback_provider_id": "p-b"}
+    picked = G.Gate.pick_provider(route, {"p-a", "p-b"})
+    check(bool(picked) and picked["provider_id"] == "p-a" and picked["model"] == "model-x"
+          and not picked["used_fallback"], "主可用 → 用主（带模型名）")
+    picked = G.Gate.pick_provider(route, {"p-b"})
+    check(bool(picked) and picked["provider_id"] == "p-b" and picked["model"] == ""
+          and picked["used_fallback"], "主不可用 → 用备用，且不沿用主的模型名")
+    check(G.Gate.pick_provider(route, set()) is None,
+          "都不可用 → 返回 None（绝不设未知 id：AstrBot 会直接放弃本次请求）")
+    check(G.Gate.pick_provider({"provider_id": "p-a", "model": "", "fallback_provider_id": ""}, set()) is None,
+          "无备用且主不可用 → 不干预")
+
+    print("\n[12] 提供商熔断")
+    c = G.ProviderCircuit(threshold=2, cooldown_sec=300)
+    check(not c.note_failure("p-a", now=1000.0), "第 1 次失败不熔断")
+    check(c.note_failure("p-a", now=1001.0), "第 2 次失败触发熔断")
+    check(c.is_open("p-a", now=1100.0), "熔断期内视为不可用")
+    check(not c.is_open("p-a", now=1301.0), "冷却结束自动恢复（再给一次机会）")
+    check(not c.is_open("p-a", now=1302.0), "恢复后保持可用")
+    check(not c.note_failure("p-b", now=1000.0) and not c.is_open("p-b", now=1001.0), "其它提供商互不影响")
+    c.note_failure("p-c", now=1.0)
+    c.note_failure("p-c", now=2.0)
+    check("p-c" in c.open_ids(now=3.0), "open_ids 列出熔断中的提供商")
+    c.note_success("p-c")
+    check(not c.is_open("p-c", now=4.0), "成功一次即复位（避免偶发失败累积）")
+    off = G.ProviderCircuit(threshold=1, cooldown_sec=0)
+    check(not off.note_failure("p-a", now=1.0) and not off.is_open("p-a", now=1.0), "cooldown=0 → 关闭熔断")
+    check(isinstance(c.snapshot(now=10.0), dict), "snapshot 可序列化给控制台")
+    # 搭配使用：主被熔断 → 自动落到备用（用独立的熔断器避免与上面的时间线耦合）
+    route = {"provider_id": "p-a", "model": "model-x", "fallback_provider_id": "p-b"}
+    c2 = G.ProviderCircuit(threshold=1, cooldown_sec=300)
+    c2.note_failure("p-a", now=1000.0)
+    avail = {"p-a", "p-b"} - c2.open_ids(now=1100.0)
+    picked = G.Gate.pick_provider(route, avail)
+    check(bool(picked) and picked["provider_id"] == "p-b" and picked["used_fallback"],
+          "主提供商熔断后由备用接管")
+    avail2 = {"p-a", "p-b"} - c2.open_ids(now=1400.0)
+    check(G.Gate.pick_provider(route, avail2)["provider_id"] == "p-a", "冷却结束后主提供商重新被选中")
 
     print()
     if _failures:

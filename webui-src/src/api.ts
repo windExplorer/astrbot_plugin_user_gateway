@@ -129,8 +129,21 @@ export interface PingInfo {
   rules?: {
     effect_users: number;
     effect_groups: number;
-    quota_users: number;
-    quota_groups: number;
+    levels?: number;
+    leveled_users?: number;
+    leveled_groups?: number;
+    limits?: number;
+    usage_users?: number;
+    usage_groups?: number;
+  };
+  /** 头像缓存概况 */
+  avatars?: Record<string, any>;
+  /** 模型路由概况（熔断中的提供商会列在这里） */
+  model_route?: {
+    enabled: boolean;
+    levels: number;
+    routed_sessions: number;
+    circuit: Record<string, { until: number; remaining: number }>;
   };
 }
 
@@ -273,6 +286,10 @@ export interface LevelRow {
   description: string;
   effect: "inherit" | "allow" | "deny";
   sort_order: number;
+  /** 模型路由：主提供商 id / 具体模型名 / 备用提供商 id */
+  provider_id: string;
+  model: string;
+  fallback_provider_id: string;
   members: number;
   quotas: Record<string, { limit_tokens: number; mode: string; reset_at: number | null }>;
 }
@@ -285,7 +302,32 @@ export interface LevelPayload {
   description?: string;
   effect?: "inherit" | "allow" | "deny";
   sort_order?: number;
+  provider_id?: string;
+  model?: string;
+  fallback_provider_id?: string;
   quotas?: { period: string; limit_tokens: number | null; mode?: string; delete?: boolean }[];
+}
+
+/** AstrBot 里已加载的对话模型提供商。 */
+export interface ProviderRow {
+  id: string;
+  model: string;
+  type: string;
+  modalities: string[];
+}
+
+/** 某对象当前会走的模型（含来源等级与是否落到备用）。 */
+export interface ModelRoute {
+  layer?: string;
+  label?: string;
+  level_id?: number;
+  provider_id?: string;
+  model?: string;
+  fallback_provider_id?: string;
+  used_fallback?: boolean;
+  reason?: string;
+  available?: string[];
+  circuit_open?: string[];
 }
 
 export interface SubjectTotals {
@@ -318,6 +360,7 @@ export interface SubjectDetail {
   level_quotas: QuotaRow[];
   quota_chain: QuotaChainItem[];
   quota: EffectiveQuota;
+  model_route: ModelRoute;
   usage: Record<string, { used_tokens: number; reset_at: number | null }>;
   bot: LastBotMessage | null;
   days: number;
@@ -347,6 +390,11 @@ export function apiSync() {
 }
 
 /** 等级列表（含额度模板与成员数）。 */
+/** 可用的对话模型提供商（等级里选「走哪个模型」）。 */
+export function apiProviders() {
+  return apiGet<{ items: ProviderRow[]; circuit_open: string[]; route_enabled: boolean }>("/providers");
+}
+
 export function apiLevels(kind?: "user" | "group") {
   return apiGet<{ items: LevelRow[]; counts: Record<string, number> }>(
     `/levels${kind ? `?kind=${kind}` : ""}`,

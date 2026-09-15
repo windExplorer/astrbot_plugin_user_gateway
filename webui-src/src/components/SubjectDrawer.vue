@@ -57,6 +57,14 @@ const qMode = ref<"enforce" | "observe">("enforce");
 
 const isUser = computed(() => props.type === "user");
 
+// 生效模型（等级路由）：说明「这个会话实际会走哪个提供商/模型」
+const modelRouteText = computed(() => {
+  const r = detail.value?.model_route as any;
+  if (!r || !r.layer) return "未配置（跟随 AstrBot 默认模型）";
+  if (!r.provider_id) return r.reason || "配置的提供商当前不可用，本次走 AstrBot 默认模型";
+  return `${r.provider_id}${r.model ? " · " + r.model : ""}${r.used_fallback ? "（备用）" : ""}｜来源：${r.label}`;
+});
+
 const displayName = computed(() => {
   const info = detail.value?.info as any;
   if (!info) return props.id;
@@ -366,6 +374,9 @@ watch(
                 />
                 <span style="font-size: 12px; opacity: 0.6">等级可带默认权限与额度模板</span>
               </n-space>
+              <span style="font-size: 12px; opacity: 0.65">
+                生效模型：{{ modelRouteText }}
+              </span>
               <span v-if="detail?.bot?.ts" style="font-size: 12px; opacity: 0.65">
                 最后回复：{{ new Date(detail.bot.ts * 1000).toLocaleString() }}（{{ detail.bot.kind === "llm" ? "LLM 回复" : detail.bot.kind === "command" ? "指令回复" : "普通消息" }}）
               </span>

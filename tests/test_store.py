@@ -43,7 +43,7 @@ async def main() -> int:
         check(Path(db_path).exists(), "数据库文件已创建")
 
         print("\n[2] settings")
-        check(await st.get_setting("schema_version") == "2", "schema_version 已写入 2")
+        check(await st.get_setting("schema_version") == "3", "schema_version 已写入 3")
         check(await st.get_setting("nope", "d") == "d", "缺省值回退")
         await st.set_setting("sync_last_at", "123")
         check(await st.get_setting("sync_last_at") == "123", "写入后可读")
@@ -251,6 +251,23 @@ async def main() -> int:
         check(lv["name"] == "VIP改名" and lv["effect"] == "deny" and lv["sort_order"] == 9, "按 id 更新等级")
         check(len(await st.list_levels()) == 3, "更新不会多出等级")
 
+        # 等级模型路由三字段（主提供商 / 模型名 / 备用提供商）
+        await st.upsert_level(
+            "user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9,
+            provider_id="prov-a", model="gpt-x", fallback_provider_id="prov-b",
+        )
+        lv = await st.get_level(lv_vip)
+        check(lv["provider_id"] == "prov-a" and lv["model"] == "gpt-x" and lv["fallback_provider_id"] == "prov-b",
+              "等级模型路由字段可写可读")
+        await st.upsert_level("user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9)
+        lv = await st.get_level(lv_vip)
+        check(lv["provider_id"] == "" and lv["model"] == "" and lv["fallback_provider_id"] == "",
+              "不传模型字段 → 清空（避免旧值阴魂不散）")
+        await st.upsert_level(
+            "user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9,
+            provider_id="prov-a", model="gpt-x", fallback_provider_id="prov-b",
+        )
+
         await st.set_subject_level("group", "88888", lv_group)
         await st.delete_level(lv_group)
         check(await st.get_level(lv_group) is None, "删除等级")
@@ -324,7 +341,7 @@ async def main() -> int:
 
         st3 = Store(v1_path)
         await st3.open()
-        check(await st3.get_setting("schema_version") == "2", "版本号升到 2")
+        check(await st3.get_setting("schema_version") == "3", "版本号直接升到最新（v1 → v3 连续迁移）")
         q = await st3.get_quota("user", "10001", "day")
         check(q is not None and q["limit_tokens"] == 1000 and "used_tokens" not in q,
               "限额保留、用量的列已移除")
@@ -343,6 +360,53 @@ async def main() -> int:
         await st4.open()
         check((await st4.get_usage("user", "10001"))["day"]["used_tokens"] == 600, "重开不会重复累加迁移用量")
         await st4.close()
+
+    print("\n[12] v2 → v3 迁移（等级新增模型路由三列）")
+    with tempfile.TemporaryDirectory() as tmp3:
+        v2_path = str(Path(tmp3) / "v2.db")
+        raw2 = await aiosqlite.connect(v2_path)
+        await raw2.executescript(
+            """
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL);
+            CREATE TABLE quota_level (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind        TEXT    NOT NULL,
+                name        TEXT    NOT NULL,
+                description TEXT    NOT NULL DEFAULT '',
+                effect      TEXT    NOT NULL DEFAULT 'inherit',
+                sort_order  INTEGER NOT NULL DEFAULT 0,
+                updated_at  INTEGER NOT NULL,
+                UNIQUE (kind, name)
+            );
+            """,
+        )
+        await raw2.execute("INSERT INTO settings(key, value, updated_at) VALUES('schema_version', '2', 0)")
+        await raw2.execute("INSERT INTO quota_level(kind, name, updated_at) VALUES('user', '老等级', 0)")
+        await raw2.commit()
+        await raw2.close()
+
+        st5 = Store(v2_path)
+        await st5.open()
+        check(await st5.get_setting("schema_version") == "3", "版本号升到 3")
+        lv = await st5.get_level(1)
+        check(lv is not None and lv["name"] == "老等级", "v2 的等级数据保留")
+        check(
+            lv.get("provider_id") == "" and lv.get("model") == "" and lv.get("fallback_provider_id") == "",
+            "新增的三个模型列默认为空",
+        )
+        await st5.upsert_level(
+            "user", "老等级", level_id=1, provider_id="p1", model="m1", fallback_provider_id="p2",
+        )
+        lv = await st5.get_level(1)
+        check(
+            lv["provider_id"] == "p1" and lv["model"] == "m1" and lv["fallback_provider_id"] == "p2",
+            "迁移后新列可正常读写",
+        )
+        await st5.close()
+        st6 = Store(v2_path)
+        await st6.open()
+        check((await st6.get_level(1))["provider_id"] == "p1", "重开不会重复迁移、也不丢数据")
+        await st6.close()
 
     print()
     if _failures:

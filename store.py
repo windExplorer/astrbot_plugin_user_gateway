@@ -29,7 +29,7 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
     ) from e
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 额度周期：越靠前越"紧凑"，超限时优先报告它
 PERIODS: tuple[str, ...] = ("day", "month", "total")
@@ -93,15 +93,20 @@ CREATE TABLE IF NOT EXISTS llm_quota (
 );
 CREATE INDEX IF NOT EXISTS idx_quota_scope ON llm_quota(scope_type, scope_id);
 
--- 自定义等级：私聊与群聊各一套（kind 区分），等级本身可带默认 LLM 权限
+-- 自定义等级：私聊与群聊各一套（kind 区分），等级本身可带默认 LLM 权限与模型路由
+-- provider_id / fallback_provider_id 存 AstrBot 的提供商 id（在 AstrBot「模型提供商」里配置的那个 id），
+-- model 是可选的具体模型名（留空则用该提供商自己的默认模型）。
 CREATE TABLE IF NOT EXISTS quota_level (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT    NOT NULL,
-    name        TEXT    NOT NULL,
-    description TEXT    NOT NULL DEFAULT '',
-    effect      TEXT    NOT NULL DEFAULT 'inherit',
-    sort_order  INTEGER NOT NULL DEFAULT 0,
-    updated_at  INTEGER NOT NULL,
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind                 TEXT    NOT NULL,
+    name                 TEXT    NOT NULL,
+    description          TEXT    NOT NULL DEFAULT '',
+    effect               TEXT    NOT NULL DEFAULT 'inherit',
+    sort_order           INTEGER NOT NULL DEFAULT 0,
+    provider_id          TEXT    NOT NULL DEFAULT '',
+    model                TEXT    NOT NULL DEFAULT '',
+    fallback_provider_id TEXT    NOT NULL DEFAULT '',
+    updated_at           INTEGER NOT NULL,
     UNIQUE (kind, name)
 );
 
@@ -244,6 +249,25 @@ class Store:
         """按版本号做结构迁移。每一步都必须可重入（靠列/表存在性判断，而不是靠版本号）。"""
         if old_version < 2:
             await cls._migrate_v1_to_v2(db)
+        if old_version < 3:
+            await cls._migrate_v2_to_v3(db)
+
+    @staticmethod
+    async def _migrate_v2_to_v3(db: aiosqlite.Connection) -> None:
+        """v2 → v3：等级新增「模型路由」三列（主提供商 / 模型名 / 备用提供商）。
+
+        SQLite 的 ``ALTER TABLE ADD COLUMN`` 对「常量默认值」的列是可用的，
+        且这里按**列是否存在**判断，重复执行安全。
+        """
+        cols = await Store._table_columns(db, "quota_level")
+        if not cols:
+            return  # 全新库：SCHEMA_SQL 已经带上这三列
+        for name in ("provider_id", "model", "fallback_provider_id"):
+            if name in cols:
+                continue
+            await db.execute(
+                f"ALTER TABLE quota_level ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+            )
 
     @staticmethod
     async def _migrate_v1_to_v2(db: aiosqlite.Connection) -> None:
@@ -559,24 +583,56 @@ class Store:
         effect: str = "inherit",
         sort_order: int = 0,
         level_id: Optional[int] = None,
+        provider_id: str = "",
+        model: str = "",
+        fallback_provider_id: str = "",
     ) -> int:
-        """新建 / 更新等级，返回等级 id（``level_id`` 为空则按 ``(kind, name)`` 新建）。"""
+        """新建 / 更新等级，返回等级 id（``level_id`` 为空则按 ``(kind, name)`` 新建）。
+
+        ``provider_id`` / ``model`` / ``fallback_provider_id`` 是模型路由：
+        属于该等级的对象走指定提供商（可选指定模型名），主提供商不可用时用备用的那个。
+        """
         db = self._conn()
         if level_id:
             await db.execute(
                 "UPDATE quota_level SET kind = ?, name = ?, description = ?, effect = ?, "
-                "sort_order = ?, updated_at = ? WHERE id = ?",
-                (kind, name, description, effect, int(sort_order), now_ts(), int(level_id)),
+                "sort_order = ?, provider_id = ?, model = ?, fallback_provider_id = ?, "
+                "updated_at = ? WHERE id = ?",
+                (
+                    kind,
+                    name,
+                    description,
+                    effect,
+                    int(sort_order),
+                    str(provider_id or ""),
+                    str(model or ""),
+                    str(fallback_provider_id or ""),
+                    now_ts(),
+                    int(level_id),
+                ),
             )
             await db.commit()
             return int(level_id)
         await db.execute(
-            "INSERT INTO quota_level(kind, name, description, effect, sort_order, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?) "
+            "INSERT INTO quota_level(kind, name, description, effect, sort_order, "
+            "provider_id, model, fallback_provider_id, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, name) DO UPDATE SET "
             "description = excluded.description, effect = excluded.effect, "
-            "sort_order = excluded.sort_order, updated_at = excluded.updated_at",
-            (kind, name, description, effect, int(sort_order), now_ts()),
+            "sort_order = excluded.sort_order, provider_id = excluded.provider_id, "
+            "model = excluded.model, fallback_provider_id = excluded.fallback_provider_id, "
+            "updated_at = excluded.updated_at",
+            (
+                kind,
+                name,
+                description,
+                effect,
+                int(sort_order),
+                str(provider_id or ""),
+                str(model or ""),
+                str(fallback_provider_id or ""),
+                now_ts(),
+            ),
         )
         await db.commit()
         async with db.execute(

@@ -53,6 +53,12 @@ LAYER_LABELS: dict[str, str] = {
     LAYER_GLOBAL: "全局默认",
 }
 
+# 模型路由的来源（等级是唯一来源，但私聊看好友等级、群聊看群等级）
+MODEL_SOURCE_LABELS: dict[str, str] = {
+    LAYER_USER_LEVEL: "好友等级",
+    LAYER_GROUP_LEVEL: "群等级",
+}
+
 
 def layer_label(layer: str) -> str:
     """档位的中文名（控制台与日志共用）。"""
@@ -91,6 +97,8 @@ class Rules:
     subject_level: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
     limits: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     usage: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
+    level_model: Mapping[Any, Mapping[str, str]] = field(default_factory=dict)
+    """``{(kind, level_id): {"provider_id", "model", "fallback_provider_id"}}`` —— 等级的模型路由。"""
 
     def limits_of(self, scope_type: str, scope_id: str) -> Mapping[str, Mapping[str, Any]]:
         return (self.limits.get(scope_type) or {}).get(str(scope_id)) or {}
@@ -263,6 +271,66 @@ class Gate:
         return Verdict(allow=True, layer=layer, scope_type=scope_type, scope_id=scope_id)
 
     # ------------------------------------------------------------------ #
+    # 模型路由
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def resolve_model(subject: Subject, rules: Rules) -> Optional[dict[str, Any]]:
+        """按会话类型解析该走哪个「等级模型」。
+
+        **群聊只看群等级、私聊只看好友等级** —— 有意与权限/额度的档位链不同：
+        群聊的上下文与统计都属于「群」（同一个 umo），若按发言人切模型，
+        同一个群会因谁说话而换模型，上下文与计费口径都会串味。
+
+        Returns:
+            ``{layer, label, level_id, provider_id, model, fallback_provider_id}``；
+            该等级没配模型时返回 ``None``（表示不干预，走 AstrBot 的默认模型）。
+        """
+        kind = ""
+        sid = ""
+        layer = ""
+        if str(subject.group_id or ""):
+            kind, sid, layer = "group", str(subject.group_id), LAYER_GROUP_LEVEL
+        elif str(subject.sender_id or ""):
+            kind, sid, layer = "user", str(subject.sender_id), LAYER_USER_LEVEL
+        if not kind:
+            return None
+        level_id = rules.level_id_of(kind, sid)
+        if not level_id:
+            return None
+        got = rules.level_model.get((kind, int(level_id))) or {}
+        if not (got.get("provider_id") or got.get("fallback_provider_id") or got.get("model")):
+            return None
+        return {
+            "layer": layer,
+            "label": MODEL_SOURCE_LABELS.get(layer, layer),
+            "level_id": int(level_id),
+            "provider_id": str(got.get("provider_id") or ""),
+            "model": str(got.get("model") or ""),
+            "fallback_provider_id": str(got.get("fallback_provider_id") or ""),
+        }
+
+    @staticmethod
+    def pick_provider(route: Mapping[str, Any], available: set[str]) -> Optional[dict[str, Any]]:
+        """在**当前可用**的提供商里挑一个：主 → 备用 → 都没有则返回 ``None``。
+
+        ``None`` 表示「不干预」——交给 AstrBot 用它自己的默认提供商，
+        绝不能拿一个不存在的 id 去设 ``selected_provider``：
+        AstrBot 遇到未知提供商 id 会**直接放弃本次 LLM 请求**（`astr_main_agent.py:242`）。
+
+        Returns:
+            ``{provider_id, model, used_fallback}``；用备用时不沿用主提供商的模型名
+            （模型名可能不存在于备用提供商上，AstrBot 自己切换提供商时也是这么做的）。
+        """
+        pid = str(route.get("provider_id") or "")
+        fb = str(route.get("fallback_provider_id") or "")
+        model = str(route.get("model") or "")
+        if pid and pid in available:
+            return {"provider_id": pid, "model": model, "used_fallback": False}
+        if fb and fb in available:
+            return {"provider_id": fb, "model": "", "used_fallback": True}
+        return None
+
+    # ------------------------------------------------------------------ #
     # 额度
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -384,6 +452,77 @@ class Gate:
                 allowed = quota
 
         return allowed
+
+
+class ProviderCircuit:
+    """提供商熔断器：某个提供商连续失败到阈值就「断开」，冷却期内不再选它。
+
+    为什么需要：等级可以配「主提供商 + 备用提供商」，但 AstrBot 自带的
+    ``fallback_provider_ids`` 是**全局**配置、且在建 Agent 时一次性固定，
+    插件没法按会话注入。所以「主模型挂了自动走备用」由我们在**选择阶段**实现：
+    连续失败 N 次 → 冷却期内该提供商视为不可用 → 自动落到备用提供商。
+
+    全内存、进程重启即清空；失败判定只看「最终响应是 err」，不区分具体错误类型
+    （超时 / 429 / 鉴权失败都会导致同样结果：该提供商现在不好用）。
+    """
+
+    def __init__(self, threshold: int = 2, cooldown_sec: int = 300) -> None:
+        self.threshold = max(1, int(threshold))
+        self.cooldown = max(0, int(cooldown_sec))
+        self._fails: dict[str, int] = {}
+        self._until: dict[str, float] = {}
+
+    def is_open(self, provider_id: str, now: Optional[float] = None) -> bool:
+        """该提供商当前是否处于熔断中（``cooldown<=0`` 表示永不熔断）。"""
+        pid = str(provider_id or "")
+        if not pid or self.cooldown <= 0:
+            return False
+        now = now if now is not None else time.time()
+        until = self._until.get(pid, 0.0)
+        if until and now < until:
+            return True
+        if until:  # 冷却结束 → 复位，给它一次机会
+            self._until.pop(pid, None)
+            self._fails.pop(pid, None)
+        return False
+
+    def note_failure(self, provider_id: str, now: Optional[float] = None) -> bool:
+        """记一次失败；返回本次是否**刚刚**触发熔断（用于打日志）。"""
+        pid = str(provider_id or "")
+        if not pid or self.cooldown <= 0:
+            return False
+        now = now if now is not None else time.time()
+        n = self._fails.get(pid, 0) + 1
+        if n >= self.threshold:
+            self._fails[pid] = 0
+            self._until[pid] = now + self.cooldown
+            return True
+        self._fails[pid] = n
+        return False
+
+    def note_success(self, provider_id: str) -> None:
+        """成功一次就清零（避免偶发失败累积成熔断）。"""
+        pid = str(provider_id or "")
+        if pid:
+            self._fails.pop(pid, None)
+            self._until.pop(pid, None)
+
+    def open_ids(self, now: Optional[float] = None) -> set[str]:
+        """当前熔断中的所有提供商 id。"""
+        return {pid for pid in list(self._until.keys()) if self.is_open(pid, now)}
+
+    def snapshot(self, now: Optional[float] = None) -> dict[str, dict[str, Any]]:
+        """给控制台看的状态：``{pid: {until, remaining}}``。"""
+        now = now if now is not None else time.time()
+        out: dict[str, dict[str, Any]] = {}
+        for pid in list(self._until.keys()):
+            if not self.is_open(pid, now):
+                continue
+            out[pid] = {
+                "until": int(self._until.get(pid, 0)),
+                "remaining": max(0, int(self._until.get(pid, 0) - now)),
+            }
+        return out
 
 
 class Cooldown:

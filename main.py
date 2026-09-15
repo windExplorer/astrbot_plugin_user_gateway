@@ -43,7 +43,7 @@ if _PLUGIN_DIR not in sys.path:
 try:  # 包内相对导入（AstrBot 正常加载路径）
     from . import quota as quota_mod
     from .avatar import AvatarCache
-    from .gate import Cooldown, Gate, Rules, Subject, layer_label
+    from .gate import Cooldown, Gate, ProviderCircuit, Rules, Subject, layer_label
     from .store import Store
     from .sync import SyncScheduler
     from .webui_api import register_apis
@@ -56,7 +56,7 @@ except ImportError as _rel_err:
     try:
         import quota as quota_mod  # type: ignore
         from avatar import AvatarCache  # type: ignore
-        from gate import Cooldown, Gate, Rules, Subject, layer_label  # type: ignore
+        from gate import Cooldown, Gate, ProviderCircuit, Rules, Subject, layer_label  # type: ignore
         from store import Store  # type: ignore
         from sync import SyncScheduler  # type: ignore
         from webui_api import register_apis  # type: ignore
@@ -114,6 +114,8 @@ class UserGatewayPlugin(Star):
         self._level_effect: dict[tuple[str, int], str] = {}
         self._subject_level_user: dict[str, int] = {}
         self._subject_level_group: dict[str, int] = {}
+        # 等级模型路由：{(kind, level_id): {provider_id, model, fallback_provider_id}}
+        self._level_route: dict[tuple[str, int], dict[str, str]] = {}
         # 限额规则：{scope_type(user|group|level|global): {scope_id: {period: row}}}
         self._limits: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
         # 用量计数：{scope_type(user|group): {scope_id: {period: row}}}
@@ -123,6 +125,12 @@ class UserGatewayPlugin(Star):
         # M1：判定内核 / 提示冷却 / 后台任务
         self.gate = Gate(self._cfg)
         self._notify_cooldown = Cooldown(int(self._cfg("notice_cooldown_sec", 60) or 0))
+        # M3：模型路由的提供商熔断器 + 每个会话最近一次的下发结果（用于失败归因与控制台展示）
+        self.circuit = ProviderCircuit(
+            threshold=int(self._cfg("model_route_failure_threshold", 2) or 2),
+            cooldown_sec=int(self._cfg("model_route_circuit_sec", 300) or 0),
+        )
+        self._last_route: dict[str, dict[str, Any]] = {}
         self.scheduler = SyncScheduler(self)
         # 会话 → 本次 LLM 请求的起始信息（用于估算 token 与统计延迟）
         self._inflight: dict[str, dict[str, Any]] = {}
@@ -269,10 +277,19 @@ class UserGatewayPlugin(Star):
             self._effect_user = await self.store.effect_map("user")
             self._effect_group = await self.store.effect_map("group")
 
-            # 等级默认权限：{(kind, level_id): effect}
+            # 等级默认权限与模型路由
+            levels = await self.store.list_levels()
             self._level_effect = {
                 (str(lv["kind"]), int(lv["id"])): str(lv.get("effect") or "inherit")
-                for lv in await self.store.list_levels()
+                for lv in levels
+            }
+            self._level_route = {
+                (str(lv["kind"]), int(lv["id"])): {
+                    "provider_id": str(lv.get("provider_id") or ""),
+                    "model": str(lv.get("model") or ""),
+                    "fallback_provider_id": str(lv.get("fallback_provider_id") or ""),
+                }
+                for lv in levels
             }
             self._subject_level_user = await self.store.subject_level_map("user")
             self._subject_level_group = await self.store.subject_level_map("group")
@@ -317,7 +334,114 @@ class UserGatewayPlugin(Star):
             subject_level={"user": self._subject_level_user, "group": self._subject_level_group},
             limits=self._limits,
             usage={"user": self._usage_user, "group": self._usage_group},
+            level_model=self._level_route,
         )
+
+    # ------------------------------------------------------------------ #
+    # M3：按等级路由模型（主提供商 + 备用提供商）
+    # ------------------------------------------------------------------ #
+    def provider_ids(self) -> set[str]:
+        """当前**已加载可用**的对话提供商 id 集合。"""
+        out: set[str] = set()
+        try:
+            for p in self.context.get_all_providers() or []:
+                pid = str((getattr(p, "provider_config", {}) or {}).get("id") or "")
+                if pid:
+                    out.add(pid)
+        except Exception as e:
+            logger.debug(f"[UserGateway] 读取提供商列表失败（忽略）: {e}")
+        return out
+
+    @astr_filter.on_waiting_llm_request()
+    async def route_model(self, event: AstrMessageEvent) -> None:
+        """按等级把「本次请求走哪个模型」下发给 AstrBot。
+
+        时机依据（AstrBot 4.27 ``internal.py`` 的 ``process()``）：
+
+        - 本钩子在 **214 行**触发（获取会话锁之前）；
+        - 提供商在 **230 行**才由 ``_select_provider`` 决定，它读
+          ``event.get_extra("selected_provider")``（``astr_main_agent.py:242``）；
+        - ``req`` 在 **238 行**构造，``selected_model`` 在那时被读进 ``req.model``。
+
+        所以这里设的两个 extra 都来得及生效；而在 ``on_llm_request``（333 行）里
+        再改提供商就已经晚了。**未知的提供商 id 绝不能设**：AstrBot 找不到会直接
+        放弃本次请求并报错，所以这里先做「可用性 + 熔断」校验，都不行就不干预。
+        """
+        try:
+            if not self._cfg("model_route_enabled", True):
+                return
+            if not (self.store and self.store.ready):
+                return
+            subject = self._subject_of(event)
+            self._last_route.pop(subject.umo, None)
+            route = self.gate.resolve_model(subject, self._rules())
+            if not route:
+                return
+            available = self.provider_ids() - self.circuit.open_ids()
+            picked = self.gate.pick_provider(route, available)
+            if not picked:
+                if self._cfg("debug_log", False):
+                    logger.info(
+                        f"[UserGateway] 模型路由：{route['label']} 配的提供商当前不可用，"
+                        f"本次不干预（走 AstrBot 默认模型）｜{subject.umo}"
+                    )
+                return
+            event.set_extra("selected_provider", picked["provider_id"])
+            if picked["model"]:
+                event.set_extra("selected_model", picked["model"])
+            if len(self._last_route) > 2000:  # 防御性清理
+                self._last_route.clear()
+            self._last_route[subject.umo] = {**route, **picked}
+            if self._cfg("debug_log", False):
+                logger.info(
+                    f"[UserGateway] 模型路由：{subject.umo} → {picked['provider_id']}"
+                    f"{'（备用）' if picked['used_fallback'] else ''}"
+                    f"{'｜model=' + picked['model'] if picked['model'] else ''}"
+                    f"｜来源 {route['label']}"
+                )
+        except Exception:
+            # 路由失败绝不能影响对话：静默放行，交给 AstrBot 自己的默认逻辑
+            logger.exception("[UserGateway] 模型路由异常（忽略）")
+
+    @staticmethod
+    def _is_llm_error(response: Any) -> bool:
+        """判断这次响应是不是「所有候选模型都失败了」的兜底响应。
+
+        依据：AstrBot ``_iter_llm_responses_with_fallback`` 在候选用尽后
+        yield ``LLMResponse(role="err", completion_text="All chat models failed: ...")``。
+        """
+        try:
+            if str(getattr(response, "role", "") or "") == "err":
+                return True
+            text = str(getattr(response, "completion_text", "") or "")
+            return text.startswith("All chat models failed") or text.startswith(
+                "All available chat models"
+            )
+        except Exception:
+            return False
+
+    def _update_circuit(self, umo: str, response: Any) -> None:
+        """按本次响应更新「我们路由过的那个提供商」的熔断状态。
+
+        只统计**本插件下发过的**提供商，不碰 AstrBot 自己的默认模型。
+        """
+        if not self._cfg("model_route_enabled", True):
+            return
+        routed = self._last_route.get(umo) or {}
+        pid = str(routed.get("provider_id") or "")
+        if not pid:
+            return
+        try:
+            if self._is_llm_error(response):
+                if self.circuit.note_failure(pid):
+                    logger.warning(
+                        f"[UserGateway] 提供商 {pid} 连续失败，已熔断 "
+                        f"{self.circuit.cooldown}s；期间配了备用模型的等级会自动落过去"
+                    )
+            else:
+                self.circuit.note_success(pid)
+        except Exception:
+            pass
 
     @staticmethod
     def quota_reset_at(period: str, now: Optional[datetime] = None) -> Optional[int]:
@@ -357,7 +481,7 @@ class UserGatewayPlugin(Star):
     # M1 核心：LLM 请求闸门
     # ------------------------------------------------------------------ #
     @astr_filter.on_llm_request()
-    async def guard_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+    async def guard_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:  # noqa: D401
         """LLM 请求前的权限与额度闸门（PRD §8.1）。
 
         放行时不做任何事；拒绝时**直发提示**并 ``event.stop_event()`` 掐断本次 LLM 调用。
@@ -371,6 +495,7 @@ class UserGatewayPlugin(Star):
             subject = self._subject_of(event)
             verdict = self.gate.evaluate(subject, self._rules())
             self._mark_request(event, req)
+            self._apply_model_to_request(subject.umo, req)
 
             if verdict.allow:
                 # 给事件打标：本条消息确实走了 LLM。
@@ -398,8 +523,11 @@ class UserGatewayPlugin(Star):
         ⚠️ 已知粒度：该钩子只在「最终无工具调用」的那一轮触发
         （`tool_loop_agent_runner.py:912`），因此**多轮工具循环的中间轮 token 不会计入**。
         对限额而言这是系统性低估，M2 会改为按轮累计或增量读 `provider_stats`。
+
+        这里顺带做模型路由的熔断统计（与 ``stats_enabled`` 无关，开关只管统计）。
         """
         try:
+            self._update_circuit(str(getattr(event, "unified_msg_origin", "") or ""), response)
             if not (self.store and self.store.ready):
                 return
             if not self._cfg("stats_enabled", True):
@@ -407,6 +535,21 @@ class UserGatewayPlugin(Star):
             await self._record_usage(event, response)
         except Exception:
             logger.exception("[UserGateway] 用量记录异常（忽略，不影响对话）")
+
+    def _apply_model_to_request(self, umo: str, req: Any) -> None:
+        """双保险：把路由到的模型名再写进 ``req.model``。
+
+        ``selected_model`` extra 由 AstrBot 在构造 ``req`` 时读取；这里再兜一次，
+        因为 ``req.model`` 才是 Agent 真正传给 provider 的字段
+        （``tool_loop_agent_runner.py:514``，且只有主提供商才带模型名，备用提供商
+        用自己的默认模型 —— 与 AstrBot 切提供商时的处理一致）。
+        """
+        try:
+            model = str((self._last_route.get(umo) or {}).get("model") or "")
+            if model and not getattr(req, "model", None):
+                req.model = model
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # 闸门辅助
@@ -588,6 +731,26 @@ class UserGatewayPlugin(Star):
                 },
             )
         return out
+
+    def model_route_of(self, scope_type: str, scope_id: str) -> dict[str, Any]:
+        """给控制台用：某对象当前**会走哪个模型**（含来源等级与实际选中的提供商）。
+
+        ``available`` 一起返回，前端可以就地标出「配置的提供商当前不可用」。
+        """
+        try:
+            subject = Subject(sender_id=scope_id) if scope_type == "user" else Subject(group_id=scope_id)
+            route = self.gate.resolve_model(subject, self._rules()) or {}
+            available = self.provider_ids()
+            out: dict[str, Any] = {**route, "available": sorted(available), "circuit_open": sorted(self.circuit.open_ids())}
+            if route:
+                picked = self.gate.pick_provider(route, available - self.circuit.open_ids()) or {}
+                out.update(picked)
+                if not picked:
+                    out["reason"] = "配置的提供商当前不可用（未加载或已熔断），本次会走 AstrBot 默认模型"
+            return out
+        except Exception as e:
+            logger.debug(f"[UserGateway] 解析模型路由失败（忽略）: {e}")
+            return {}
 
     def _effective_limit(self, scope_type: str, scope_id: str) -> Optional[tuple[str, dict]]:
         """取某对象**生效**的那一层限额 ``(layer, {period: row})``（与 Gate 档位链一致）。

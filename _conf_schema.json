@@ -122,6 +122,24 @@
     "type": "bool",
     "default": true
   },
+  "model_route_enabled": {
+    "description": "启用等级模型路由",
+    "hint": "开启后，等级里配置的「主模型 / 备用模型」会在请求前下发给 AstrBot（私聊按好友等级、群聊按群等级）。关闭则所有会话都走 AstrBot 的默认模型。",
+    "type": "bool",
+    "default": true
+  },
+  "model_route_failure_threshold": {
+    "description": "模型熔断阈值（连续失败次数）",
+    "hint": "某个提供商连续失败这么多次后进入熔断（暂时不再选它），配了备用模型的等级会自动落到备用。默认 2。",
+    "type": "int",
+    "default": 2
+  },
+  "model_route_circuit_sec": {
+    "description": "模型熔断时长（秒）",
+    "hint": "熔断期间该提供商不参与路由；到点自动恢复。默认 300；设 0 关闭熔断（失败也不会自动切备用，每次请求都先试主模型）。",
+    "type": "int",
+    "default": 300
+  },
   "retention_days": {
     "description": "统计数据保留天数",
     "hint": "超过该天数的用量明细会自动清理。默认 180 天；设 0 表示永久保留（数据量大时注意磁盘占用）。",

@@ -288,6 +288,13 @@ async def h_ping(plugin) -> dict:
             "avatars": (
                 plugin.avatars.stats() if getattr(plugin, "avatars", None) is not None else {}
             ),
+            # 模型路由概况（等级模型是否在生效、哪些提供商被熔断了）
+            "model_route": {
+                "enabled": bool(plugin._cfg("model_route_enabled", True)),
+                "levels": len(getattr(plugin, "_level_route", {}) or {}),
+                "routed_sessions": len(getattr(plugin, "_last_route", {}) or {}),
+                "circuit": (plugin.circuit.snapshot() if getattr(plugin, "circuit", None) else {}),
+            },
         },
     )
 
@@ -561,6 +568,7 @@ async def h_subject(plugin) -> dict:
     chain = plugin.quota_chain(subject_type, subject_id)
     bot = await plugin.store.get_bot_message(subject_type, subject_id)
     usage = await plugin.store.get_usage(subject_type, subject_id)
+    model_route = plugin.model_route_of(subject_type, subject_id)
 
     return ok(
         {
@@ -572,6 +580,7 @@ async def h_subject(plugin) -> dict:
             "level_id": level_id,
             "level": level,
             "level_quotas": level_quotas,
+            "model_route": model_route,
             "quota_chain": chain,
             "quota": _effective_from_chain(chain),
             "usage": usage,
@@ -796,11 +805,51 @@ async def h_levels(plugin) -> dict:
                 "description": str(lv.get("description") or ""),
                 "effect": str(lv.get("effect") or "inherit"),
                 "sort_order": int(lv.get("sort_order") or 0),
+                "provider_id": str(lv.get("provider_id") or ""),
+                "model": str(lv.get("model") or ""),
+                "fallback_provider_id": str(lv.get("fallback_provider_id") or ""),
                 "members": int(counts.get(lid, 0)),
                 "quotas": limits.get(str(lid), {}),
             },
         )
     return ok({"items": items, "counts": counts})
+
+
+async def h_providers(plugin) -> dict:
+    """列出可用的对话模型提供商（等级里选「走哪个模型」用）。
+
+    只列**已加载**的：AstrBot 遇到不存在的提供商 id 会直接放弃本次 LLM 请求，
+    所以必须让前端只能从这份名单里选。附带返回当前熔断中的提供商。
+    """
+    items: list[dict] = []
+    try:
+        for p in plugin.context.get_all_providers() or []:
+            cfg = getattr(p, "provider_config", {}) or {}
+            pid = str(cfg.get("id") or "")
+            if not pid:
+                continue
+            try:
+                model = str(p.get_model() or "")
+            except Exception:
+                model = str(cfg.get("model") or "")
+            items.append(
+                {
+                    "id": pid,
+                    "model": model,
+                    "type": str(cfg.get("type") or ""),
+                    "modalities": list(cfg.get("modalities") or []),
+                },
+            )
+    except Exception as e:
+        logger.warning(f"[UserGateway] 读取提供商列表失败: {e}")
+    circuit = getattr(plugin, "circuit", None)
+    return ok(
+        {
+            "items": items,
+            "circuit_open": sorted(circuit.open_ids()) if circuit else [],
+            "route_enabled": bool(plugin._cfg("model_route_enabled", True)),
+        },
+    )
 
 
 async def h_set_level(plugin) -> dict:
@@ -842,6 +891,9 @@ async def h_set_level(plugin) -> dict:
         effect=effect,
         sort_order=sort_order,
         level_id=level_id,
+        provider_id=str(body.get("provider_id") or "").strip(),
+        model=str(body.get("model") or "").strip(),
+        fallback_provider_id=str(body.get("fallback_provider_id") or "").strip(),
     )
     if not new_id:
         return err("等级写入失败")
@@ -1055,6 +1107,7 @@ def register_apis(plugin) -> None:
         ("/levels", h_set_level, ["POST"]),
         ("/levels/delete", h_delete_level, ["POST"]),
         ("/subject-level", h_set_subject_level, ["POST"]),
+        ("/providers", h_providers, ["GET"]),
         ("/avatars", h_avatars, ["GET"]),
         ("/avatars/refresh", h_avatars_refresh, ["POST"]),
         ("/usage", h_usage, ["GET"]),
