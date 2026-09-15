@@ -6,6 +6,7 @@
 // 所以在这里 stop_event() 就能让后面的指令 handler 不执行。
 import { computed, h, onMounted, ref } from "vue";
 import {
+  NAlert,
   NButton,
   NCard,
   NDataTable,
@@ -16,13 +17,25 @@ import {
   NRadioGroup,
   NSelect,
   NSpace,
+  NSpin,
   NTag,
   NTooltip,
   useMessage,
   type DataTableColumns,
 } from "naive-ui";
 
-import { apiCommands, apiPruneCommands, apiSetPolicy, type CommandRow } from "../api";
+import {
+  apiCommandMatrix,
+  apiCommands,
+  apiGet,
+  apiGroupMembers,
+  apiLevels,
+  apiPruneCommands,
+  apiSetPolicy,
+  type CommandMatrix,
+  type CommandMatrixRow,
+  type CommandRow,
+} from "../api";
 import EffectSegment from "../components/EffectSegment.vue";
 
 const message = useMessage();
@@ -187,6 +200,207 @@ function ruleSummary(row: CommandRow): string {
   return rules.length > 2 ? `${text} 等 ${rules.length} 条` : text;
 }
 
+// ------------------------------------------------------------------ //
+// 对象体检：某对象 × 所有指令的可用性矩阵
+//
+// 「这道指令他到底能不能用、结论是哪一层给的」以前只能靠一条条点开规则去推；
+// 这里直接把整个结论摊平：选一个对象 → 列出所有指令 + 结论 + 来源 + 该对象的显式规则。
+// ------------------------------------------------------------------ //
+const mxType = ref<"user" | "group" | "member" | "level" | "global">("user");
+const mxScene = ref<"private" | "group">("private");
+const mxId = ref("");
+const mxGroupId = ref(""); // 群成员模式：先选群
+const mxLoading = ref(false);
+const mxRows = ref<CommandMatrixRow[]>([]);
+const mxSummary = ref<CommandMatrix["summary"] | null>(null);
+const mxEditable = ref(false);
+const mxLevelKind = ref("");
+const mxObjects = ref<{ label: string; value: string }[]>([]);
+const mxGroups = ref<{ label: string; value: string }[]>([]);
+
+const mxTypeOptions = [
+  { label: "好友", value: "user" },
+  { label: "群聊", value: "group" },
+  { label: "群成员", value: "member" },
+  { label: "等级", value: "level" },
+  { label: "全局", value: "global" },
+];
+
+const mxSceneOptions = [
+  { label: "私聊场景", value: "private" },
+  { label: "群聊场景", value: "group" },
+];
+
+/** 当前模式下真正提交给后端的 scope_type / scope_id。 */
+function mxScope(): { scopeType: string; scopeId: string; scene: "private" | "group" } {
+  const scene: "private" | "group" =
+    mxType.value === "group" || mxType.value === "member" ? "group" : mxScene.value;
+  return {
+    scopeType: mxType.value,
+    // 群成员的选项值就是后端给的「群号:QQ」，其它模式直接用对象 id
+    scopeId: mxId.value,
+    scene,
+  };
+}
+
+async function loadMatrixObjects() {
+  mxId.value = "";
+  mxRows.value = [];
+  mxSummary.value = null;
+  try {
+    if (mxType.value === "user") {
+      const res = await apiGet<{ rows: any[] }>("/friends?page=1&size=500&sort=last");
+      mxObjects.value = (res.rows || []).map((r) => ({
+        label: `${r.display_name}（${r.uin}）`,
+        value: String(r.uin),
+      }));
+    } else if (mxType.value === "group" || mxType.value === "member") {
+      const res = await apiGet<{ rows: any[] }>("/groups?page=1&size=500&sort=last");
+      const opts = (res.rows || []).map((r) => ({
+        label: `${r.name || r.group_id}（${r.group_id}）`,
+        value: String(r.group_id),
+      }));
+      mxGroups.value = opts;
+      mxObjects.value = mxType.value === "group" ? opts : [];
+    } else if (mxType.value === "level") {
+      const res = await apiLevels();
+      mxObjects.value = (res.items || []).map((lv) => ({
+        label: `${lv.name}（${lv.kind === "group" ? "群聊" : "好友"}等级 · ${lv.members} 人在此档）`,
+        value: String(lv.id),
+      }));
+    } else {
+      mxObjects.value = [{ label: "全局（所有对象）", value: "*" }];
+      mxId.value = "*";
+      await loadMatrix();
+    }
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  }
+}
+
+async function loadMatrixMembers(groupId: string) {
+  mxObjects.value = [];
+  mxId.value = "";
+  if (!groupId) return;
+  try {
+    const res = await apiGroupMembers(groupId, "", 1, 1000);
+    mxObjects.value = (res.rows || []).map((m) => ({
+      label: `${m.display_name}（${m.user_id}）`,
+      // 直接用后端给的规则 scope_id（群号:QQ），避免自己拼格式
+      value: m.scope_id || `${groupId}:${m.user_id}`,
+    }));
+    if (!res.rows?.length) {
+      message.warning("这个群还没有成员缓存，先到「群聊」页点该行的「同步成员」");
+    }
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  }
+}
+
+async function loadMatrix() {
+  if (!mxId.value) return;
+  const { scopeType, scopeId, scene } = mxScope();
+  mxLoading.value = true;
+  try {
+    const res = await apiCommandMatrix(scopeType, scopeId, scene);
+    mxRows.value = res.rows || [];
+    mxSummary.value = res.summary || null;
+    mxEditable.value = !!res.editable;
+    mxLevelKind.value = res.level_kind || "";
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    mxLoading.value = false;
+  }
+}
+
+/** 给该对象设「这条指令」的显式规则（写 feature=command:<指令名>）。 */
+async function setMatrixRule(row: CommandMatrixRow, effect: string) {
+  if (mxType.value === "level") return; // 等级层不支持单条指令规则
+  const { scopeType, scopeId, scene } = mxScope();
+  try {
+    await apiSetPolicy([
+      {
+        scope_type: scopeType as any,
+        scope_id: scopeId,
+        effect: effect as any,
+        feature: featureOf(row.name),
+        scene: scopeType === "user" ? scene : "",
+      },
+    ]);
+    message.success(
+      `「${row.name}」已设为${effect === "allow" ? "放行" : effect === "deny" ? "禁止" : "继承"}`,
+    );
+    await loadMatrix();
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  }
+}
+
+const mxColumns: DataTableColumns<CommandMatrixRow> = [
+  {
+    title: "指令",
+    key: "name",
+    minWidth: 170,
+    render: (row) =>
+      h("div", { style: "line-height:1.35" }, [
+        h("div", { style: "font-weight:500" }, [
+          row.name,
+          row.is_group
+            ? h(NTag, { size: "tiny", bordered: false, style: "margin-left:6px" }, { default: () => "指令组" })
+            : null,
+        ]),
+        row.aliases?.length
+          ? h("div", { style: "font-size:12px;opacity:.65" }, `别名：${row.aliases.join(" / ")}`)
+          : null,
+      ]),
+  },
+  {
+    title: "能不能用",
+    key: "allow",
+    width: 110,
+    render: (row) =>
+      h(
+        NTag,
+        { size: "small", bordered: false, type: row.allow ? "success" : "error" },
+        { default: () => (row.allow ? "可以用" : "被拦下") },
+      ),
+  },
+  {
+    title: "结论来源",
+    key: "layer_label",
+    width: 130,
+    render: (row) =>
+      h(
+        NTooltip,
+        { trigger: "hover" },
+        {
+          trigger: () => h("span", { style: "font-size:12.5px" }, row.layer_label),
+          default: () =>
+            row.layer
+              ? `命中最具体的一层：${row.layer_label}（更粗的层不再参与）`
+              : "整条链都没有显式规则 → 用配置里的「指令默认策略」",
+        },
+      ),
+  },
+  {
+    title: "该对象的例外",
+    key: "explicit",
+    width: 200,
+    render: (row) => {
+      if (!mxEditable.value) {
+        return h("span", { style: "font-size:12px;opacity:.5" }, "等级层不支持单条指令规则");
+      }
+      return h(EffectSegment, {
+        effect: row.explicit || "inherit",
+        disabled: saving.value,
+        onChange: (v: string) => setMatrixRule(row, v),
+      });
+    },
+  },
+];
+
 const columns: DataTableColumns<CommandRow> = [
   {
     title: "指令",
@@ -252,7 +466,10 @@ const columns: DataTableColumns<CommandRow> = [
   },
 ];
 
-onMounted(load);
+onMounted(() => {
+  load();
+  loadMatrixObjects();
+});
 </script>
 
 <template>
@@ -328,6 +545,87 @@ onMounted(load);
         :scroll-x="1000"
         size="small"
       />
+    </n-card>
+
+    <!-- 对象体检：指令 × 对象矩阵 -->
+    <n-card size="small">
+      <template #header>
+        <n-space align="center" :size="10">
+          <span>对象体检：他到底能用哪些指令</span>
+          <n-tag v-if="mxSummary" size="small" :bordered="false">
+            共 {{ mxSummary.total }} 条指令：可用 {{ mxSummary.allowed }} / 被拦
+            {{ mxSummary.denied }}
+          </n-tag>
+        </n-space>
+      </template>
+      <n-space vertical :size="10">
+        <n-space align="center" :size="8" style="flex-wrap: wrap">
+          <n-select
+            v-model:value="mxType"
+            :options="mxTypeOptions"
+            size="small"
+            style="width: 110px"
+            @update:value="loadMatrixObjects"
+          />
+          <n-select
+            v-if="mxType === 'user' || mxType === 'level'"
+            v-model:value="mxScene"
+            :options="mxSceneOptions"
+            size="small"
+            style="width: 118px"
+            @update:value="loadMatrix"
+          />
+          <n-select
+            v-if="mxType === 'member'"
+            v-model:value="mxGroupId"
+            :options="mxGroups"
+            filterable
+            size="small"
+            style="width: 240px"
+            placeholder="先选群"
+            @update:value="loadMatrixMembers"
+          />
+          <n-select
+            v-model:value="mxId"
+            :options="mxObjects"
+            filterable
+            clearable
+            :disabled="mxType === 'global'"
+            size="small"
+            style="width: 260px"
+            :placeholder="mxType === 'member' ? '再选成员' : '选择对象'"
+            @update:value="loadMatrix"
+          />
+        </n-space>
+        <n-spin :show="mxLoading">
+          <n-empty
+            v-if="!mxId"
+            description="先选一个对象，马上看到它对每条指令的结论与来源"
+            style="padding: 28px 0"
+          />
+          <template v-else>
+            <n-alert
+              v-if="mxType === 'level'"
+              type="info"
+              :bordered="false"
+              style="margin-bottom: 8px"
+            >
+              这是「{{ mxLevelKind === "group" ? "群聊" : "好友" }}等级」的结论：等级只管
+              <b>整体能不能用指令</b>（在「限额 → 等级管理」配置），单条指令的例外要配到
+              好友 / 群 / 群成员上。想给这一档里的个别人开白名单，去「私聊 / 群聊」页设那个人的指令权限。
+            </n-alert>
+            <n-data-table
+              :columns="mxColumns"
+              :data="mxRows"
+              :bordered="false"
+              size="small"
+              :max-height="460"
+              :scroll-x="620"
+              :row-key="(row: CommandMatrixRow) => row.name"
+            />
+          </template>
+        </n-spin>
+      </n-space>
     </n-card>
 
     <!-- 例外规则 -->

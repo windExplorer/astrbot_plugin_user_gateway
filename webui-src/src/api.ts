@@ -503,7 +503,8 @@ export function apiPruneCommands() {
 export type Scene = "" | "private" | "group";
 
 export interface PolicyItem {
-  scope_type: "user" | "group" | "global";
+  /** ``member`` 时 ``scope_id`` 是「群号:QQ」（群成员维度） */
+  scope_type: "user" | "group" | "member" | "global";
   scope_id: string;
   effect: "allow" | "deny" | "inherit";
   feature: string;
@@ -698,6 +699,48 @@ export function apiSyncGroupMembers(groupId: string, platformId = "") {
     { group_id: groupId, platform_id: platformId },
     60000,
   );
+}
+
+// ---------------------------------------------------------------- 指令 × 对象矩阵
+
+/** 矩阵里的一行：某条指令对「这个对象」的结论。 */
+export interface CommandMatrixRow extends CommandRow {
+  command: string;
+  /** 最终结论：能不能用 */
+  allow: boolean;
+  /** 结论来自哪一层（空 = 系统默认） */
+  layer: string;
+  layer_label: string;
+  /** 该对象在这条指令上的**显式**规则（``inherit`` = 没单独配） */
+  explicit: "allow" | "deny" | "inherit";
+}
+
+export interface CommandMatrix {
+  scope_type: "user" | "group" | "member" | "level" | "global";
+  scope_id: string;
+  scene: "private" | "group";
+  /** 等级的类型（仅 scope_type=level 时非空） */
+  level_kind: string;
+  /** 这一层能不能配单条指令规则（等级层不能，前端据此隐藏编辑入口） */
+  editable: boolean;
+  summary: {
+    total: number;
+    allowed: number;
+    denied: number;
+    /** 按「结论来自哪一层」统计 */
+    by_layer: Record<string, number>;
+  };
+  rows: CommandMatrixRow[];
+}
+
+/** 指令 × 对象矩阵：某对象能用哪些指令、结论来自哪一层。 */
+export function apiCommandMatrix(
+  scopeType: string,
+  scopeId: string,
+  scene: "private" | "group" = "private",
+) {
+  const p = new URLSearchParams({ scope_type: scopeType, scope_id: scopeId, scene });
+  return apiGet<CommandMatrix>(`/commands/matrix?${p.toString()}`, 60000);
 }
 
 // ---------------------------------------------------------------- 规则备份 / 迁移

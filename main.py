@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import re
 import sys
@@ -1079,6 +1080,99 @@ class UserGatewayPlugin(Star):
             logger.debug(f"[UserGateway] 解析指令权限失败（忽略）: {e}")
             return {}
 
+    async def command_matrix_of(
+        self, scope_type: str, scope_id: str, scene: str = "private"
+    ) -> dict[str, Any]:
+        """给控制台用：**某对象 × 所有指令** 的可用性矩阵。
+
+        回答「这个人 / 这个群 / 这一等级到底能用哪些指令、以及为什么」——
+        以前只能在「指令」页逐条看规则（或逐个对象跑一下才知道），看不到整体结论。
+
+        Args:
+            scope_type: ``user`` / ``group`` / ``member`` / ``level`` / ``global``
+            scope_id: 对象 id（``member`` 是「群号:QQ」，``level`` 是等级 id，``global`` 传 ``*``）
+            scene: 好友这一层分场景，``private`` / ``group``
+
+        Returns:
+            ``{scope_type, scope_id, scene, editable, summary, rows}``；
+            ``rows`` 每项含 ``{name, desc, plugin, aliases, allow, layer, layer_label,
+            explicit}``。``editable=False``（等级）表示这一层不支持单条指令规则。
+        """
+        scene = "group" if str(scene) == "group" else "private"
+        rules = self._rules()
+        level_kind = ""
+        probe = "__probe__"
+
+        if scope_type == "level":
+            # 等级本身不是一个「会话对象」，得造一个探针对象并临时把它归到该等级，
+            # 才能跑出「这一档人」的结论。用 dataclasses.replace 派生一份临时快照，
+            # 不动插件里那份（热路径正在用）。
+            try:
+                lv = await self.store.get_level(int(scope_id)) if self.store else None
+            except Exception:
+                lv = None
+            if not lv:
+                return {}
+            level_kind = "group" if str(lv.get("kind")) == "group" else "user"
+            merged = {**((rules.subject_level or {}).get(level_kind) or {}), probe: int(lv["id"])}
+            rules = dataclasses.replace(
+                rules,
+                subject_level={**(rules.subject_level or {}), level_kind: merged},
+            )
+            if level_kind == "group":
+                scene, subject = "group", Subject(group_id=probe)
+            elif scene == "group":
+                subject = Subject(sender_id=probe, group_id="__scene_probe__")
+            else:
+                subject = Subject(sender_id=probe)
+        else:
+            subject = self._probe_subject(scope_type, scope_id, scene)
+
+        def explicit_of(cmd: str) -> str:
+            """该对象在这条指令上的**显式**规则（没配 = inherit）。"""
+            if scope_type == "level":
+                return "inherit"  # 单条指令不参与等级层（等级只管整体开关，见 gate.check_command）
+            row = (self._cmd_policy.get(cmd) or {}).get(scope_type) or {}
+            return effect_in_scene(row.get(scope_id), scene) or "inherit"
+
+        rows: list[dict[str, Any]] = []
+        by_layer: dict[str, int] = {}
+        allowed = 0
+        for c in self.registered_commands():
+            name = str(c.get("name") or "")
+            if not name:
+                continue
+            v = self.gate.check_command(subject, name, rules)
+            if v.allow:
+                allowed += 1
+            layer = v.layer or "global"
+            by_layer[layer] = by_layer.get(layer, 0) + 1
+            rows.append(
+                {
+                    **c,
+                    "command": name,
+                    "allow": bool(v.allow),
+                    "layer": v.layer,
+                    "layer_label": layer_label(v.layer) if v.layer else "系统默认",
+                    "explicit": explicit_of(name),
+                }
+            )
+        return {
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "scene": scene,
+            "level_kind": level_kind,
+            # 等级层不支持单条指令规则（设计如此），前端据此隐藏编辑入口
+            "editable": scope_type != "level" and bool(rows),
+            "summary": {
+                "total": len(rows),
+                "allowed": allowed,
+                "denied": len(rows) - allowed,
+                "by_layer": by_layer,
+            },
+            "rows": rows,
+        }
+
     @staticmethod
     def _probe_subject(scope_type: str, scope_id: str, scene: str) -> Subject:
         """构造一个「探针」Subject，用来在指定场景下跑档位链。
@@ -1086,12 +1180,23 @@ class UserGatewayPlugin(Star):
         群聊场景必须有 ``group_id`` 才会走群聊那条链（群专属 / 群等级）。控制台问的是
         「这个好友在群里会怎样」，所以用一个**不存在的探针群号**：它在库里没有任何
         专属规则与归级，对应档位自然落空，不会扰动结论。
+
+        - ``user`` → 私聊（或群聊场景用探针群号）
+        - ``group`` → 该群
+        - ``member`` → 该群里那个人（真实组合，两个 id 都是真的）
+        - ``level`` / ``global`` → 用一个不存在的探针对象，档位链自然落到对应层
         """
-        if scope_type != "user":
+        if scope_type == "member":
+            gid, uid = parse_member_scope_id(scope_id)
+            return Subject(sender_id=uid, group_id=gid)
+        if scope_type == "group":
             return Subject(group_id=scope_id)
-        if scene == "group":
-            return Subject(sender_id=scope_id, group_id="__scene_probe__")
-        return Subject(sender_id=scope_id)
+        if scope_type == "user":
+            if scene == "group":
+                return Subject(sender_id=scope_id, group_id="__scene_probe__")
+            return Subject(sender_id=scope_id)
+        # level / global：探针对象，库里没有它的任何规则
+        return Subject(sender_id="__probe__")
 
     def _quota_subject(self, scope_type: str, scope_id: str) -> Optional[Subject]:
         """把「额度作用对象」转成一个用于跑档位链的 ``Subject``。

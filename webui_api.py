@@ -1450,6 +1450,36 @@ async def h_commands(plugin) -> dict:
     )
 
 
+async def h_command_matrix(plugin) -> dict:
+    """指令 × 对象矩阵：某对象能用哪些指令、结论来自哪一层。
+
+    ``?scope_type=user|group|member|level|global&scope_id=...&scene=private|group``
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    scope_type = _q("scope_type", "user") or "user"
+    scope_id = _q("scope_id")
+    if scope_type not in ("user", "group", "member", "level", "global"):
+        return err("scope_type 必须是 user / group / member / level / global")
+    if scope_type == "global":
+        scope_id = "*"
+    if not scope_id:
+        return err("缺少 scope_id")
+    if scope_type == "member":
+        gid, uid = parse_member_scope_id(scope_id)
+        if not (gid and uid):
+            return err("群成员的 scope_id 必须是「群号:QQ」")
+        scope_id = member_scope_id(gid, uid)
+    try:
+        data = await plugin.command_matrix_of(scope_type, scope_id, _scene_arg("private"))
+    except Exception as e:
+        logger.exception("[UserGateway] 生成指令矩阵失败")
+        return err(f"生成矩阵失败：{e}")
+    if not data:
+        return err("对象不存在（等级 id 可能已删除）")
+    return ok(data)
+
+
 async def h_prune_commands(plugin) -> dict:
     """清理已失效的指令规则（指令被卸载/改名后残留的 policy 行）。"""
     if not (plugin.store and plugin.store.ready):
@@ -1564,6 +1594,7 @@ def register_apis(plugin) -> None:
         ("/quota", h_set_quota, ["POST"]),
         ("/quota/reset", h_reset_quota, ["POST"]),
         ("/commands", h_commands, ["GET"]),
+        ("/commands/matrix", h_command_matrix, ["GET"]),
         ("/commands/prune", h_prune_commands, ["POST"]),
         ("/levels", h_levels, ["GET"]),
         ("/levels", h_set_level, ["POST"]),
