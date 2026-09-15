@@ -362,7 +362,6 @@ const levelColumns: DataTableColumns<LevelRow> = [
     },
   },
   { title: "额度模板", key: "quotas", minWidth: 200, render: (row) => levelQuotaText(row) },
-  { title: "成员数", key: "members", width: 90 },
   {
     title: "操作",
     key: "actions",

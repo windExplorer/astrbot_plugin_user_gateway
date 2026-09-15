@@ -47,7 +47,9 @@ const size = ref(50);
 const keyword = ref("");
 const effectFilter = ref("");
 const cmdFilter = ref("");
-const sort = ref("active");
+const sort = ref("last");
+// 等级筛选："" = 全部，「0」= 未分组，其余为等级 id
+const levelFilter = ref("");
 const checked = ref<string[]>([]);
 const levels = ref<LevelRow[]>([]);
 const batchLevelId = ref<number | null>(null);
@@ -61,14 +63,22 @@ const levelOptions = computed(() => [
   ...levels.value.map((l) => ({ label: `${l.name}（${l.members}）`, value: l.id })),
 ]);
 
+// 默认按「最近回复」倒序：最关心的是「哪个群最近还在用」，从没回复过的自然沉底。
 const sortOptions = [
-  { label: "最近同步", value: "active" },
   { label: "最近回复", value: "last" },
+  { label: "最近同步", value: "active" },
   { label: "今日用量", value: "usage" },
   { label: "人数", value: "size" },
   { label: "群名", value: "name" },
   { label: "等级", value: "level" },
 ];
+
+// 等级筛选项：数量跟着归级实时刷新
+const levelFilterOptions = computed(() => [
+  { label: "全部等级", value: "" },
+  { label: "未分组", value: "0" },
+  ...levels.value.map((l) => ({ label: `${l.name}（${l.members}）`, value: String(l.id) })),
+]);
 
 const KIND_META: Record<string, { text: string; type: "success" | "info" | "default" }> = {
   llm: { text: "LLM 回复", type: "success" },
@@ -106,10 +116,13 @@ async function load() {
       `/groups?page=${page.value}&size=${size.value}&sort=${sort.value}` +
         `&effect=${encodeURIComponent(effectFilter.value)}` +
         `&effect_command=${encodeURIComponent(cmdFilter.value)}` +
+        `&level_id=${encodeURIComponent(levelFilter.value)}` +
         `&q=${encodeURIComponent(keyword.value)}`,
     );
     rows.value = res.rows || [];
     total.value = res.total || 0;
+    // 顺手刷新等级（下拉里的数量要跟着归级变化实时更新）
+    loadLevels();
     loadAvatars("group", rows.value.map((r) => r.avatar_id || r.group_id));
   } catch (e: any) {
     message.error(e?.message || String(e));
@@ -415,6 +428,13 @@ onMounted(async () => {
           size="small"
           style="width: 118px"
           :options="sortOptions"
+          @update:value="search"
+        />
+        <n-select
+          v-model:value="levelFilter"
+          size="small"
+          style="width: 140px"
+          :options="levelFilterOptions"
           @update:value="search"
         />
         <n-button size="small" @click="search">搜索</n-button>

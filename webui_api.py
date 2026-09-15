@@ -308,6 +308,23 @@ async def h_ping(plugin) -> dict:
     )
 
 
+def _filter_level(rows: list[dict], level_filter: str) -> list[dict]:
+    """按等级过滤行（``level_filter`` 为空 = 不过滤）。
+
+    - ``0``  = 未分组（没有归到任何等级的行，其 ``level_id`` 为 ``None``）；
+    - ``>0`` = 该等级的 id；
+    - 非法值当作「不过滤」，避免手动改 URL 时整个列表变空。
+    """
+    text = str(level_filter or "").strip()
+    if text == "":
+        return rows
+    try:
+        want = int(text)
+    except (TypeError, ValueError):
+        return rows
+    return [r for r in rows if int(r.get("level_id") or 0) == want]
+
+
 async def _list_ctx(plugin, kind: str) -> dict[str, Any]:
     """装配列表页要用的映射。
 
@@ -420,14 +437,17 @@ async def h_overview(plugin) -> dict:
 async def h_friends(plugin) -> dict:
     """好友列表（含头像、等级、权限、生效额度、今日用量、最后回复）。
 
-    排序：``active``（默认，按同步时间）/ ``usage``（今日 token）/ ``name`` / ``qq`` /
-    ``level``（按等级名）/ ``last``（最近有 bot 回复的排前面）。
+    排序：``last``（**默认**，最近有 bot 回复的排前面）/ ``active``（按同步时间）/
+    ``usage``（今日 token）/ ``name`` / ``qq`` / ``level``（按等级名）。
     除 ``active`` 外都需要**先取全量再排序分页**，好友量级通常只有数百，
-    整表取回可接受（上限 5000 条防爆）。``effect`` 可再按权限过滤（同样是全量语义）。
+    整表取回可接受（上限 5000 条防爆）。
+
+    过滤：``effect``（LLM 权限）/ ``effect_command``（指令权限）/ ``level_id``
+    （等级：空 = 全部，``0`` = 未分组，``>0`` = 该等级 id）。
     """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
-    sort = _q("sort", "active") or "active"
+    sort = _q("sort", "last") or "last"
     page = _qi("page", 1, 1, 10**6)
     size = _qi("size", 50, 1, 500)
     platform = _q("platform") or None
@@ -435,11 +455,13 @@ async def h_friends(plugin) -> dict:
     effect_filter = _q("effect")
     # LLM 权限与指令权限是两套规则，所以支持分别过滤（都命中才算通过）
     cmd_filter = _q("effect_command")
+    level_filter = _q("level_id")
 
     full = (
         sort in ("usage", "name", "qq", "level", "last")
         or effect_filter in ("allow", "deny", "inherit")
         or cmd_filter in ("allow", "deny", "inherit")
+        or level_filter != ""
     )
     if full:
         res = await plugin.store.list_friends(platform_id=platform, keyword=kw, limit=5000, offset=0)
@@ -456,6 +478,7 @@ async def h_friends(plugin) -> dict:
         rows = [r for r in rows if str(r.get("effect") or "inherit") == effect_filter]
     if cmd_filter in ("allow", "deny", "inherit"):
         rows = [r for r in rows if str(r.get("effect_command") or "inherit") == cmd_filter]
+    rows = _filter_level(rows, level_filter)
 
     if sort == "usage":
         rows.sort(key=lambda r: int(r.get("today_tokens") or 0), reverse=True)
@@ -476,21 +499,23 @@ async def h_friends(plugin) -> dict:
 
 
 async def h_groups(plugin) -> dict:
-    """群列表（含群头像、等级、权限、生效额度、今日用量、最后回复）。排序语义同好友列表。"""
+    """群列表（含群头像、等级、权限、生效额度、今日用量、最后回复）。排序与过滤语义同好友列表。"""
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
-    sort = _q("sort", "active") or "active"
+    sort = _q("sort", "last") or "last"
     page = _qi("page", 1, 1, 10**6)
     size = _qi("size", 50, 1, 500)
     platform = _q("platform") or None
     kw = _q("q")
     effect_filter = _q("effect")
     cmd_filter = _q("effect_command")
+    level_filter = _q("level_id")
 
     full = (
         sort in ("usage", "name", "group", "size", "level", "last")
         or effect_filter in ("allow", "deny", "inherit")
         or cmd_filter in ("allow", "deny", "inherit")
+        or level_filter != ""
     )
     if full:
         res = await plugin.store.list_groups(platform_id=platform, keyword=kw, limit=5000, offset=0)
@@ -507,6 +532,7 @@ async def h_groups(plugin) -> dict:
         rows = [r for r in rows if str(r.get("effect") or "inherit") == effect_filter]
     if cmd_filter in ("allow", "deny", "inherit"):
         rows = [r for r in rows if str(r.get("effect_command") or "inherit") == cmd_filter]
+    rows = _filter_level(rows, level_filter)
 
     if sort == "usage":
         rows.sort(key=lambda r: int(r.get("today_tokens") or 0), reverse=True)
