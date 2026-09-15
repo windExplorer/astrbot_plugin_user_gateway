@@ -46,6 +46,12 @@ LAYER_GROUP = "group"
 LAYER_GROUP_LEVEL = "group_level"
 LAYER_GLOBAL = "global"
 
+# 场景：规则可以只对「私聊」或只对「群聊」生效，'' = 两者都生效（旧数据）。
+# 取值与 store.SCENE_* 保持一致（gate 刻意不 import store：本模块要能脱离 aiosqlite 单独跑测试）。
+SCENE_ANY = ""
+SCENE_PRIVATE = "private"
+SCENE_GROUP = "group"
+
 LAYER_LABELS: dict[str, str] = {
     LAYER_USER: "好友专属",
     LAYER_USER_LEVEL: "好友等级",
@@ -66,6 +72,19 @@ def layer_label(layer: str) -> str:
     return LAYER_LABELS.get(layer, layer or "未知")
 
 
+def effect_in_scene(raw: Any, scene: str) -> str:
+    """从 ``{scene: effect}`` 里取当前场景的规则值：**场景专属 → 通用（''）**。
+
+    这是「规则分场景」的唯一取值口径，判定内核与控制台都用它，避免两边语义漂移。
+    兼容扁平的单个字符串（自检里手写 Rules 更短），非字典一律当作「没配规则」。
+    """
+    if isinstance(raw, str):
+        return raw
+    if not isinstance(raw, Mapping):
+        return ""
+    return str(raw.get(scene) or raw.get(SCENE_ANY) or "")
+
+
 @dataclass(frozen=True)
 class Subject:
     """一次 LLM 请求的归属对象。"""
@@ -82,30 +101,42 @@ class Rules:
     """判定所需的规则快照。插件在 ``reload_rules()`` 里**整体重建**（不做原地修改）。
 
     Args:
-        effect_user: ``{uin: allow|deny}`` —— 好友专属权限。
-        effect_group: ``{group_id: allow|deny}`` —— 群专属权限。
-        level_effect: ``{(kind, level_id): allow|deny|inherit}`` —— 等级默认权限。
+        effect_user: ``{uin: {scene: allow|deny}}`` —— 好友专属权限（``''`` = 通用）。
+        effect_group: ``{group_id: {scene: allow|deny}}`` —— 群专属权限（实际只有 ``''``）。
+        level_effect: ``{(kind, level_id): allow|deny|inherit}`` —— 等级默认权限（主值）。
+        level_effect_group: 同上，但只在**群聊**场景下用（仅 ``kind='user'`` 有意义；
+            ``inherit`` = 跟随主值）。
         subject_level: ``{scope_type: {scope_id: level_id}}`` —— 对象归级。
         limits: ``{scope_type: {scope_id: {period: row}}}`` —— 限额规则，
             ``scope_type`` 为 ``user`` / ``group`` / ``level`` / ``global``。
         usage: ``{scope_type: {scope_id: {period: row}}}`` —— 用量计数，
             ``scope_type`` 为 ``user`` / ``group``。
+
+    关于「场景」（为什么规则里多一层 ``{scene: effect}``）：好友 / 好友等级这两个档位
+    在私聊与群聊里都会参与判定，所以要能把它们分开配 —— 私聊禁掉某人，他在群里照用。
+    取值的规则统一是「**场景专属 → 通用**」：
+    ``row.get(scene) or row.get('')``，于是 v5 之前的旧数据（只有 ``''``）行为完全不变。
     """
 
-    effect_user: Mapping[str, str] = field(default_factory=dict)
-    effect_group: Mapping[str, str] = field(default_factory=dict)
+    effect_user: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    effect_group: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     level_effect: Mapping[Any, str] = field(default_factory=dict)
+    level_effect_group: Mapping[Any, str] = field(default_factory=dict)
     subject_level: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
     limits: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     usage: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     level_model: Mapping[Any, Mapping[str, str]] = field(default_factory=dict)
     """``{(kind, level_id): {"provider_id", "fallback_provider_id"}}`` —— 等级的模型路由。"""
-    command_policy: Mapping[str, Mapping[str, Mapping[str, str]]] = field(default_factory=dict)
-    """``{指令名: {scope_type: {scope_id: effect}}}`` —— 单条指令的权限规则。"""
-    command_master: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
-    """``{scope_type: {scope_id: effect}}`` —— **对象级指令总权限**（好友 / 群 / 全局）。"""
+    command_policy: Mapping[str, Mapping[str, Mapping[str, Mapping[str, str]]]] = field(
+        default_factory=dict
+    )
+    """``{指令名: {scope_type: {scope_id: {scene: effect}}}}`` —— 单条指令的权限规则。"""
+    command_master: Mapping[str, Mapping[str, Mapping[str, str]]] = field(default_factory=dict)
+    """``{scope_type: {scope_id: {scene: effect}}}`` —— **对象级指令总权限**（好友 / 群 / 全局）。"""
     level_command_effect: Mapping[Any, str] = field(default_factory=dict)
-    """``{(kind, level_id): effect}`` —— 等级的默认**指令**权限（与 LLM 的 level_effect 分开）。"""
+    """``{(kind, level_id): effect}`` —— 等级的默认**指令**权限（主值，与 level_effect 分开）。"""
+    level_command_effect_group: Mapping[Any, str] = field(default_factory=dict)
+    """同上，但只在**群聊**场景下用（仅 ``kind='user'`` 有意义）。"""
 
     def limits_of(self, scope_type: str, scope_id: str) -> Mapping[str, Mapping[str, Any]]:
         return (self.limits.get(scope_type) or {}).get(str(scope_id)) or {}
@@ -128,6 +159,7 @@ class LayerRef:
     scope_id: str
     usage_type: str  # user | group（用量所在）
     usage_id: str
+    scene: str = SCENE_ANY  # 本次会话的场景（private | group），取规则时按它回落通用
 
     @property
     def label(self) -> str:
@@ -214,30 +246,39 @@ class Gate:
     # 档位链
     # ------------------------------------------------------------------ #
     @staticmethod
+    def scene_of(subject: Subject) -> str:
+        """本会话属于哪个场景：进了群就是 ``group``，否则 ``private``。"""
+        return SCENE_GROUP if str(subject.group_id or "") else SCENE_PRIVATE
+
+    @staticmethod
     def layers_for(subject: Subject, rules: Rules) -> list[LayerRef]:
         """按「从具体到兜底」列出该对象适用的档位。
 
         私聊：好友专属 → 好友等级 → 全局
         群聊：好友专属 → 好友等级 → 群专属 → 群等级 → 全局
         （群聊里也先看人：这是 v0.2 定的优先级，等级只是插进这条链的中间层）
+
+        每个档位都带上本次的 ``scene``：好友 / 好友等级这两层在私聊与群聊里都会参与判定，
+        取规则时要按场景回落（详见 :class:`Rules` 的说明）。
         """
         uid = str(subject.sender_id or "")
         gid = str(subject.group_id or "")
+        scene = Gate.scene_of(subject)
         out: list[LayerRef] = []
 
         if uid:
-            out.append(LayerRef(LAYER_USER, "user", uid, "user", uid))
+            out.append(LayerRef(LAYER_USER, "user", uid, "user", uid, scene))
             lv = rules.level_id_of("user", uid)
             if lv:
-                out.append(LayerRef(LAYER_USER_LEVEL, "level", str(lv), "user", uid))
+                out.append(LayerRef(LAYER_USER_LEVEL, "level", str(lv), "user", uid, scene))
         if gid:
-            out.append(LayerRef(LAYER_GROUP, "group", gid, "group", gid))
+            out.append(LayerRef(LAYER_GROUP, "group", gid, "group", gid, scene))
             lv = rules.level_id_of("group", gid)
             if lv:
-                out.append(LayerRef(LAYER_GROUP_LEVEL, "level", str(lv), "group", gid))
+                out.append(LayerRef(LAYER_GROUP_LEVEL, "level", str(lv), "group", gid, scene))
         # 全局：群聊按群用量、私聊按人用量（与 v0.2 的记账口径一致）
         out.append(
-            LayerRef(LAYER_GLOBAL, "global", "*", "group" if gid else "user", gid or uid)
+            LayerRef(LAYER_GLOBAL, "global", "*", "group" if gid else "user", gid or uid, scene)
         )
         return out
 
@@ -249,6 +290,24 @@ class Gate:
         """等级层的键 ``(kind, level_id)``（群等级用 group，其余用 user）。"""
         kind = "group" if ref.layer == LAYER_GROUP_LEVEL else "user"
         return (kind, _as_int(ref.scope_id, -1))
+
+    def _level_effect(self, rules: Rules, ref: LayerRef, which: str) -> str:
+        """取等级层的默认权限。
+
+        Args:
+            which: ``"effect"`` 取 LLM 权限，``"command_effect"`` 取指令权限。
+
+        群聊场景下的**好友等级**先看「群聊专属值」，没配（inherit）再回落到主值
+        —— 主值就是私聊那套，也就是 v5 之前唯一存在的那一列，所以旧数据行为不变。
+        """
+        key = self._level_key(ref)
+        if which == "effect":
+            main, group = rules.level_effect, rules.level_effect_group
+        else:
+            main, group = rules.level_command_effect, rules.level_command_effect_group
+        if ref.layer == LAYER_USER_LEVEL and ref.scene == SCENE_GROUP:
+            return str(group.get(key) or main.get(key) or "")
+        return str(main.get(key) or "")
 
     def _first_effect(
         self,
@@ -285,11 +344,11 @@ class Gate:
 
         def lookup(ref: LayerRef) -> str:
             if ref.layer == LAYER_USER:
-                return str(rules.effect_user.get(ref.scope_id) or "")
+                return effect_in_scene(rules.effect_user.get(ref.scope_id), ref.scene)
             if ref.layer == LAYER_GROUP:
-                return str(rules.effect_group.get(ref.scope_id) or "")
+                return effect_in_scene(rules.effect_group.get(ref.scope_id), ref.scene)
             if ref.layer in (LAYER_USER_LEVEL, LAYER_GROUP_LEVEL):
-                return str(rules.level_effect.get(self._level_key(ref)) or "")
+                return self._level_effect(rules, ref, "effect")
             return ""  # 全局层：交给配置 default_effect 兜底
 
         eff, layer, scope_type, scope_id = self._first_effect(subject, rules, lookup)
@@ -330,8 +389,9 @@ class Gate:
 
         def lookup(ref: LayerRef) -> str:
             if ref.layer in (LAYER_USER_LEVEL, LAYER_GROUP_LEVEL):
-                return str(rules.level_command_effect.get(self._level_key(ref)) or "")
-            return str((rules.command_master.get(ref.scope_type) or {}).get(ref.scope_id) or "")
+                return self._level_effect(rules, ref, "command_effect")
+            raw = (rules.command_master.get(ref.scope_type) or {}).get(ref.scope_id)
+            return effect_in_scene(raw, ref.scene)
 
         return self._first_effect(subject, rules, lookup)
 
@@ -369,7 +429,8 @@ class Gate:
         for ref in self.layers_for(subject, rules):
             if ref.layer in (LAYER_USER_LEVEL, LAYER_GROUP_LEVEL):
                 continue  # 单条指令不参与等级层（等级只管「整体能不能用指令」）
-            eff = str((table.get(ref.scope_type) or {}).get(ref.scope_id) or "")
+            raw = (table.get(ref.scope_type) or {}).get(ref.scope_id)
+            eff = effect_in_scene(raw, ref.scene)
             if eff == "deny":
                 return Verdict(
                     allow=False,

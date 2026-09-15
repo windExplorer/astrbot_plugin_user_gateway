@@ -31,7 +31,17 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
     ) from e
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+# 权限规则的「场景」维度：
+#   ANY（''）  → 两个场景都生效（旧数据、以及群 / 全局这类本来就不分场景的规则）
+#   PRIVATE    → 只在私聊生效
+#   GROUP      → 只在群聊生效
+# 判定时的回落顺序是「场景专属 → 通用」，所以历史数据的行为不会因为引入场景而改变。
+SCENE_ANY = ""
+SCENE_PRIVATE = "private"
+SCENE_GROUP = "group"
+SCENES: tuple[str, ...] = (SCENE_ANY, SCENE_PRIVATE, SCENE_GROUP)
 
 # 额度周期：越靠前越"紧凑"，超限时优先报告它
 PERIODS: tuple[str, ...] = ("day", "month", "total")
@@ -88,16 +98,21 @@ CREATE TABLE IF NOT EXISTS group_cache (
     PRIMARY KEY (platform_id, group_id)
 );
 
--- 权限规则：feature 预留 'command'（M3 指令权限）
+-- 权限规则
+-- feature: 'llm' | 'command'（对象级指令总权限） | 'command:<指令名>'
+-- scene  : ''（通用，两个场景都生效；旧数据都是这个） | 'private' | 'group'
+--          —— 用来把「好友/好友等级」这一层的规则按会话类型拆开：
+--             私聊禁用某人，不影响他在群里继续用。
 CREATE TABLE IF NOT EXISTS policy (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     scope_type  TEXT    NOT NULL,
     scope_id    TEXT    NOT NULL,
     feature     TEXT    NOT NULL DEFAULT 'llm',
+    scene       TEXT    NOT NULL DEFAULT '',
     effect      TEXT    NOT NULL,
     note        TEXT    NOT NULL DEFAULT '',
     updated_at  INTEGER NOT NULL,
-    UNIQUE (scope_type, scope_id, feature)
+    UNIQUE (scope_type, scope_id, feature, scene)
 );
 CREATE INDEX IF NOT EXISTS idx_policy_scope ON policy(scope_type, scope_id);
 
@@ -119,6 +134,10 @@ CREATE INDEX IF NOT EXISTS idx_quota_scope ON llm_quota(scope_type, scope_id);
 -- 自定义等级：私聊与群聊各一套（kind 区分），等级本身可带默认权限与模型路由
 -- effect         → 默认 **LLM** 权限（inherit | allow | deny）
 -- command_effect → 默认 **指令** 权限（M5；inherit | allow | deny，deny 即该等级不能用任何指令）
+-- *_group        → **群聊场景**下的那一套（v6）。只对 kind='user'（好友等级）有意义：
+--                  好友等级在群里也生效，所以要能单独说「私聊禁止但群里照用」。
+--                  `inherit` = 跟随主值（= 私聊那套），这就是旧数据的语义，行为不变。
+-- kind='group'（群聊等级）只在群里出现，用主值即可，*_group 保持 inherit。
 -- provider_id / fallback_provider_id 存 AstrBot 的**提供商 id**（在 AstrBot「模型提供商」里配置的那个）。
 -- 模型选择以「提供商」为单位：AstrBot 里一个提供商就对应一个模型，
 -- 再单独存一个模型名只会让配置变含混（v0.4.0 的教训），故不设该列。
@@ -129,6 +148,8 @@ CREATE TABLE IF NOT EXISTS quota_level (
     description          TEXT    NOT NULL DEFAULT '',
     effect               TEXT    NOT NULL DEFAULT 'inherit',
     command_effect       TEXT    NOT NULL DEFAULT 'inherit',
+    effect_group         TEXT    NOT NULL DEFAULT 'inherit',
+    command_effect_group TEXT    NOT NULL DEFAULT 'inherit',
     sort_order           INTEGER NOT NULL DEFAULT 0,
     provider_id          TEXT    NOT NULL DEFAULT '',
     fallback_provider_id TEXT    NOT NULL DEFAULT '',
@@ -281,6 +302,51 @@ class Store:
             await cls._migrate_v3_to_v4(db)
         if old_version < 5:
             await cls._migrate_v4_to_v5(db)
+        if old_version < 6:
+            await cls._migrate_v5_to_v6(db)
+
+    @staticmethod
+    async def _migrate_v5_to_v6(db: aiosqlite.Connection) -> None:
+        """v5 → v6：引入「场景」维度（私聊 / 群聊分开管）。
+
+        两件事：
+
+        1. ``policy`` 加 ``scene`` 列。唯一键要从 ``(scope_type, scope_id, feature)`` 变成
+           加上 ``scene``，而 SQLite 改不了唯一约束，所以重建表。旧行一律填 ``''``（通用）
+           —— 判定时通用规则在两个场景都生效，所以**升级不会改变任何既有行为**。
+        2. ``quota_level`` 加「群聊场景」的两列默认权限（只有 kind='user' 的等级会用）。
+           默认 ``inherit`` = 跟随主值，同样是「行为不变」。
+        """
+        if "scene" not in await Store._table_columns(db, "policy"):
+            await db.executescript(
+                """
+                DROP INDEX IF EXISTS idx_policy_scope;
+                ALTER TABLE policy RENAME TO policy_v5;
+                CREATE TABLE policy (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_type  TEXT    NOT NULL,
+                    scope_id    TEXT    NOT NULL,
+                    feature     TEXT    NOT NULL DEFAULT 'llm',
+                    scene       TEXT    NOT NULL DEFAULT '',
+                    effect      TEXT    NOT NULL,
+                    note        TEXT    NOT NULL DEFAULT '',
+                    updated_at  INTEGER NOT NULL,
+                    UNIQUE (scope_type, scope_id, feature, scene)
+                );
+                INSERT INTO policy(id, scope_type, scope_id, feature, scene, effect, note, updated_at)
+                    SELECT id, scope_type, scope_id, feature, '', effect, note, updated_at
+                    FROM policy_v5;
+                DROP TABLE policy_v5;
+                CREATE INDEX IF NOT EXISTS idx_policy_scope ON policy(scope_type, scope_id);
+                """,
+            )
+        cols = await Store._table_columns(db, "quota_level")
+        for name in ("effect_group", "command_effect_group"):
+            if name in cols:
+                continue
+            await db.execute(
+                f"ALTER TABLE quota_level ADD COLUMN {name} TEXT NOT NULL DEFAULT 'inherit'"
+            )
 
     @staticmethod
     async def _migrate_v4_to_v5(db: aiosqlite.Connection) -> None:
@@ -431,14 +497,38 @@ class Store:
         scope_type: str,
         scope_id: str,
         feature: str = "llm",
+        scene: str = SCENE_ANY,
     ) -> Optional[str]:
-        """取某对象的权限效果；无记录返回 None（表示"继承上级"）。"""
+        """取某对象在某场景下的权限效果；无记录返回 None（表示"继承上级"）。
+
+        ``scene=''`` 只查通用规则（不会顺带命中场景专属的），要「场景回落通用」请用
+        :meth:`resolve_policy`。
+        """
         async with self._conn().execute(
-            "SELECT effect FROM policy WHERE scope_type = ? AND scope_id = ? AND feature = ?",
-            (scope_type, str(scope_id), feature),
+            "SELECT effect FROM policy WHERE scope_type = ? AND scope_id = ? "
+            "AND feature = ? AND scene = ?",
+            (scope_type, str(scope_id), feature, str(scene or "")),
         ) as cur:
             row = await cur.fetchone()
         return row["effect"] if row else None
+
+    async def resolve_policy(
+        self,
+        scope_type: str,
+        scope_id: str,
+        feature: str = "llm",
+        scene: str = SCENE_ANY,
+    ) -> Optional[str]:
+        """按「场景专属 → 通用」取生效效果；都没有返回 None。
+
+        这是判定链之外（控制台展示、单点查询）用的语义，与 ``gate`` 里的一致。
+        """
+        scene = str(scene or "")
+        if scene:
+            got = await self.get_effect(scope_type, scope_id, feature, scene)
+            if got:
+                return got
+        return await self.get_effect(scope_type, scope_id, feature, SCENE_ANY)
 
     async def set_policy(
         self,
@@ -447,21 +537,27 @@ class Store:
         effect: str,
         feature: str = "llm",
         note: str = "",
+        scene: str = SCENE_ANY,
     ) -> None:
-        """写入/更新一条权限规则。``effect='inherit'`` 与删除等价。"""
+        """写入/更新一条权限规则。``effect='inherit'`` 与删除等价。
+
+        ``scene`` 只对 ``scope_type='user'`` 有意义（群 / 全局规则本来就不分场景）；
+        删「恢复继承」时也是按``(对象, feature, scene)``精确删，不会误伤另一个场景的规则。
+        """
         db = self._conn()
+        scene = str(scene or "")
         if effect == "inherit":
             await db.execute(
-                "DELETE FROM policy WHERE scope_type = ? AND scope_id = ? AND feature = ?",
-                (scope_type, str(scope_id), feature),
+                "DELETE FROM policy WHERE scope_type = ? AND scope_id = ? AND feature = ? AND scene = ?",
+                (scope_type, str(scope_id), feature, scene),
             )
         else:
             await db.execute(
-                "INSERT INTO policy(scope_type, scope_id, feature, effect, note, updated_at) "
-                "VALUES(?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(scope_type, scope_id, feature) DO UPDATE SET "
+                "INSERT INTO policy(scope_type, scope_id, feature, scene, effect, note, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(scope_type, scope_id, feature, scene) DO UPDATE SET "
                 "effect = excluded.effect, note = excluded.note, updated_at = excluded.updated_at",
-                (scope_type, str(scope_id), feature, effect, note, now_ts()),
+                (scope_type, str(scope_id), feature, scene, effect, note, now_ts()),
             )
         await db.commit()
 
@@ -469,10 +565,20 @@ class Store:
         self,
         scope_type: Optional[str] = None,
         feature: Optional[str] = None,
+        scene: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """列出规则；``scope_type`` / ``feature`` 都可选过滤（都不传 = 全部规则）。"""
-        sql = "SELECT scope_type, scope_id, feature, effect, note, updated_at FROM policy WHERE 1 = 1"
+        """列出规则；``scope_type`` / ``feature`` / ``scene`` 都可选过滤。
+
+        ``scene=None`` = 不过滤（含通用与场景专属两种）；``scene=''`` = 只要通用规则。
+        """
+        sql = (
+            "SELECT scope_type, scope_id, feature, scene, effect, note, updated_at "
+            "FROM policy WHERE 1 = 1"
+        )
         args: list[Any] = []
+        if scene is not None:
+            sql += " AND scene = ?"
+            args.append(str(scene))
         if feature:
             sql += " AND feature = ?"
             args.append(feature)
@@ -486,24 +592,37 @@ class Store:
         self,
         scope_type: str,
         feature: str = "llm",
-    ) -> dict[str, str]:
-        """取某作用域下 ``{scope_id: effect}`` 映射，供闸门热路径全内存判定。"""
-        rows = await self.list_policies(scope_type=scope_type, feature=feature)
-        return {str(r["scope_id"]): str(r["effect"]) for r in rows}
+    ) -> dict[str, dict[str, str]]:
+        """取某作用域下的 ``{scope_id: {scene: effect}}``，供闸门热路径全内存判定。
 
-    async def command_policies(self) -> dict[str, dict[str, dict[str, str]]]:
-        """所有指令规则，形如 ``{指令名: {scope_type: {scope_id: effect}}}``（闸门热路径用）。"""
+        保留 scene 这一层，是为了让判定链能按「场景专属 → 通用」回落，
+        而不用在热路径上查两次库。``scene=''`` 就是通用（旧数据）。
+        """
+        rows = await self.list_policies(scope_type=scope_type, feature=feature)
+        out: dict[str, dict[str, str]] = {}
+        for r in rows:
+            out.setdefault(str(r["scope_id"]), {})[str(r.get("scene") or "")] = str(r["effect"])
+        return out
+
+    async def command_policies(
+        self,
+    ) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
+        """所有指令规则，形如 ``{指令名: {scope_type: {scope_id: {scene: effect}}}}``。
+
+        （闸门热路径用；scene 层同 :meth:`effect_map`。）
+        """
         async with self._conn().execute(
-            "SELECT feature, scope_type, scope_id, effect FROM policy WHERE feature LIKE ?",
+            "SELECT feature, scope_type, scope_id, scene, effect FROM policy WHERE feature LIKE ?",
             (f"{COMMAND_FEATURE_PREFIX}%",),
         ) as cur:
-            out: dict[str, dict[str, dict[str, str]]] = {}
+            out: dict[str, dict[str, dict[str, dict[str, str]]]] = {}
             for r in await cur.fetchall():
                 cmd = command_of_feature(str(r["feature"]))
                 if cmd:
-                    out.setdefault(cmd, {}).setdefault(str(r["scope_type"]), {})[
-                        str(r["scope_id"])
-                    ] = str(r["effect"])
+                    # 注意：这里是 aiosqlite.Row，**没有 dict.get()**，只能下标取值
+                    out.setdefault(cmd, {}).setdefault(str(r["scope_type"]), {}).setdefault(
+                        str(r["scope_id"]), {}
+                    )[str(r["scene"] or "")] = str(r["effect"])
             return out
 
     async def delete_stale_command_policies(self, alive: list[str]) -> int:
@@ -697,10 +816,14 @@ class Store:
         provider_id: str = "",
         fallback_provider_id: str = "",
         command_effect: str = "inherit",
+        effect_group: str = "inherit",
+        command_effect_group: str = "inherit",
     ) -> int:
         """新建 / 更新等级，返回等级 id（``level_id`` 为空则按 ``(kind, name)`` 新建）。
 
-        - ``effect``：等级默认 **LLM** 权限；``command_effect``：等级默认 **指令** 权限；
+        - ``effect`` / ``command_effect``：等级的默认 **LLM / 指令** 权限（主场景 = 私聊）；
+        - ``effect_group`` / ``command_effect_group``：**群聊场景**下的那一套，
+          只对 ``kind='user'`` 有意义；``inherit`` = 跟随主值（旧数据的语义）；
         - ``provider_id`` / ``fallback_provider_id`` 是模型路由：属于该等级的对象
           走指定提供商，主提供商不可用（未加载 / 熔断）时用备用那个。
         """
@@ -708,7 +831,8 @@ class Store:
         if level_id:
             await db.execute(
                 "UPDATE quota_level SET kind = ?, name = ?, description = ?, effect = ?, "
-                "command_effect = ?, sort_order = ?, provider_id = ?, fallback_provider_id = ?, "
+                "command_effect = ?, effect_group = ?, command_effect_group = ?, "
+                "sort_order = ?, provider_id = ?, fallback_provider_id = ?, "
                 "updated_at = ? WHERE id = ?",
                 (
                     kind,
@@ -716,6 +840,8 @@ class Store:
                     description,
                     effect,
                     command_effect,
+                    effect_group,
+                    command_effect_group,
                     int(sort_order),
                     str(provider_id or ""),
                     str(fallback_provider_id or ""),
@@ -726,12 +852,15 @@ class Store:
             await db.commit()
             return int(level_id)
         await db.execute(
-            "INSERT INTO quota_level(kind, name, description, effect, command_effect, sort_order, "
+            "INSERT INTO quota_level(kind, name, description, effect, command_effect, "
+            "effect_group, command_effect_group, sort_order, "
             "provider_id, fallback_provider_id, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, name) DO UPDATE SET "
             "description = excluded.description, effect = excluded.effect, "
             "command_effect = excluded.command_effect, "
+            "effect_group = excluded.effect_group, "
+            "command_effect_group = excluded.command_effect_group, "
             "sort_order = excluded.sort_order, provider_id = excluded.provider_id, "
             "fallback_provider_id = excluded.fallback_provider_id, "
             "updated_at = excluded.updated_at",
@@ -741,6 +870,8 @@ class Store:
                 description,
                 effect,
                 command_effect,
+                effect_group,
+                command_effect_group,
                 int(sort_order),
                 str(provider_id or ""),
                 str(fallback_provider_id or ""),

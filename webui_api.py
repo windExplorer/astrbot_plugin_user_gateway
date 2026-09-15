@@ -34,6 +34,11 @@ try:  # quart 是 AstrBot 的运行期依赖
 except Exception:  # pragma: no cover - 仅本地静态检查时缺失
     request = None  # type: ignore
 
+try:  # 与 main.py 同样的双形态导入（包内正常加载 / 平铺调试）
+    from .gate import effect_in_scene
+except ImportError:  # pragma: no cover - 本地平铺调试
+    from gate import effect_in_scene  # type: ignore
+
 ROUTE_PREFIX = "/astrbot_plugin_user_gateway"
 
 # 时间范围简写 → 秒数
@@ -69,6 +74,16 @@ def _qi(name: str, default: int, lo: int, hi: int) -> int:
         return max(lo, min(hi, int(_q(name) or default)))
     except Exception:
         return default
+
+
+def _scene_arg(default: str = "private") -> str:
+    """读取「场景」参数（``private`` / ``group``）。
+
+    好友与好友等级这两层权限是分场景的，控制台按当前场景读写；
+    群聊页的规则（群专属 / 群等级）本来只在群里生效，传什么场景都取到同一条。
+    """
+    got = _q("scene", default) or default
+    return got if got in ("private", "group") else default
 
 
 async def _payload() -> dict:
@@ -202,8 +217,8 @@ def _fmt_group(row: dict, ctx: dict[str, Any]) -> dict:
     return {
         **row,
         "avatar_id": gid,
-        "effect": ctx["policy"].get(gid, "inherit"),
-        "effect_command": ctx["cmd_master"].get(gid, "inherit"),
+        "effect": effect_in_scene(ctx["policy"].get(gid), ctx["scene"]) or "inherit",
+        "effect_command": effect_in_scene(ctx["cmd_master"].get(gid), ctx["scene"]) or "inherit",
         "level_id": int(lv_id) if lv_id else None,
         "level_name": (lv or {}).get("name") or "",
         "quota": q,
@@ -231,8 +246,8 @@ def _fmt_friend(row: dict, ctx: dict[str, Any]) -> dict:
         "display_name": (row.get("remark") or "").strip() or (row.get("nickname") or "").strip() or uin,
         "avatar": f"https://q1.qlogo.cn/g?b=qq&nk={uin}&s=100",
         "avatar_id": uin,
-        "effect": ctx["policy"].get(uin, "inherit"),
-        "effect_command": ctx["cmd_master"].get(uin, "inherit"),
+        "effect": effect_in_scene(ctx["policy"].get(uin), ctx["scene"]) or "inherit",
+        "effect_command": effect_in_scene(ctx["cmd_master"].get(uin), ctx["scene"]) or "inherit",
         "level_id": int(lv_id) if lv_id else None,
         "level_name": (lv or {}).get("name") or "",
         "quota": q,
@@ -325,17 +340,20 @@ def _filter_level(rows: list[dict], level_filter: str) -> list[dict]:
     return [r for r in rows if int(r.get("level_id") or 0) == want]
 
 
-async def _list_ctx(plugin, kind: str) -> dict[str, Any]:
+async def _list_ctx(plugin, kind: str, scene: str = "private") -> dict[str, Any]:
     """装配列表页要用的映射。
 
     等级 / 限额 / 用量 / 归级 / 权限这几张都直接取插件**内存里已有的快照**
     （闸门热路径的同一份数据，reload_rules 时整体重建），避免每翻一页都做十来次查询，
     也保证「界面上看到的」与「闸门实际用的」完全一致。只有等级名与最后回复需要查库。
+
+    ``scene`` 决定权限列展示哪一套规则（好友这一层分私聊 / 群聊）。
     """
     store = plugin.store
     from_ts, to_ts = _today_bounds()
     return {
         "plugin": plugin,
+        "scene": scene,
         "levels": _levels_index(await store.list_levels()),
         "limits": getattr(plugin, "_limits", {}) or {},
         "usage": {
@@ -470,7 +488,7 @@ async def h_friends(plugin) -> dict:
             platform_id=platform, keyword=kw, limit=size, offset=(page - 1) * size
         )
 
-    ctx = await _list_ctx(plugin, "user")
+    ctx = await _list_ctx(plugin, "user", _scene_arg("private"))
     rows = [_fmt_friend(r, ctx) for r in res["rows"]]
     total = res["total"]
 
@@ -524,7 +542,8 @@ async def h_groups(plugin) -> dict:
             platform_id=platform, keyword=kw, limit=size, offset=(page - 1) * size
         )
 
-    ctx = await _list_ctx(plugin, "group")
+    # 群页的规则（群专属 / 群等级）本来就只在群里生效，场景固定为群聊
+    ctx = await _list_ctx(plugin, "group", "group")
     rows = [_fmt_group(r, ctx) for r in res["rows"]]
     total = res["total"]
 
@@ -595,7 +614,9 @@ async def h_subject(plugin) -> dict:
     except Exception as e:
         logger.warning(f"[UserGateway] 读取对象缓存失败（忽略）: {e}")
 
-    effect = await plugin.store.get_effect(subject_type, subject_id)
+    scene = _scene_arg()
+    # 好友这一层的权限分场景：抽屉里展示的是「当前场景」下的配置与结论
+    effect = await plugin.store.resolve_policy(subject_type, subject_id, "llm", scene)
     quotas = await plugin.store.list_quotas_of(subject_type, subject_id)
     stats = await plugin.store.subject_stats(subject_type, subject_id, from_ts, to_ts)
 
@@ -618,7 +639,7 @@ async def h_subject(plugin) -> dict:
     bot = await plugin.store.get_bot_message(subject_type, subject_id)
     usage = await plugin.store.get_usage(subject_type, subject_id)
     model_route = plugin.model_route_of(subject_type, subject_id)
-    command_master = plugin.command_master_of(subject_type, subject_id)
+    command_master = plugin.command_master_of(subject_type, subject_id, scene)
 
     return ok(
         {
@@ -654,16 +675,21 @@ async def h_get_policy(plugin) -> dict:
     rows = await plugin.store.list_policies(
         scope_type=_q("scope_type") or None,
         feature=_q("feature") or "llm",
+        scene=_q("scene") if _q("scene") else None,
     )
     return ok({"items": rows})
 
 
 async def h_set_policy(plugin) -> dict:
-    """写入权限规则。body: ``{scope_type, scope_id, effect, feature?}`` 或 ``{items: [...]}``。
+    """写入权限规则。body: ``{scope_type, scope_id, effect, feature?, scene?}`` 或 ``{items: [...]}``。
 
     - ``feature='llm'``：LLM 对话权限（``scope_type`` 只允许 ``user`` / ``group``）；
+    - ``feature='command'``：对象级指令总权限；
     - ``feature='command:<指令名>'``：某条指令的权限，额外支持 ``scope_type='global'``
-      （``scope_id`` 固定 ``*``），即「这条指令全局禁用/放行」。
+      （``scope_id`` 固定 ``*``），即「这条指令全局禁用/放行」；
+    - ``scene='private' | 'group'``：只对 ``scope_type='user'`` 有意义 ——
+      好友这一层分私聊与群聊，例如「私聊禁用某人，但他在群里照用」。
+      不传 = 通用规则（两个场景都生效）。
     """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
@@ -680,6 +706,12 @@ async def h_set_policy(plugin) -> dict:
         scope_id = str(it.get("scope_id") or "").strip()
         effect = str(it.get("effect") or "").strip()
         feature = str(it.get("feature") or "llm").strip() or "llm"
+        # 场景只对「好友」这一层有意义：群 / 全局规则本来就只在（或不分）群里生效
+        scene = str(it.get("scene") or "").strip()
+        if scope_type != "user":
+            scene = ""
+        if scene not in ("", "private", "group"):
+            return err("scene 必须是 private / group（留空 = 两个场景都生效）")
         if scope_type not in ("user", "group", "global"):
             return err("scope_type 必须是 user / group / global")
         if scope_type == "global":
@@ -692,8 +724,16 @@ async def h_set_policy(plugin) -> dict:
             return err("effect 必须是 allow / deny / inherit")
         if feature not in ("llm", "command") and not feature.startswith("command:"):
             return err("feature 必须是 llm / command（对象级指令权限）/ command:<指令名>")
-        await plugin.store.set_policy(scope_type, scope_id, effect, feature=feature)
-        applied.append({"scope_type": scope_type, "scope_id": scope_id, "effect": effect, "feature": feature})
+        await plugin.store.set_policy(scope_type, scope_id, effect, feature=feature, scene=scene)
+        applied.append(
+            {
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "effect": effect,
+                "feature": feature,
+                "scene": scene,
+            }
+        )
 
     if not applied:
         return err("没有可应用的规则")
@@ -920,6 +960,9 @@ async def h_levels(plugin) -> dict:
                 "effect": str(lv.get("effect") or "inherit"),
                 "sort_order": int(lv.get("sort_order") or 0),
                 "effect_command": str(lv.get("command_effect") or "inherit"),
+                # 群聊场景的那一套（只对 kind='user' 有意义；inherit = 跟随主值）
+                "effect_group": str(lv.get("effect_group") or "inherit"),
+                "command_effect_group": str(lv.get("command_effect_group") or "inherit"),
                 "provider_id": str(lv.get("provider_id") or ""),
                 "fallback_provider_id": str(lv.get("fallback_provider_id") or ""),
                 "members": int(counts.get(lid, 0)),
@@ -1009,14 +1052,23 @@ async def h_set_level(plugin) -> dict:
     effect = str(body.get("effect") or "inherit").strip()
     # 兼容两种写法：前端用 effect_command（与列表返回字段一致），也接受 command_effect
     cmd_effect = str(body.get("effect_command") or body.get("command_effect") or "inherit").strip()
+    # 群聊场景那一套：只对「好友等级」有意义（群聊等级本来就只在群里生效）
+    eff_group = str(body.get("effect_group") or "inherit").strip()
+    cmd_eff_group = str(body.get("command_effect_group") or "inherit").strip()
     if kind not in ("user", "group"):
         return err("kind 必须是 user 或 group")
+    if kind == "group":
+        # 群聊等级只有群聊场景，不需要（也不该）有两套默认权限
+        eff_group = cmd_eff_group = "inherit"
     if not name:
         return err("等级名称不能为空")
     if effect not in ("inherit", "allow", "deny"):
         return err("effect 必须是 inherit / allow / deny（等级默认 LLM 权限）")
     if cmd_effect not in ("inherit", "allow", "deny"):
         return err("effect_command 必须是 inherit / allow / deny（等级默认指令权限）")
+    for label, val in (("effect_group", eff_group), ("command_effect_group", cmd_eff_group)):
+        if val not in ("inherit", "allow", "deny"):
+            return err(f"{label} 必须是 inherit / allow / deny（群聊场景的默认权限）")
     try:
         sort_order = int(body.get("sort_order") or 0)
     except Exception:
@@ -1040,6 +1092,8 @@ async def h_set_level(plugin) -> dict:
         provider_id=str(body.get("provider_id") or "").strip(),
         fallback_provider_id=str(body.get("fallback_provider_id") or "").strip(),
         command_effect=cmd_effect,
+        effect_group=eff_group,
+        command_effect_group=cmd_eff_group,
     )
     if not new_id:
         return err("等级写入失败")
@@ -1166,17 +1220,24 @@ async def h_commands(plugin) -> dict:
         table = policy.get(name) or {}
         rules: list[dict] = []
         for scope_type, mapping in table.items():
-            for scope_id, effect in (mapping or {}).items():
+            for scope_id, scenes in (mapping or {}).items():
                 if scope_type == "global":
                     continue
-                rules.append(
-                    {"scope_type": scope_type, "scope_id": scope_id, "effect": effect}
-                )
-        rules.sort(key=lambda r: (r["scope_type"], r["scope_id"]))
+                for scene, effect in (scenes or {}).items():
+                    rules.append(
+                        {
+                            "scope_type": scope_type,
+                            "scope_id": scope_id,
+                            "scene": scene,
+                            "effect": effect,
+                        }
+                    )
+        rules.sort(key=lambda r: (r["scope_type"], r["scope_id"], r["scene"]))
         items.append(
             {
                 **c,
-                "global_effect": str((table.get("global") or {}).get("*") or "inherit"),
+                "global_effect": effect_in_scene((table.get("global") or {}).get("*"), "")
+                or "inherit",
                 "rules": rules,
                 "rule_count": len(rules),
             },

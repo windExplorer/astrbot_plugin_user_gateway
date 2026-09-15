@@ -1,5 +1,8 @@
 <script setup lang="ts">
 // 私聊：QQ 好友列表 + 等级 / LLM 权限 / 生效额度 / 最后回复，支持逐个与批量管控。
+//
+// 「场景」：好友的权限分**私聊**与**群聊**两个维度（同一个人可以「私聊禁用、群里照用」），
+// 顶部切换器决定权限列读写哪一套；群专属 / 群等级规则则天然只属于群聊场景。
 import { computed, h, onMounted, ref } from "vue";
 import {
   NButton,
@@ -10,6 +13,8 @@ import {
   NInput,
   NPagination,
   NProgress,
+  NRadioButton,
+  NRadioGroup,
   NSelect,
   NSpace,
   NTag,
@@ -49,6 +54,9 @@ const cmdFilter = ref("");
 const sort = ref("last");
 // 等级筛选："" = 全部，「0」= 未分组，其余为等级 id
 const levelFilter = ref("");
+// 作用场景：好友的权限分「私聊」「群聊」两个维度，切换后列表里的权限列读写对应的那一套
+const scene = ref<"private" | "group">("private");
+const sceneLabel = computed(() => (scene.value === "group" ? "群聊" : "私聊"));
 const checked = ref<string[]>([]);
 const levels = ref<LevelRow[]>([]);
 const batchLevelId = ref<number | null>(null);
@@ -117,6 +125,7 @@ async function load() {
         `&effect=${encodeURIComponent(effectFilter.value)}` +
         `&effect_command=${encodeURIComponent(cmdFilter.value)}` +
         `&level_id=${encodeURIComponent(levelFilter.value)}` +
+        `&scene=${scene.value}` +
         `&q=${encodeURIComponent(keyword.value)}`,
     );
     rows.value = res.rows || [];
@@ -179,7 +188,14 @@ async function applyPolicy(items: { scope_id: string; effect: string }[], featur
   const label = feature === "command" ? "指令权限" : "LLM 权限";
   try {
     await apiPost("/policy", {
-      items: items.map((i) => ({ scope_type: "user", scope_id: i.scope_id, effect: i.effect, feature })),
+      // scene：只改「当前作用场景」那一套规则（另一个场景不受影响）
+      items: items.map((i) => ({
+        scope_type: "user",
+        scope_id: i.scope_id,
+        effect: i.effect,
+        feature,
+        scene: scene.value,
+      })),
     });
     if (!silent) message.success(`已更新 ${items.length} 个好友的${label}`);
     checked.value = [];
@@ -209,11 +225,12 @@ async function applyLevel(items: { scope_id: string; level_id: number | null }[]
   }
 }
 
-// 批量下拉：LLM 权限与指令权限是两套独立规则，分开列，避免点错
-const batchOptions = [
+// 批量下拉：LLM 权限与指令权限是两套独立规则，分开列，避免点错。
+// 分组标题带上当前场景，提醒「这次改的是哪一套」。
+const batchOptions = computed(() => [
   {
     type: "group",
-    label: "LLM 权限",
+    label: `LLM 权限（${sceneLabel.value}）`,
     key: "g-llm",
     children: [
       { label: "放行", key: "llm:allow" },
@@ -223,7 +240,7 @@ const batchOptions = [
   },
   {
     type: "group",
-    label: "指令权限",
+    label: `指令权限（${sceneLabel.value}）`,
     key: "g-cmd",
     children: [
       { label: "放行", key: "cmd:allow" },
@@ -231,7 +248,7 @@ const batchOptions = [
       { label: "恢复继承", key: "cmd:inherit" },
     ],
   },
-];
+]);
 
 async function onBatch(key: string) {
   const [kind, effect] = String(key).split(":");
@@ -291,13 +308,14 @@ const columns: DataTableColumns<FriendRow> = [
       }),
   },
   {
-    title: "LLM 权限",
+    // 标题是函数 → 切换场景时跟着变（naive-ui 会把函数当渲染函数，读 scene.value 即自动响应）
+    title: () => `LLM 权限（${sceneLabel.value}）`,
     key: "effect",
     width: 195,
     render: (row) => h(EffectSegment, { effect: row.effect, onChange: (v: string) => applyEffect([{ scope_id: row.uin, effect: v }]) }),
   },
   {
-    title: "指令权限",
+    title: () => `指令权限（${sceneLabel.value}）`,
     key: "effect_command",
     width: 195,
     render: (row) =>
@@ -406,6 +424,10 @@ onMounted(async () => {
     </template>
     <template #header-extra>
       <n-space :size="8" align="center">
+        <n-radio-group v-model:value="scene" size="small" @update:value="search">
+          <n-radio-button value="private">私聊</n-radio-button>
+          <n-radio-button value="group">群聊</n-radio-button>
+        </n-radio-group>
         <n-input
           v-model:value="keyword"
           size="small"

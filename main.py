@@ -43,7 +43,15 @@ if _PLUGIN_DIR not in sys.path:
 try:  # 包内相对导入（AstrBot 正常加载路径）
     from . import quota as quota_mod
     from .avatar import AvatarCache
-    from .gate import Cooldown, Gate, ProviderCircuit, Rules, Subject, layer_label
+    from .gate import (
+        Cooldown,
+        Gate,
+        ProviderCircuit,
+        Rules,
+        Subject,
+        effect_in_scene,
+        layer_label,
+    )
     from .store import COMMAND_MASTER_FEATURE, Store
     from .sync import SyncScheduler
     from .webui_api import register_apis
@@ -56,7 +64,15 @@ except ImportError as _rel_err:
     try:
         import quota as quota_mod  # type: ignore
         from avatar import AvatarCache  # type: ignore
-        from gate import Cooldown, Gate, ProviderCircuit, Rules, Subject, layer_label  # type: ignore
+        from gate import (  # type: ignore
+            Cooldown,
+            Gate,
+            ProviderCircuit,
+            Rules,
+            Subject,
+            effect_in_scene,
+            layer_label,
+        )
         from store import COMMAND_MASTER_FEATURE, Store  # type: ignore
         from sync import SyncScheduler  # type: ignore
         from webui_api import register_apis  # type: ignore
@@ -121,12 +137,15 @@ class UserGatewayPlugin(Star):
         # 用量计数：{scope_type(user|group): {scope_id: {period: row}}}
         self._usage_user: dict[str, dict[str, dict[str, Any]]] = {}
         self._usage_group: dict[str, dict[str, dict[str, Any]]] = {}
-        # 指令权限：{指令名: {scope_type: {scope_id: effect}}}（单条指令的规则）
-        self._cmd_policy: dict[str, dict[str, dict[str, str]]] = {}
-        # 对象级指令总权限：{scope_type(user|group): {scope_id: effect}}
-        self._cmd_master: dict[str, dict[str, str]] = {}
+        # 指令权限：{指令名: {scope_type: {scope_id: {scene: effect}}}}（单条指令的规则）
+        self._cmd_policy: dict[str, dict[str, dict[str, dict[str, str]]]] = {}
+        # 对象级指令总权限：{scope_type: {scope_id: {scene: effect}}}
+        self._cmd_master: dict[str, dict[str, dict[str, str]]] = {}
         # 等级的默认「指令」权限：{(kind, level_id): effect}（与 LLM 的 _level_effect 分开）
         self._level_cmd_effect: dict[tuple[str, int], str] = {}
+        # 上面两者的「群聊场景」版本（v6）：只对 kind='user'（好友等级）有意义
+        self._level_eff_group: dict[tuple[str, int], str] = {}
+        self._level_cmd_eff_group: dict[tuple[str, int], str] = {}
 
         # M1：判定内核 / 提示冷却 / 后台任务
         self.gate = Gate(self._cfg)
@@ -294,6 +313,16 @@ class UserGatewayPlugin(Star):
                 (str(lv["kind"]), int(lv["id"])): str(lv.get("command_effect") or "inherit")
                 for lv in levels
             }
+            # 上面两者的「群聊场景」版本：好友等级在群里也生效，所以能单独设一套
+            # （inherit = 跟随主值，旧数据就是这样 → 行为不变）
+            self._level_eff_group = {
+                (str(lv["kind"]), int(lv["id"])): str(lv.get("effect_group") or "inherit")
+                for lv in levels
+            }
+            self._level_cmd_eff_group = {
+                (str(lv["kind"]), int(lv["id"])): str(lv.get("command_effect_group") or "inherit")
+                for lv in levels
+            }
             self._level_route = {
                 (str(lv["kind"]), int(lv["id"])): {
                     "provider_id": str(lv.get("provider_id") or ""),
@@ -357,6 +386,8 @@ class UserGatewayPlugin(Star):
             command_policy=self._cmd_policy,
             command_master=self._cmd_master,
             level_command_effect=self._level_cmd_effect,
+            level_effect_group=self._level_eff_group,
+            level_command_effect_group=self._level_cmd_eff_group,
         )
 
     # ------------------------------------------------------------------ #
@@ -960,21 +991,27 @@ class UserGatewayPlugin(Star):
             logger.debug(f"[UserGateway] 解析模型路由失败（忽略）: {e}")
             return {}
 
-    def command_master_of(self, scope_type: str, scope_id: str) -> dict[str, Any]:
+    def command_master_of(
+        self, scope_type: str, scope_id: str, scene: str = "private"
+    ) -> dict[str, Any]:
         """给控制台用：某对象的**指令权限**（自己配的值 + 实际生效的层）。
 
-        - ``effect``：该对象自己配的三态值（``inherit`` = 没单独配）；
+        Args:
+            scene: ``private`` / ``group`` —— 好友这一层是分场景的，控制台要按当前场景取。
+
+        - ``effect``：该对象在当前场景下配的三态值（``inherit`` = 没单独配）；
         - ``resolved``：按档位链算出来的最终结论（含等级 / 全局 / 配置默认）；
         - ``layer_label``：这个结论是哪来的（好友专属 / 好友等级 / … / 系统默认）。
         """
         try:
-            subject = (
-                Subject(sender_id=scope_id) if scope_type == "user" else Subject(group_id=scope_id)
-            )
+            subject = self._probe_subject(scope_type, scope_id, scene)
             eff, layer, st, sid = self.gate.check_command_master(subject, self._rules())
+            explicit = effect_in_scene(
+                (self._cmd_master.get(scope_type) or {}).get(scope_id), scene
+            )
             if not eff:
                 return {
-                    "effect": "inherit",
+                    "effect": explicit or "inherit",
                     "resolved": self.gate.default_command_effect(),
                     "layer": "",
                     "layer_label": "系统默认",
@@ -982,7 +1019,7 @@ class UserGatewayPlugin(Star):
                     "scope_id": "*",
                 }
             return {
-                "effect": str((self._cmd_master.get(scope_type) or {}).get(scope_id) or "inherit"),
+                "effect": explicit or "inherit",
                 "resolved": eff,
                 "layer": layer,
                 "layer_label": layer_label(layer),
@@ -992,6 +1029,20 @@ class UserGatewayPlugin(Star):
         except Exception as e:
             logger.debug(f"[UserGateway] 解析指令权限失败（忽略）: {e}")
             return {}
+
+    @staticmethod
+    def _probe_subject(scope_type: str, scope_id: str, scene: str) -> Subject:
+        """构造一个「探针」Subject，用来在指定场景下跑档位链。
+
+        群聊场景必须有 ``group_id`` 才会走群聊那条链（群专属 / 群等级）。控制台问的是
+        「这个好友在群里会怎样」，所以用一个**不存在的探针群号**：它在库里没有任何
+        专属规则与归级，对应档位自然落空，不会扰动结论。
+        """
+        if scope_type != "user":
+            return Subject(group_id=scope_id)
+        if scene == "group":
+            return Subject(sender_id=scope_id, group_id="__scene_probe__")
+        return Subject(sender_id=scope_id)
 
     def _effective_limit(self, scope_type: str, scope_id: str) -> Optional[tuple[str, dict]]:
         """取某对象**生效**的那一层限额 ``(layer, {period: row})``（与 Gate 档位链一致）。

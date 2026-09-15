@@ -41,19 +41,51 @@ def make_gate(**cfg):
     return G.Gate(lambda k, d=None: defaults.get(k, d))
 
 
+def _by_scene(mapping) -> dict:
+    """``{id: effect}`` → ``{id: {scene: effect}}``（扁平写法补上「通用」场景）。
+
+    规则表内部是 ``{id: {scene: effect}}``（场景是 v6 新增的维度），但绝大多数用例
+    只要「两个场景一致」的通用规则，写扁平更短。已经是 ``{scene: effect}`` 的原样保留，
+    方便写「只对私聊 / 只对群聊」的场景用例。
+    """
+    out = {}
+    for key, val in (mapping or {}).items():
+        if isinstance(val, dict):
+            out[str(key)] = {str(s): str(e) for s, e in val.items()}
+        else:
+            out[str(key)] = {"": str(val)}
+    return out
+
+
+def _by_scope(mapping) -> dict:
+    """``{scope_type: {id: effect}}`` → 末端补场景层（``command_master`` 用）。"""
+    return {str(k): _by_scene(v) for k, v in (mapping or {}).items()}
+
+
+def _by_cmd(mapping) -> dict:
+    """``{cmd: {scope_type: {id: effect}}}`` → 末端补场景层（``command_policy`` 用）。"""
+    return {str(k): _by_scope(v) for k, v in (mapping or {}).items()}
+
+
 def R(**kw) -> G.Rules:
-    """构造规则快照（只填本次要用的部分）。"""
+    """构造规则快照（只填本次要用的部分）。
+
+    带「场景」的四张表支持扁平写法（见 :func:`_by_scene` 等），
+    也可以直接写 ``{scene: effect}`` 来测「只对某个场景生效」。
+    """
     return G.Rules(
-        effect_user=kw.get("effect_user") or {},
-        effect_group=kw.get("effect_group") or {},
+        effect_user=_by_scene(kw.get("effect_user")),
+        effect_group=_by_scene(kw.get("effect_group")),
         level_effect=kw.get("level_effect") or {},
+        level_effect_group=kw.get("level_effect_group") or {},
         subject_level=kw.get("subject_level") or {},
         limits=kw.get("limits") or {},
         usage=kw.get("usage") or {},
         level_model=kw.get("level_model") or {},
-        command_policy=kw.get("command_policy") or {},
-        command_master=kw.get("command_master") or {},
+        command_policy=_by_cmd(kw.get("command_policy")),
+        command_master=_by_scope(kw.get("command_master")),
         level_command_effect=kw.get("level_command_effect") or {},
+        level_command_effect_group=kw.get("level_command_effect_group") or {},
     )
 
 
@@ -402,6 +434,81 @@ def main() -> int:
                 command_policy={"draw": {"user": {"10001": "allow"}}})
     v = gate.check_command(G.Subject(sender_id="10001"), "draw", lv_only)
     check(not v.allow and v.layer == "user_level", "等级禁止指令时，单条指令的放行压不过它（需在对象级开白名单）")
+
+    print("\n[15] 场景维度：私聊与群聊分开")
+    sc = R(effect_user={"10001": {"private": "deny"}})
+    check(not gate.check_permission(G.Subject(sender_id="10001"), sc).allow, "只禁私聊 → 私聊被拒")
+    check(
+        gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), sc).allow,
+        "只禁私聊 → 群里照用（这就是「两个维度」的意义）",
+    )
+    sc2 = R(effect_user={"10001": {"group": "deny"}})
+    check(gate.check_permission(G.Subject(sender_id="10001"), sc2).allow, "只禁群聊 → 私聊不受影响")
+    check(
+        not gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), sc2).allow,
+        "只禁群聊 → 群里被拒",
+    )
+    sc3 = R(effect_user={"10001": {"": "deny"}})
+    check(not gate.check_permission(G.Subject(sender_id="10001"), sc3).allow, "通用规则 → 私聊被拒")
+    check(
+        not gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), sc3).allow,
+        "通用规则 → 群聊也被拒（v5 旧数据的行为不变）",
+    )
+    sc4 = R(effect_user={"10001": {"": "deny", "group": "allow"}})
+    check(not gate.check_permission(G.Subject(sender_id="10001"), sc4).allow, "通用禁止在私聊仍然生效")
+    check(
+        gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), sc4).allow,
+        "群聊专属「放行」覆盖通用「禁止」",
+    )
+
+    # 好友等级：群聊有专属值，没配（inherit）就回落主值
+    lv = R(level_effect={("user", 3): "deny"}, subject_level={"user": {"10002": 3}})
+    check(not gate.check_permission(G.Subject(sender_id="10002"), lv).allow, "等级主值=禁止 → 私聊被拒")
+    check(
+        not gate.check_permission(G.Subject(sender_id="10002", group_id="88888"), lv).allow,
+        "群聊没单独配 → 回落主值（旧数据行为不变）",
+    )
+    lv2 = R(
+        level_effect={("user", 3): "deny"},
+        level_effect_group={("user", 3): "allow"},
+        subject_level={"user": {"10002": 3}},
+    )
+    check(not gate.check_permission(G.Subject(sender_id="10002"), lv2).allow, "私聊仍按主值禁止")
+    v = gate.check_permission(G.Subject(sender_id="10002", group_id="88888"), lv2)
+    check(v.allow and v.layer == "user_level", "群聊专属放行 → 群里可用，且来源仍是好友等级")
+    lvg = R(level_effect={("group", 5): "deny"}, subject_level={"group": {"88888": 5}})
+    check(
+        not gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), lvg).allow,
+        "群等级=禁止 → 群里被拒",
+    )
+    check(gate.check_permission(G.Subject(sender_id="10001"), lvg).allow, "群等级不影响私聊")
+
+    # 指令权限（对象级总权限、单条指令）同样分场景
+    cm = R(command_master={"user": {"10001": {"private": "deny"}}})
+    check(not gate.check_command(G.Subject(sender_id="10001"), "draw", cm).allow, "指令：私聊禁止 → 私聊用不了")
+    check(
+        gate.check_command(G.Subject(sender_id="10001", group_id="88888"), "draw", cm).allow,
+        "指令：只禁私聊 → 群里照用",
+    )
+    lvc = R(
+        level_command_effect={("user", 4): "deny"},
+        level_command_effect_group={("user", 4): "allow"},
+        subject_level={"user": {"10003": 4}},
+    )
+    check(
+        not gate.check_command(G.Subject(sender_id="10003"), "draw", lvc).allow,
+        "等级指令权限：私聊按主值禁止",
+    )
+    check(
+        gate.check_command(G.Subject(sender_id="10003", group_id="88888"), "draw", lvc).allow,
+        "等级指令权限：群聊专属放行 → 群里能用指令",
+    )
+    cp = R(command_policy={"draw": {"user": {"10001": {"group": "deny"}}}})
+    check(gate.check_command(G.Subject(sender_id="10001"), "draw", cp).allow, "单条指令：只禁群聊 → 私聊可用")
+    check(
+        not gate.check_command(G.Subject(sender_id="10001", group_id="88888"), "draw", cp).allow,
+        "单条指令：群里被禁",
+    )
 
     print()
     if _failures:

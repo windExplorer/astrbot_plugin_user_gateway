@@ -298,6 +298,10 @@ export interface LevelRow {
   effect: "inherit" | "allow" | "deny";
   /** 等级的默认**指令**权限（与 effect 分开配置） */
   effect_command: "inherit" | "allow" | "deny";
+  /** 群聊场景下的默认 LLM 权限（只对 kind="user" 有意义；inherit = 跟随主值） */
+  effect_group: "inherit" | "allow" | "deny";
+  /** 群聊场景下的默认指令权限（同上） */
+  command_effect_group: "inherit" | "allow" | "deny";
   sort_order: number;
   /** 模型路由：主提供商 id / 备用提供商 id（一项 = 一个「提供商 · 模型」） */
   provider_id: string;
@@ -314,6 +318,8 @@ export interface LevelPayload {
   description?: string;
   effect?: "inherit" | "allow" | "deny";
   effect_command?: "inherit" | "allow" | "deny";
+  effect_group?: "inherit" | "allow" | "deny";
+  command_effect_group?: "inherit" | "allow" | "deny";
   sort_order?: number;
   provider_id?: string;
   fallback_provider_id?: string;
@@ -400,9 +406,13 @@ export interface SubjectDetail {
   recent: Record<string, any>[];
 }
 
-/** 单个对象（好友/群）的详情：基础信息 + 权限 + 等级 + 额度档位链 + 区间用量与曲线。 */
-export function apiSubject(type: "user" | "group", id: string, days = 7) {
-  return apiGet<SubjectDetail>(`/subject?type=${type}&id=${encodeURIComponent(id)}&days=${days}`);
+/** 单个对象（好友/群）的详情：基础信息 + 权限 + 等级 + 额度档位链 + 区间用量与曲线。
+ *
+ *  ``scene`` 决定权限部分展示哪一套（好友分私聊 / 群聊两个维度）。 */
+export function apiSubject(type: "user" | "group", id: string, days = 7, scene: "private" | "group" = "private") {
+  return apiGet<SubjectDetail>(
+    `/subject?type=${type}&id=${encodeURIComponent(id)}&days=${days}&scene=${scene}`,
+  );
 }
 
 /** 手动同步好友 / 群列表（协议端往返，给足超时）。 */
@@ -427,8 +437,13 @@ export interface CommandRow {
   is_group: boolean;
   /** 该指令的全局策略（inherit = 未配置，按「指令默认策略」走） */
   global_effect: "allow" | "deny" | "inherit";
-  /** 例外规则（好友 / 群） */
-  rules: { scope_type: "user" | "group"; scope_id: string; effect: "allow" | "deny" | "inherit" }[];
+  /** 例外规则（好友 / 群）；``scene`` 非空表示该规则只对某个场景生效 */
+  rules: {
+    scope_type: "user" | "group";
+    scope_id: string;
+    scene?: Scene;
+    effect: "allow" | "deny" | "inherit";
+  }[];
   rule_count: number;
 }
 
@@ -451,11 +466,16 @@ export function apiPruneCommands() {
   return apiPost<{ deleted: number; alive: number }>("/commands/prune", {});
 }
 
+/** 会话场景：好友这一层的规则可以只对私聊或只对群聊生效（'' = 两个场景都生效）。 */
+export type Scene = "" | "private" | "group";
+
 export interface PolicyItem {
   scope_type: "user" | "group" | "global";
   scope_id: string;
   effect: "allow" | "deny" | "inherit";
   feature: string;
+  /** 只对 scope_type="user" 有意义；不传 = 通用规则 */
+  scene?: Scene;
 }
 
 /** 批量写权限规则。``feature`` 三种取值：

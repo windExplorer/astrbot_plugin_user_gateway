@@ -69,6 +69,17 @@ const qMode = ref<"enforce" | "observe">("enforce");
 
 const isUser = computed(() => props.type === "user");
 
+// 作用场景：好友的权限分「私聊」「群聊」两个维度，切换后权限卡读写对应的那一套
+// （群详情没有这个维度：群专属 / 群等级规则天然只属于群聊场景）
+const scene = ref<"private" | "group">("private");
+const sceneLabel = computed(() => (scene.value === "group" ? "群聊" : "私聊"));
+
+function setScene(v: "private" | "group") {
+  if (scene.value === v) return;
+  scene.value = v;
+  load();
+}
+
 // 生效模型（等级路由）：说明「这个会话实际会走哪个提供商/模型」
 const modelRouteText = computed(() => {
   const r = detail.value?.model_route as any;
@@ -123,7 +134,7 @@ async function load() {
   if (!props.id) return;
   loading.value = true;
   try {
-    const d = await apiSubject(props.type, props.id, 7);
+    const d = await apiSubject(props.type, props.id, 7, scene.value);
     detail.value = d;
     effect.value = d.effect || "inherit";
     cmdEffect.value = String((d as any).command_master?.effect || "inherit");
@@ -199,8 +210,12 @@ async function saveEffect(next: string) {
       scope_id: props.id,
       effect: next,
       feature: "llm",
+      scene: scene.value,
     });
-    message.success(`已设为「${next === "allow" ? "放行" : next === "deny" ? "禁止" : "继承"}」`);
+    message.success(
+      `已设为「${next === "allow" ? "放行" : next === "deny" ? "禁止" : "继承"}」` +
+        (isUser.value ? `（${sceneLabel.value}）` : ""),
+    );
     emit("changed");
     await load();
   } catch (e: any) {
@@ -219,13 +234,14 @@ async function saveCommandEffect(next: string) {
       scope_id: props.id,
       effect: next,
       feature: "command",
+      scene: scene.value,
     });
     message.success(
-      next === "deny"
+      (next === "deny"
         ? "已禁止该对象使用任何指令"
         : next === "allow"
           ? "已允许该对象使用指令"
-          : "已恢复继承",
+          : "已恢复继承") + (isUser.value ? `（${sceneLabel.value}）` : ""),
     );
     emit("changed");
     await load();
@@ -393,13 +409,19 @@ watch(
             />
           </n-card>
 
-          <n-card size="small" title="权限">
+          <n-card size="small" :title="isUser ? `权限（${sceneLabel}）` : '权限'">
+            <template v-if="isUser" #header-extra>
+              <n-radio-group :value="scene" size="small" @update:value="setScene">
+                <n-radio-button value="private">私聊</n-radio-button>
+                <n-radio-button value="group">群聊</n-radio-button>
+              </n-radio-group>
+            </template>
             <n-space vertical :size="10">
               <n-space align="center" :size="10">
                 <span style="font-size: 13px; width: 56px">LLM</span>
                 <effect-segment :effect="effect" :disabled="saving" @change="saveEffect" />
                 <span style="font-size: 12px; opacity: 0.6">
-                  三者互斥；「继承」= 不写专属规则，跟随等级 / 群 / 全局默认
+                  三者互斥；「继承」= 不写专属规则，跟随等级 / 群{{ isUser ? ' / 另一个场景的通用规则' : '' }} / 全局默认
                 </span>
               </n-space>
               <n-space align="center" :size="10">

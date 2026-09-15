@@ -174,6 +174,8 @@ const levelForm = ref<
   description: "",
   effect: "inherit",
   effect_command: "inherit",
+  effect_group: "inherit",
+  command_effect_group: "inherit",
   sort_order: 0,
   provider_id: "",
   fallback_provider_id: "",
@@ -189,6 +191,8 @@ const levelForm = ref<
   description: row.description || "",
   effect: row.effect || "inherit",
   effect_command: row.effect_command || "inherit",
+  effect_group: row.effect_group || "inherit",
+  command_effect_group: row.command_effect_group || "inherit",
   sort_order: row.sort_order || 0,
   provider_id: row.provider_id || "",
   fallback_provider_id: row.fallback_provider_id || "",
@@ -235,6 +239,8 @@ async function saveLevel() {
       description: f.description?.trim() || "",
       effect: f.effect,
       effect_command: f.effect_command,
+      effect_group: f.effect_group,
+      command_effect_group: f.command_effect_group,
       sort_order: f.sort_order,
       provider_id: f.provider_id || "",
       fallback_provider_id: f.fallback_provider_id || "",
@@ -335,6 +341,26 @@ const levelColumns: DataTableColumns<LevelRow> = [
                   : "该等级不管指令权限，按更具体的规则与「指令默认策略」走",
           },
         ),
+        // 好友等级可以单独配「群聊」那一套，配了就额外标一行
+        row.kind === "user" &&
+        ((row.effect_group && row.effect_group !== "inherit") ||
+          (row.command_effect_group && row.command_effect_group !== "inherit"))
+          ? h(NTooltip, { trigger: "hover" }, {
+              trigger: () =>
+                h("div", { style: "font-size:11.5px;opacity:.7" }, [
+                  "群聊：" +
+                    (row.effect_group === "inherit"
+                      ? "跟随"
+                      : effectText[row.effect_group] || row.effect_group) +
+                    " / " +
+                    (row.command_effect_group === "inherit"
+                      ? "跟随"
+                      : effectText[row.command_effect_group] || row.command_effect_group),
+                ]),
+              default: () =>
+                "该好友等级在**群聊**里的默认权限（与私聊那一套分开配）：「跟随」= 用私聊设置",
+            })
+          : null,
       ]),
   },
   {
@@ -620,7 +646,7 @@ onMounted(load);
         <n-form-item label="说明">
           <n-input v-model:value="levelForm.description" placeholder="可选，给自己看的备注" />
         </n-form-item>
-        <n-form-item label="默认 LLM 权限">
+        <n-form-item :label="levelForm.kind === 'user' ? '私聊默认 LLM 权限' : '默认 LLM 权限'">
           <n-radio-group v-model:value="levelForm.effect">
             <n-radio-button value="inherit">继承</n-radio-button>
             <n-radio-button value="allow">放行</n-radio-button>
@@ -630,7 +656,7 @@ onMounted(load);
             「继承」= 该等级不管 LLM 对话权限
           </span>
         </n-form-item>
-        <n-form-item label="默认指令权限">
+        <n-form-item :label="levelForm.kind === 'user' ? '私聊默认指令权限' : '默认指令权限'">
           <n-space vertical :size="4" style="width: 100%">
             <n-radio-group v-model:value="levelForm.effect_command">
               <n-radio-button value="inherit">继承</n-radio-button>
@@ -640,6 +666,31 @@ onMounted(load);
             <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
               与上面的 LLM 权限<b>相互独立</b>：设成「禁止」= 该等级下的好友 / 群<b>不能用任何指令</b>；<br />
               要给个别人开白名单，去「私聊 / 群聊」页把那个人的指令权限设为「放行」。
+            </span>
+          </n-space>
+        </n-form-item>
+        <n-form-item v-if="levelForm.kind === 'user'" label="群聊默认权限">
+          <n-space vertical :size="6" style="width: 100%">
+            <n-space align="center" :size="8">
+              <span style="font-size: 12.5px; width: 34px">LLM</span>
+              <n-radio-group v-model:value="levelForm.effect_group">
+                <n-radio-button value="inherit">跟随私聊</n-radio-button>
+                <n-radio-button value="allow">放行</n-radio-button>
+                <n-radio-button value="deny">禁止</n-radio-button>
+              </n-radio-group>
+            </n-space>
+            <n-space align="center" :size="8">
+              <span style="font-size: 12.5px; width: 34px">指令</span>
+              <n-radio-group v-model:value="levelForm.command_effect_group">
+                <n-radio-button value="inherit">跟随私聊</n-radio-button>
+                <n-radio-button value="allow">放行</n-radio-button>
+                <n-radio-button value="deny">禁止</n-radio-button>
+              </n-radio-group>
+            </n-space>
+            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
+              好友等级在群里同样生效，所以能单独说「私聊禁止、群里照用」：
+              这里设「禁止」只影响该等级的人在<b>群聊</b>里的行为；<br />
+              「跟随私聊」= 用上面私聊那一套（升级前的旧数据就是这个状态，行为不变）。
             </span>
           </n-space>
         </n-form-item>

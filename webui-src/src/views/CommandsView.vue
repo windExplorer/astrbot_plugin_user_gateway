@@ -161,12 +161,23 @@ async function prune() {
   }
 }
 
+/** 规则里带的场景标记：只对某个场景生效时要写出来，否则会被误读成「全场生效」。 */
+function sceneTag(scene?: string): string {
+  if (scene === "private") return "（仅私聊）";
+  if (scene === "group") return "（仅群聊）";
+  return "";
+}
+
 function ruleSummary(row: CommandRow): string {
   const rules = row.rules || [];
   if (!rules.length) return "";
   const text = rules
     .slice(0, 2)
-    .map((r) => `${r.scope_type === "user" ? "好友" : "群"} ${r.scope_id} ${r.effect === "deny" ? "禁止" : "放行"}`)
+    .map(
+      (r) =>
+        `${r.scope_type === "user" ? "好友" : "群"} ${r.scope_id}` +
+        `${sceneTag(r.scene)} ${r.effect === "deny" ? "禁止" : "放行"}`,
+    )
     .join("；");
   return rules.length > 2 ? `${text} 等 ${rules.length} 条` : text;
 }
@@ -222,7 +233,11 @@ const columns: DataTableColumns<CommandRow> = [
         trigger: () => h("span", { style: "font-size:12.5px" }, ruleSummary(row)),
         default: () =>
           (row.rules || [])
-            .map((r) => `${r.scope_type === "user" ? "好友" : "群"} ${r.scope_id}：${r.effect === "deny" ? "禁止" : "放行"}`)
+            .map(
+              (r) =>
+                `${r.scope_type === "user" ? "好友" : "群"} ${r.scope_id}${sceneTag(r.scene)}：` +
+                `${r.effect === "deny" ? "禁止" : "放行"}`,
+            )
             .join("\n"),
       });
     },

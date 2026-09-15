@@ -43,7 +43,7 @@ async def main() -> int:
         check(Path(db_path).exists(), "数据库文件已创建")
 
         print("\n[2] settings")
-        check(await st.get_setting("schema_version") == "5", "schema_version 已写入 5")
+        check(await st.get_setting("schema_version") == "6", "schema_version 已写入 6")
         check(await st.get_setting("nope", "d") == "d", "缺省值回退")
         await st.set_setting("sync_last_at", "123")
         check(await st.get_setting("sync_last_at") == "123", "写入后可读")
@@ -55,8 +55,27 @@ async def main() -> int:
         await st.set_policy("user", "10001", "allow")
         check(await st.get_effect("user", "10001") == "allow", "同键覆盖为 allow")
         await st.set_policy("group", "88888", "deny")
-        check(await st.effect_map("user") == {"10001": "allow"}, "effect_map(user)")
-        check(await st.effect_map("group") == {"88888": "deny"}, "effect_map(group)")
+        check(await st.effect_map("user") == {"10001": {"": "allow"}}, "effect_map(user)（值为 {场景: 效果}）")
+        check(await st.effect_map("group") == {"88888": {"": "deny"}}, "effect_map(group)")
+        # 场景维度（v6）：同一对象的「私聊」「群聊」可以各配一条，互不覆盖
+        await st.set_policy("user", "10001", "deny", scene="private")
+        await st.set_policy("user", "10001", "allow", scene="group")
+        em = await st.effect_map("user")
+        check(em["10001"] == {"": "allow", "private": "deny", "group": "allow"},
+              f"同对象多场景并存（实得 {em.get('10001')}）")
+        check(await st.get_effect("user", "10001", "llm", "private") == "deny", "按场景读单条规则")
+        check(await st.resolve_policy("user", "10001", "llm", "group") == "allow",
+              "resolve_policy 优先取场景专属")
+        await st.set_policy("user", "10002", "deny")           # 只有通用
+        check(await st.resolve_policy("user", "10002", "llm", "group") == "deny",
+              "只有通用规则时两个场景都生效（旧数据行为不变）")
+        await st.set_policy("user", "10001", "inherit", scene="private")
+        check(await st.get_effect("user", "10001", "llm", "private") is None,
+              "「恢复继承」只删本场景的规则")
+        check(await st.get_effect("user", "10001", "llm", "group") == "allow",
+              "另一个场景的规则不受影响")
+        await st.set_policy("user", "10001", "inherit", scene="group")
+        await st.set_policy("user", "10002", "inherit")
         await st.set_policy("user", "10001", "inherit")
         check(await st.get_effect("user", "10001") is None, "inherit 等价于删除")
 
@@ -403,7 +422,7 @@ async def main() -> int:
 
         st3 = Store(v1_path)
         await st3.open()
-        check(await st3.get_setting("schema_version") == "5", "版本号直接升到最新（v1 → v5 连续迁移）")
+        check(await st3.get_setting("schema_version") == "6", "版本号直接升到最新（v1 → v6 连续迁移）")
         q = await st3.get_quota("user", "10001", "day")
         check(q is not None and q["limit_tokens"] == 1000 and "used_tokens" not in q,
               "限额保留、用量的列已移除")
@@ -449,7 +468,7 @@ async def main() -> int:
 
         st5 = Store(v2_path)
         await st5.open()
-        check(await st5.get_setting("schema_version") == "5", "版本号升到 5（v2 → v3 → v4 → v5 连续迁移）")
+        check(await st5.get_setting("schema_version") == "6", "版本号升到 6（v2 → v3 → v4 → v5 → v6 连续迁移）")
         lv = await st5.get_level(1)
         check(lv is not None and lv["name"] == "老等级", "v2 的等级数据保留")
         check(
@@ -469,6 +488,83 @@ async def main() -> int:
         check((await st6.get_level(1))["provider_id"] == "p1", "重开不会重复迁移、也不丢数据")
         await st6.close()
 
+    print("\n[12.1] v5 → v6 迁移（policy 加场景列、等级加群聊默认权限）")
+    with tempfile.TemporaryDirectory() as tmp5:
+        import aiosqlite
+
+        v5_path = str(Path(tmp5) / "v5.db")
+        raw = await aiosqlite.connect(v5_path)
+        await raw.executescript(
+            """
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL);
+            CREATE TABLE policy (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope_type  TEXT    NOT NULL,
+                scope_id    TEXT    NOT NULL,
+                feature     TEXT    NOT NULL DEFAULT 'llm',
+                effect      TEXT    NOT NULL,
+                note        TEXT    NOT NULL DEFAULT '',
+                updated_at  INTEGER NOT NULL,
+                UNIQUE (scope_type, scope_id, feature)
+            );
+            CREATE INDEX idx_policy_scope ON policy(scope_type, scope_id);
+            CREATE TABLE quota_level (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind                  TEXT    NOT NULL,
+                name                  TEXT    NOT NULL,
+                description           TEXT    NOT NULL DEFAULT '',
+                effect                TEXT    NOT NULL DEFAULT 'inherit',
+                command_effect        TEXT    NOT NULL DEFAULT 'inherit',
+                sort_order            INTEGER NOT NULL DEFAULT 0,
+                provider_id           TEXT    NOT NULL DEFAULT '',
+                fallback_provider_id  TEXT    NOT NULL DEFAULT '',
+                updated_at            INTEGER NOT NULL,
+                UNIQUE (kind, name)
+            );
+            """,
+        )
+        await raw.execute("INSERT INTO settings(key, value, updated_at) VALUES('schema_version', '5', 0)")
+        await raw.execute(
+            "INSERT INTO policy(scope_type, scope_id, feature, effect, note, updated_at) "
+            "VALUES('user', '10001', 'llm', 'deny', '', 0)"
+        )
+        await raw.execute(
+            "INSERT INTO policy(scope_type, scope_id, feature, effect, note, updated_at) "
+            "VALUES('group', '88888', 'llm', 'deny', '', 0)"
+        )
+        await raw.execute(
+            "INSERT INTO quota_level(kind, name, effect, command_effect, sort_order, updated_at) "
+            "VALUES('user', '老等级', 'deny', 'allow', 0, 0)"
+        )
+        await raw.commit()
+        await raw.close()
+
+        st8 = Store(v5_path)
+        await st8.open()
+        check(await st8.get_setting("schema_version") == "6", "版本号升到 6")
+        em = await st8.effect_map("user")
+        check(em == {"10001": {"": "deny"}}, f"旧规则落到「通用」场景（实得 {em}）")
+        check(await st8.resolve_policy("user", "10001", "llm", "group") == "deny",
+              "旧规则在群聊里照样生效（升级不改变既有行为）")
+        gm = await st8.effect_map("group")
+        check(gm == {"88888": {"": "deny"}}, "群规则同样保留")
+        lv = await st8.get_level(1)
+        check(lv["effect_group"] == "inherit" and lv["command_effect_group"] == "inherit",
+              "等级新增的群聊默认权限默认为 inherit（= 跟随主值）")
+        check(lv["effect"] == "deny" and lv["command_effect"] == "allow", "等级原有权限保留")
+        # 重建后的唯一键必须含 scene：同对象同 feature 能同时存「私聊」与「通用」
+        await st8.set_policy("user", "10001", "allow", feature="llm", scene="private")
+        check(len(await st8.list_policies(scope_type="user", feature="llm")) == 2,
+              "重建后的唯一键含 scene（同对象可存两条）")
+        check(await st8.resolve_policy("user", "10001", "llm", "private") == "allow", "私聊专属规则生效")
+        check(await st8.resolve_policy("user", "10001", "llm", "group") == "deny", "群聊仍按通用规则")
+        await st8.close()
+        st9 = Store(v5_path)
+        await st9.open()
+        check(await st9.get_setting("schema_version") == "6", "重开不会重复迁移")
+        check(await st9.resolve_policy("user", "10001", "llm", "private") == "allow", "重开后规则仍在")
+        await st9.close()
+
     print("\n[13] 指令规则（policy 的指令 feature 维度）")
     with tempfile.TemporaryDirectory() as tmp4:
         st7 = Store(str(Path(tmp4) / "cmd.db"))
@@ -477,11 +573,14 @@ async def main() -> int:
         await st7.set_policy("user", "10001", "allow", feature="command:help")
         await st7.set_policy("group", "88888", "deny", feature="command:draw")
         cp = await st7.command_policies()
-        check(cp["help"]["global"]["*"] == "deny", "全局指令规则可读写")
-        check(cp["help"]["user"]["10001"] == "allow", "好友指令规则可读写")
-        check(cp["draw"]["group"]["88888"] == "deny", "群指令规则可读写")
+        check(cp["help"]["global"]["*"][""] == "deny", "全局指令规则可读写（场景层 '' = 通用）")
+        check(cp["help"]["user"]["10001"][""] == "allow", "好友指令规则可读写")
+        check(cp["draw"]["group"]["88888"][""] == "deny", "群指令规则可读写")
         check(set(cp) == {"help", "draw"}, f"command_policies 只含指令 feature（实得 {sorted(cp)}）")
-        check(await st7.effect_map("global", feature="command:help") == {"*": "deny"}, "effect_map 支持任意 feature")
+        check(
+            await st7.effect_map("global", feature="command:help") == {"*": {"": "deny"}},
+            "effect_map 支持任意 feature（值为 {场景: 效果}）",
+        )
         check(len(await st7.list_policies(feature="command:help")) == 2, "按 feature 过滤")
         check(len(await st7.list_policies(feature="llm")) == 0, "指令规则不污染 llm feature")
         check(len(await st7.list_policies()) == 3, "不传 feature → 全部规则")
