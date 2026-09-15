@@ -769,6 +769,11 @@ class UserGatewayPlugin(Star):
             # 只记第一个：一条消息通常只对应一个主指令，全记会让榜单被同一条消息刷高。
             if allowed:
                 await self._log_command_used(subject, allowed[0])
+                # 兜底：指令的回复也算「bot 最后消息」（send 钩子失效时保底不断更）
+                try:
+                    await self._touch_bot_reply(event, "command", allowed[0])
+                except Exception as e:
+                    self._note_record_failure(e)
         except Exception:
             logger.exception("[UserGateway] 指令闸门异常，已放行（fail-open）")
 
@@ -940,6 +945,19 @@ class UserGatewayPlugin(Star):
             status="ok",
             latency_ms=latency_ms,
         )
+
+        # 兜底：send 钩子若被其它插件覆盖 / 发送路径变化，「最后回复」会停更——
+        # 这里在用量记账成功后顺带补一条 LLM 回复。send 钩子正常时两处写的是
+        # 同一会话、相邻时间戳，upsert 幂等；钩子失效时这里保证最后回复不断更。
+        try:
+            await self._touch_bot_reply(
+                event,
+                "llm",
+                "",
+                str(getattr(response, "completion_text", "") or ""),
+            )
+        except Exception as e:
+            self._note_record_failure(e)
 
         if total <= 0 or not self._cfg("quota_enabled", True):
             return
@@ -1406,6 +1424,7 @@ class UserGatewayPlugin(Star):
                 await asyncio.sleep(60)
                 await self._reset_stale_quotas()
                 self._notify_cooldown.prune()
+                await self._ensure_send_hook()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1487,6 +1506,24 @@ class UserGatewayPlugin(Star):
         except Exception:
             pass
 
+    async def _ensure_send_hook(self) -> None:
+        """确认「bot 最后消息」钩子还挂在类上。
+
+        其它插件若用同样手段 patch ``AstrMessageEvent.send`` 且**没有链式调用**
+        我们打过的补丁，钩子就会被顶掉——表现为「最后回复」从某一刻起停止更新。
+        维护循环每分钟检查一次，丢了就重新挂载并告警。
+        """
+        try:
+            from astrbot.core.platform.astr_message_event import AstrMessageEvent as _Event
+
+            if not getattr(_Event.send, "_ugw_hooked", False):
+                logger.warning(
+                    "[UserGateway] 「bot 最后消息」钩子被其它插件覆盖（最后回复会停更），已重新挂载"
+                )
+                self._install_send_hook()
+        except Exception:
+            pass
+
     @staticmethod
     def _classify_reply(event: AstrMessageEvent) -> tuple[str, str]:
         """判断这条 bot 消息属于哪一类：``llm`` / ``command`` / ``normal``。
@@ -1533,8 +1570,25 @@ class UserGatewayPlugin(Star):
         names = [type(c).__name__ for c in comps]
         return ("[" + "/".join(names[:3]) + "]") if names else ""
 
-    async def _record_bot_message(self, event: AstrMessageEvent, chain: Any) -> None:
-        """记录「bot 在某会话里的最后一条消息 + 类型」（每个会话只留最新一条）。"""
+    def _note_record_failure(self, e: Exception) -> None:
+        """「最后回复」记账失败的告警（5 分钟节流，避免刷日志）。"""
+        now = time.time()
+        if now - getattr(self, "_last_rec_fail_log", 0.0) > 300:
+            self._last_rec_fail_log = now
+            logger.warning(f"[UserGateway] 记录「bot 最后回复」失败（5 分钟内不再重复提示）: {e}")
+
+    async def _touch_bot_reply(
+        self,
+        event: AstrMessageEvent,
+        kind: str,
+        command: str = "",
+        preview: str = "",
+    ) -> None:
+        """把一条「bot 回复」记入最后消息表（send 钩子与用量 / 指令记账共用）。
+
+        私聊记在对方（好友）名下，群聊记在群名下；流式回复按段多次到达，
+        只接受更晚的时间戳（秒级，乱序旧段直接丢弃）。
+        """
         if not (self.store and self.store.ready):
             return
         if not self._cfg("track_bot_messages", True):
@@ -1547,7 +1601,6 @@ class UserGatewayPlugin(Star):
             sid = str(event.get_sender_id() or "")
         except Exception:
             sid = ""
-        # 私聊记在对方（好友）名下，群聊记在群名下
         scope_type, scope_id = ("group", gid) if gid else ("user", sid)
         if not scope_id:
             return
@@ -1556,10 +1609,7 @@ class UserGatewayPlugin(Star):
         except Exception:
             platform_id = ""
 
-        kind, command = self._classify_reply(event)
         ts = int(time.time())
-
-        # 流式回复按段多次调用 send，可能乱序到达 → 只接受更晚的时间戳
         key = f"{scope_type}:{scope_id}"
         if ts < self._bot_msg_seq.get(key, 0):
             return
@@ -1573,6 +1623,18 @@ class UserGatewayPlugin(Star):
             kind,
             ts=ts,
             command=command,
-            preview=self._chain_preview(chain),
+            preview=(preview or "")[:120],
             platform_id=platform_id,
         )
+
+    async def _record_bot_message(self, event: AstrMessageEvent, chain: Any) -> None:
+        """send 钩子入口：分类这条 bot 消息并记录（每个会话只留最新一条）。"""
+        if not (self.store and self.store.ready):
+            return
+        if not self._cfg("track_bot_messages", True):
+            return
+        kind, command = self._classify_reply(event)
+        try:
+            await self._touch_bot_reply(event, kind, command, self._chain_preview(chain))
+        except Exception as e:
+            self._note_record_failure(e)
