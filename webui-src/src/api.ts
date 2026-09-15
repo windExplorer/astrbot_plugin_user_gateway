@@ -458,7 +458,9 @@ export interface PolicyItem {
   feature: string;
 }
 
-/** 批量写权限规则（LLM 用 feature="llm"，指令用 feature="command:<指令名>"）。 */
+/** 批量写权限规则。``feature`` 三种取值：
+ *  ``"llm"`` = LLM 对话权限；``"command"`` = 对象级指令总权限；
+ *  ``"command:<指令名>"`` = 单条指令的规则。 */
 export function apiSetPolicy(items: PolicyItem[]) {
   return apiPost<{ applied: unknown[] }>("/policy", { items });
 }
