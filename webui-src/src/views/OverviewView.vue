@@ -13,6 +13,8 @@ import {
   NSpace,
   NSpin,
   NStatistic,
+  NTabPane,
+  NTabs,
   NTag,
   useMessage,
 } from "naive-ui";
@@ -31,6 +33,13 @@ function fmt(n: number | undefined | null): string {
   const v = Number(n || 0);
   if (v >= 1_000_000) return (v / 1_000_000).toFixed(2) + "M";
   if (v >= 1_000) return (v / 1_000).toFixed(1) + "K";
+  return String(v);
+}
+
+/** 坐标轴用的紧凑数值（不占位小数，避免 y 轴标签过宽被截断）。 */
+function fmtAxis(v: number): string {
+  if (v >= 1_000_000) return Number((v / 1_000_000).toFixed(1)) + "M";
+  if (v >= 1_000) return Number((v / 1_000).toFixed(1)) + "K";
   return String(v);
 }
 
@@ -64,11 +73,21 @@ const trendOption = computed(() => {
   return {
     tooltip: { trigger: "axis" },
     legend: { data: ["token", "调用次数", "被拒"], top: 0 },
-    grid: { left: 48, right: 48, top: 34, bottom: 30 },
+    // containLabel = 让 grid 自动给坐标轴标签让位，token 上到百万级标签也不再被截断
+    grid: { left: 8, right: 8, top: 36, bottom: 4, containLabel: true },
     xAxis: { type: "category", data: rows.map((r) => r.day), boundaryGap: false },
     yAxis: [
-      { type: "value", name: "token" },
-      { type: "value", name: "次数" },
+      {
+        type: "value",
+        name: "token",
+        axisLabel: { formatter: (v: number) => fmtAxis(v), hideOverlap: true },
+      },
+      {
+        type: "value",
+        name: "次数",
+        splitLine: { show: false },
+        axisLabel: { formatter: (v: number) => fmtAxis(v), hideOverlap: true },
+      },
     ],
     series: [
       {
@@ -174,7 +193,7 @@ const scopeColumns = [
         </n-grid-item>
       </n-grid>
 
-      <n-space justify="space-between" align="center" style="margin: 16px 0 10px">
+      <n-space justify="space-between" align="center" style="margin: 14px 0 0">
         <n-radio-group :value="range" size="small" @update:value="setRange">
           <n-radio-button value="1d">今日</n-radio-button>
           <n-radio-button value="7d">近 7 日</n-radio-button>
@@ -191,35 +210,42 @@ const scopeColumns = [
         </n-space>
       </n-space>
 
-      <n-card size="small" title="用量趋势">
-        <n-empty v-if="!data?.trend?.length" description="暂无数据（统计从 M1 的 LLM 钩子接入后开始记录）" />
-        <EChart v-else :option="trendOption" height="300px" />
-      </n-card>
-
-      <n-grid :cols="2" :x-gap="12" style="margin-top: 12px" item-responsive responsive="screen">
-        <n-grid-item span="2 m:1">
-          <n-card size="small" title="模型占比">
-            <n-empty v-if="!modelOption.series[0].data.length" description="暂无数据" />
-            <EChart v-else :option="modelOption" height="270px" />
+      <!-- 分成三个 Tab，避免一页从趋势图一路滚到榜单 -->
+      <n-tabs type="line" animated style="margin-top: 4px">
+        <n-tab-pane name="trend" tab="用量趋势">
+          <n-card size="small" :bordered="false" embedded>
+            <n-empty v-if="!data?.trend?.length" description="暂无数据（统计从 M1 的 LLM 钩子接入后开始记录）" />
+            <EChart v-else :option="trendOption" height="320px" />
           </n-card>
-        </n-grid-item>
-        <n-grid-item span="2 m:1">
-          <n-card size="small" title="拒绝原因分布">
-            <n-empty v-if="!denyOption.series[0].data.length" description="暂无拒绝记录" />
-            <EChart v-else :option="denyOption" height="270px" />
+        </n-tab-pane>
+        <n-tab-pane name="dist" tab="模型与拒绝">
+          <n-grid :cols="2" :x-gap="12" item-responsive responsive="screen">
+            <n-grid-item span="2 m:1">
+              <n-card size="small" title="模型占比" :bordered="false" embedded>
+                <n-empty v-if="!modelOption.series[0].data.length" description="暂无数据" />
+                <EChart v-else :option="modelOption" height="270px" />
+              </n-card>
+            </n-grid-item>
+            <n-grid-item span="2 m:1">
+              <n-card size="small" title="拒绝原因分布" :bordered="false" embedded>
+                <n-empty v-if="!denyOption.series[0].data.length" description="暂无拒绝记录" />
+                <EChart v-else :option="denyOption" height="270px" />
+              </n-card>
+            </n-grid-item>
+          </n-grid>
+        </n-tab-pane>
+        <n-tab-pane name="top" tab="用量 Top 对象">
+          <n-card size="small" :bordered="false" embedded>
+            <n-data-table
+              :columns="scopeColumns"
+              :data="data?.top_scopes || []"
+              :bordered="false"
+              size="small"
+              :max-height="360"
+            />
           </n-card>
-        </n-grid-item>
-      </n-grid>
-
-      <n-card size="small" title="用量 Top 对象" style="margin-top: 12px">
-        <n-data-table
-          :columns="scopeColumns"
-          :data="data?.top_scopes || []"
-          :bordered="false"
-          size="small"
-          :max-height="320"
-        />
-      </n-card>
+        </n-tab-pane>
+      </n-tabs>
     </n-spin>
   </n-space>
 </template>

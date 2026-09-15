@@ -21,6 +21,8 @@ import {
   NSelect,
   NSpace,
   NSpin,
+  NTabPane,
+  NTabs,
   NTag,
   NTooltip,
   useMessage,
@@ -59,6 +61,18 @@ const audits = ref<AuditRow[]>([]);
 const auditTotal = ref(0);
 const auditPage = ref(1);
 const auditSize = ref(20);
+
+// Tab 分区：指令维度 / 用量明细 / 操作审计。审计**懒加载**（第一次切过去才拉），
+// 初始只拉指令统计 + 明细，省一次查询也快一截。
+const tab = ref("commands");
+const auditLoaded = ref(false);
+
+async function onTabChange(name: string) {
+  if (name === "audit" && !auditLoaded.value) {
+    auditLoaded.value = true;
+    await loadAudit();
+  }
+}
 
 const csvOpen = ref(false);
 const csvName = ref("");
@@ -148,7 +162,9 @@ async function loadAudit() {
 async function loadAll() {
   loading.value = true;
   try {
-    await Promise.all([loadUsage(), loadStats(), loadAudit()]);
+    const jobs: Promise<void>[] = [loadUsage(), loadStats()];
+    if (auditLoaded.value) jobs.push(loadAudit());
+    await Promise.all(jobs);
   } finally {
     loading.value = false;
   }
@@ -460,80 +476,88 @@ const heatOption = computed(() => {
     </n-space>
 
     <n-spin :show="loading">
-      <n-grid :cols="2" :x-gap="12" :y-gap="12" item-responsive responsive="screen">
-        <n-grid-item span="2 m:1">
-          <n-card size="small" title="最常触发的指令">
-            <n-empty v-if="!stats?.top_ok?.length" description="暂无记录（可能没开「记录指令触发流水」）" />
-            <EChart v-else :option="okBar" height="300px" />
+      <!-- 三个 Tab 分区，避免「指令图表 → 热力图 → 明细 → 审计」一路滚到底 -->
+      <n-tabs v-model:value="tab" type="line" animated @update:value="onTabChange">
+        <n-tab-pane name="commands" tab="指令维度">
+          <n-grid :cols="2" :x-gap="12" :y-gap="12" item-responsive responsive="screen">
+            <n-grid-item span="2 m:1">
+              <n-card size="small" title="最常触发的指令" :bordered="false" embedded>
+                <n-empty v-if="!stats?.top_ok?.length" description="暂无记录（可能没开「记录指令触发流水」）" />
+                <EChart v-else :option="okBar" height="300px" />
+              </n-card>
+            </n-grid-item>
+            <n-grid-item span="2 m:1">
+              <n-card size="small" title="最常被拦的指令" :bordered="false" embedded>
+                <n-empty v-if="!stats?.top_denied?.length" description="暂无拦截记录" />
+                <EChart v-else :option="deniedBar" height="300px" />
+              </n-card>
+            </n-grid-item>
+          </n-grid>
+          <n-card size="small" title="LLM 活跃时段（24 小时 × 星期）" style="margin-top: 12px" :bordered="false" embedded>
+            <n-empty v-if="!stats?.heatmap?.length" description="暂无数据" />
+            <EChart v-else :option="heatOption" height="300px" />
           </n-card>
-        </n-grid-item>
-        <n-grid-item span="2 m:1">
-          <n-card size="small" title="最常被拦的指令">
-            <n-empty v-if="!stats?.top_denied?.length" description="暂无拦截记录" />
-            <EChart v-else :option="deniedBar" height="300px" />
+        </n-tab-pane>
+
+        <n-tab-pane name="usage" tab="用量明细">
+          <n-card size="small" :bordered="false" embedded>
+            <template #header>
+              <n-space align="center" :size="8">
+                <span>明细</span>
+                <n-tag size="small" :bordered="false">共 {{ total }} 条</n-tag>
+              </n-space>
+            </template>
+            <template #header-extra>
+              <n-select v-model:value="size" size="small" style="width: 108px" :options="sizeOptions" @update:value="search" />
+            </template>
+            <n-data-table
+              :columns="usageColumns"
+              :data="rows"
+              :bordered="false"
+              size="small"
+              :max-height="460"
+              :row-key="(r: UsageRow) => r.id"
+            />
+            <n-space justify="center" style="margin-top: 12px">
+              <n-pagination
+                v-model:page="page"
+                :page-count="Math.max(1, Math.ceil(total / size))"
+                :page-size="size"
+                @update:page="loadUsage"
+              >
+                <template #prefix="{ itemCount }">共 {{ itemCount }} 条</template>
+              </n-pagination>
+            </n-space>
           </n-card>
-        </n-grid-item>
-      </n-grid>
+        </n-tab-pane>
 
-      <n-card size="small" title="LLM 活跃时段（24 小时 × 星期）" style="margin-top: 12px">
-        <n-empty v-if="!stats?.heatmap?.length" description="暂无数据" />
-        <EChart v-else :option="heatOption" height="300px" />
-      </n-card>
-
-      <n-card size="small" style="margin-top: 12px">
-        <template #header>
-          <n-space align="center" :size="8">
-            <span>用量明细</span>
-            <n-tag size="small" :bordered="false">共 {{ total }} 条</n-tag>
-          </n-space>
-        </template>
-        <template #header-extra>
-          <n-select v-model:value="size" size="small" style="width: 108px" :options="sizeOptions" @update:value="search" />
-        </template>
-        <n-data-table
-          :columns="usageColumns"
-          :data="rows"
-          :bordered="false"
-          size="small"
-          :max-height="420"
-          :row-key="(r: UsageRow) => r.id"
-        />
-        <n-space justify="center" style="margin-top: 12px">
-          <n-pagination
-            v-model:page="page"
-            :page-count="Math.max(1, Math.ceil(total / size))"
-            :page-size="size"
-            @update:page="loadUsage"
-          >
-            <template #prefix="{ itemCount }">共 {{ itemCount }} 条</template>
-          </n-pagination>
-        </n-space>
-      </n-card>
-
-      <n-card size="small" style="margin-top: 12px">
-        <template #header>
-          <n-space align="center" :size="8">
-            <span>操作审计</span>
-            <n-tag size="small" :bordered="false">共 {{ auditTotal }} 条</n-tag>
-          </n-space>
-        </template>
-        <n-data-table
-          :columns="auditColumns"
-          :data="audits"
-          :bordered="false"
-          size="small"
-          :max-height="360"
-          :row-key="(r: AuditRow) => r.id"
-        />
-        <n-space justify="center" style="margin-top: 12px">
-          <n-pagination
-            v-model:page="auditPage"
-            :page-count="Math.max(1, Math.ceil(auditTotal / auditSize))"
-            :page-size="auditSize"
-            @update:page="loadAudit"
-          />
-        </n-space>
-      </n-card>
+        <n-tab-pane name="audit" tab="操作审计">
+          <n-card size="small" :bordered="false" embedded>
+            <template #header>
+              <n-space align="center" :size="8">
+                <span>审计</span>
+                <n-tag size="small" :bordered="false">共 {{ auditTotal }} 条</n-tag>
+              </n-space>
+            </template>
+            <n-data-table
+              :columns="auditColumns"
+              :data="audits"
+              :bordered="false"
+              size="small"
+              :max-height="460"
+              :row-key="(r: AuditRow) => r.id"
+            />
+            <n-space justify="center" style="margin-top: 12px">
+              <n-pagination
+                v-model:page="auditPage"
+                :page-count="Math.max(1, Math.ceil(auditTotal / auditSize))"
+                :page-size="auditSize"
+                @update:page="loadAudit"
+              />
+            </n-space>
+          </n-card>
+        </n-tab-pane>
+      </n-tabs>
     </n-spin>
 
     <n-modal v-model:show="csvOpen" preset="card" :title="`导出内容：${csvName}`" style="width: 720px">
