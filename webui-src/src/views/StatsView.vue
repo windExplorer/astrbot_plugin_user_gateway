@@ -40,6 +40,7 @@ import {
   type UsageRow,
 } from "../api";
 import EChart from "../EChart.vue";
+import SubjectAvatar from "../components/SubjectAvatar.vue";
 
 const message = useMessage();
 const loading = ref(false);
@@ -272,11 +273,23 @@ const usageColumns: DataTableColumns<UsageRow> = [
   {
     title: "对象",
     key: "scope_id",
-    width: 150,
+    width: 190,
     render: (r) =>
-      h("div", { style: "line-height:1.35" }, [
-        h("div", { style: "font-size:12.5px" }, `${String(r.scope_type) === "group" ? "群" : "好友"} ${r.scope_id || "-"}`),
-        h("div", { style: "font-size:11.5px;opacity:.6" }, `发起人 ${r.sender_id || "-"}`),
+      h("div", { style: "display:flex;align-items:center;gap:8px;min-width:0" }, [
+        h(SubjectAvatar, {
+          kind: String(r.scope_type) === "group" ? "group" : "user",
+          id: r.scope_id,
+          name: r.scope_name,
+          size: 28,
+        }),
+        h("div", { style: "line-height:1.3;min-width:0" }, [
+          h(
+            "div",
+            { style: "font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" },
+            r.scope_name || `${String(r.scope_type) === "group" ? "群" : "好友"} ${r.scope_id || "-"}`,
+          ),
+          h("div", { style: "font-size:11.5px;opacity:.6" }, `发起人 ${r.sender_id || "-"}`),
+        ]),
       ]),
   },
   {

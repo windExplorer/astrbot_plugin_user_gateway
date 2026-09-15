@@ -1298,9 +1298,12 @@ class Store:
         ) as cur:
             totals = dict(await cur.fetchone() or {})
 
-        # 按本地日分桶的趋势
+        # 按本地时间分桶的趋势：跨度 ≤ 48h 用**小时桶**（今日视图的 x 轴是「小时:00」，
+        # 不然一整天只有一个点），更长跨度按天
+        hourly = (int(to_ts) - int(from_ts)) <= 48 * 3600
+        bucket = "%H:00" if hourly else "%Y-%m-%d"
         async with db.execute(
-            f"""SELECT strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime') AS day,
+            f"""SELECT strftime('{bucket}', ts, 'unixepoch', 'localtime') AS day,
                        COALESCE(SUM(tok_in_other + tok_in_cached + tok_out), 0) AS tokens,
                        SUM(CASE WHEN kind = 'llm' THEN 1 ELSE 0 END) AS calls,
                        SUM(CASE WHEN status = 'denied' THEN 1 ELSE 0 END) AS denied
@@ -1350,6 +1353,38 @@ class Store:
             "by_model": by_model,
             "deny_reasons": deny_reasons,
         }
+
+    async def subject_name_map(
+        self, user_ids: Iterable[str], group_ids: Iterable[str]
+    ) -> dict[str, str]:
+        """批量取展示名：``{scope_id: 名称}``。
+
+        好友 = 备注优先、其次昵称；群 = 群名。给总览榜 / 用量明细的「对象」列用
+        —— 只有一串 QQ 号 / 群号看不出是谁。查不到的 id 不进结果，前端回退显示 id。
+        """
+        out: dict[str, str] = {}
+        uids = sorted({str(u).strip() for u in user_ids if str(u or "").strip()})
+        gids = sorted({str(g).strip() for g in group_ids if str(g or "").strip()})
+        db = self._conn()
+        if uids:
+            marks = ",".join("?" * len(uids))
+            async with db.execute(
+                f"SELECT uin, COALESCE(NULLIF(remark, ''), NULLIF(nickname, '')) AS name "
+                f"FROM friend_cache WHERE uin IN ({marks})",
+                uids,
+            ) as cur:
+                for r in await cur.fetchall():
+                    if r["name"]:
+                        out.setdefault(str(r["uin"]), str(r["name"]))
+        if gids:
+            marks = ",".join("?" * len(gids))
+            async with db.execute(
+                f"SELECT group_id, name FROM group_cache WHERE group_id IN ({marks})", gids
+            ) as cur:
+                for r in await cur.fetchall():
+                    if r["name"]:
+                        out.setdefault(str(r["group_id"]), str(r["name"]))
+        return out
 
     async def usage_sums(self, column: str, from_ts: int, to_ts: int) -> dict[str, int]:
         """按某个维度列聚合区间内的 token 总量，返回 ``{值: tokens}``。

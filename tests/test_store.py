@@ -167,7 +167,8 @@ async def main() -> int:
         check(t["tok_total"] == 541, f"tok_total = {t['tok_total']}（期望 541）")
         check(t["users"] == 2, f"活跃用户 = {t['users']}（期望 2）")
         check(t["groups"] == 1, f"活跃群 = {t['groups']}（期望 1）")
-        check(len(s["trend"]) == 1, f"趋势按天分桶 = {len(s['trend'])} 天")
+        check(len(s["trend"]) == 1, f"短区间趋势分桶 = {len(s['trend'])} 桶（≤48h 按小时）")
+        check(":" in str(s["trend"][0]["day"]), "短区间的 x 轴标签是「小时:00」（今日视图用）")
         check(s["trend"][0]["tokens"] == 541, "趋势当日 token")
         check(any(r["reason"] == "quota" for r in s["deny_reasons"]), "拒绝原因含 quota")
         check(any(r["model"] == "gpt-4o" for r in s["by_model"]), "模型占比含 gpt-4o")
@@ -270,6 +271,13 @@ async def main() -> int:
         check(await st.get_friend("77777") is None, "不存在的 QQ → None")
         g1 = await st.get_group("88888")
         check(g1 is not None and g1["name"] == "测试群" and g1["owner"] == "10001", "get_group 字段完整")
+
+        # 展示名批量映射（总览榜 / 明细的「对象」列用）
+        nm = await st.subject_name_map(["10001", "10002", "77777"], ["88888", "1"])
+        check(nm.get("10001") == "同事", "好友展示名 = 备注优先")
+        check(nm.get("10002") == "小红", "没有备注 → 昵称")
+        check(nm.get("88888") == "测试群", "群展示名 = 群名")
+        check("77777" not in nm and "1" not in nm, "查不到的 id 不进结果（前端回退显示 id）")
 
         print("\n[7] 超期清理与审计")
         await st.log_usage(ts=now - 400 * 86400, scope_type="user", scope_id="10001", status="ok")

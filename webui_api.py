@@ -480,6 +480,17 @@ async def h_overview(plugin) -> dict:
     from_ts, to_ts = _range_bounds(_q("range", "7d"), _q("from"), _q("to"))
     data = await plugin.store.summary(from_ts, to_ts)
     data["range_key"] = _q("range", "7d")
+    # 榜单补展示名（备注 / 昵称 / 群名）——只有 id 看不出是谁
+    try:
+        scopes = data.get("top_scopes") or []
+        names = await plugin.store.subject_name_map(
+            [r.get("scope_id") for r in scopes if r.get("scope_type") == "user"],
+            [r.get("scope_id") for r in scopes if r.get("scope_type") == "group"],
+        )
+        for r in scopes:
+            r["name"] = names.get(str(r.get("scope_id") or ""), "")
+    except Exception as e:
+        logger.warning(f"[UserGateway] 补榜单展示名失败（忽略）: {e}")
     try:
         data["bot"] = await plugin.store.bot_message_summary(from_ts, to_ts)
     except Exception as e:
@@ -1030,6 +1041,17 @@ async def h_usage(plugin) -> dict:
     )
     res["page"] = _qi("page", 1, 1, 10**6)
     res["size"] = _qi("size", 50, 1, 500)
+    # 明细行补「对象」的展示名（一页最多几百行，按 id 批量查两次缓存表即可）
+    try:
+        rows = res.get("rows") or []
+        names = await plugin.store.subject_name_map(
+            [r.get("scope_id") for r in rows if r.get("scope_type") == "user"],
+            [r.get("scope_id") for r in rows if r.get("scope_type") == "group"],
+        )
+        for r in rows:
+            r["scope_name"] = names.get(str(r.get("scope_id") or ""), "")
+    except Exception as e:
+        logger.warning(f"[UserGateway] 补明细展示名失败（忽略）: {e}")
     return ok(res)
 
 

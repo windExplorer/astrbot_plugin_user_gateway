@@ -176,7 +176,7 @@ export interface SummaryData {
   range_key: string;
   totals: SummaryTotals;
   trend: { day: string; tokens: number; calls: number; denied: number }[];
-  top_scopes: { scope_type: string; scope_id: string; tokens: number; events: number }[];
+  top_scopes: { scope_type: string; scope_id: string; name?: string; tokens: number; events: number }[];
   by_model: { model: string; tokens: number }[];
   deny_reasons: { reason: string; cnt: number }[];
   /** bot 最后消息概况（M2）：最近回过话的会话数与类型分布 */
@@ -588,6 +588,8 @@ export interface UsageRow {
   command_name: string;
   scope_type: string;
   scope_id: string;
+  /** 对象的展示名（备注 / 昵称 / 群名；查不到为空，前端回退显示 id） */
+  scope_name?: string;
   sender_id: string;
   group_id: string;
   provider_id: string;

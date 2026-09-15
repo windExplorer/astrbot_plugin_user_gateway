@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// 总览：区间指标卡 + 趋势 / 模型占比 / 拒绝原因 / 活跃对象榜单。
-import { computed, onMounted, ref } from "vue";
+// 总览：区间指标卡 + 趋势 + 「模型与拒绝 / 用量 Top」左右分栏。
+import { computed, h, onMounted, ref } from "vue";
 import {
   NButton,
   NCard,
@@ -17,10 +17,12 @@ import {
   NTabs,
   NTag,
   useMessage,
+  type DataTableColumns,
 } from "naive-ui";
 
 import { apiGet, type SummaryData } from "../api";
 import EChart from "../EChart.vue";
+import SubjectAvatar from "../components/SubjectAvatar.vue";
 
 const message = useMessage();
 const loading = ref(false);
@@ -139,11 +141,43 @@ const denyOption = computed(() => {
   };
 });
 
-const scopeColumns = [
-  { title: "类型", key: "scope_type", width: 90 },
-  { title: "对象", key: "scope_id" },
-  { title: "token", key: "tokens", width: 110 },
-  { title: "事件数", key: "events", width: 90 },
+/** Top 对象榜：头像 + 名称（备注 / 群名，查不到回退 id）+ 友好 token + 中文类型。 */
+const scopeColumns: DataTableColumns<any> = [
+  {
+    title: "对象",
+    key: "scope_id",
+    minWidth: 160,
+    render: (r) =>
+      h("div", { style: "display:flex;align-items:center;gap:8px;min-width:0" }, [
+        h(SubjectAvatar, {
+          kind: r.scope_type === "group" ? "group" : "user",
+          id: r.scope_id,
+          name: r.name,
+          size: 28,
+        }),
+        h("div", { style: "line-height:1.3;min-width:0" }, [
+          h(
+            "div",
+            { style: "font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" },
+            r.name || r.scope_id,
+          ),
+          h("div", { style: "font-size:11.5px;opacity:.6" }, r.scope_id),
+        ]),
+      ]),
+  },
+  {
+    title: "类型",
+    key: "scope_type",
+    width: 64,
+    render: (r) => (String(r.scope_type) === "group" ? "群聊" : "好友"),
+  },
+  {
+    title: "token",
+    key: "tokens",
+    width: 88,
+    render: (r) => fmt(r.tokens),
+  },
+  { title: "事件", key: "events", width: 64 },
 ];
 </script>
 
@@ -210,42 +244,40 @@ const scopeColumns = [
         </n-space>
       </n-space>
 
-      <!-- 分成三个 Tab，避免一页从趋势图一路滚到榜单 -->
-      <n-tabs type="line" animated style="margin-top: 4px">
-        <n-tab-pane name="trend" tab="用量趋势">
-          <n-card size="small" :bordered="false" embedded>
-            <n-empty v-if="!data?.trend?.length" description="暂无数据（统计从 M1 的 LLM 钩子接入后开始记录）" />
-            <EChart v-else :option="trendOption" height="320px" />
-          </n-card>
-        </n-tab-pane>
-        <n-tab-pane name="dist" tab="模型与拒绝">
-          <n-grid :cols="2" :x-gap="12" item-responsive responsive="screen">
-            <n-grid-item span="2 m:1">
-              <n-card size="small" title="模型占比" :bordered="false" embedded>
+      <!-- 用量趋势独占一块（今日视图 x 轴是小时:00） -->
+      <n-card size="small" title="用量趋势" style="margin-top: 14px">
+        <n-empty v-if="!data?.trend?.length" description="暂无数据（统计从 M1 的 LLM 钩子接入后开始记录）" />
+        <EChart v-else :option="trendOption" height="300px" />
+      </n-card>
+
+      <!-- 左右均分：左 = 模型与拒绝（内部分 Tab），右 = 用量 Top 对象 -->
+      <n-grid :cols="2" :x-gap="12" style="margin-top: 12px" item-responsive responsive="screen">
+        <n-grid-item span="2 m:1">
+          <n-card size="small" title="模型与拒绝">
+            <n-tabs type="segment" size="small" animated>
+              <n-tab-pane name="model" tab="模型占比">
                 <n-empty v-if="!modelOption.series[0].data.length" description="暂无数据" />
-                <EChart v-else :option="modelOption" height="270px" />
-              </n-card>
-            </n-grid-item>
-            <n-grid-item span="2 m:1">
-              <n-card size="small" title="拒绝原因分布" :bordered="false" embedded>
+                <EChart v-else :option="modelOption" height="262px" />
+              </n-tab-pane>
+              <n-tab-pane name="deny" tab="拒绝原因分布">
                 <n-empty v-if="!denyOption.series[0].data.length" description="暂无拒绝记录" />
-                <EChart v-else :option="denyOption" height="270px" />
-              </n-card>
-            </n-grid-item>
-          </n-grid>
-        </n-tab-pane>
-        <n-tab-pane name="top" tab="用量 Top 对象">
-          <n-card size="small" :bordered="false" embedded>
+                <EChart v-else :option="denyOption" height="262px" />
+              </n-tab-pane>
+            </n-tabs>
+          </n-card>
+        </n-grid-item>
+        <n-grid-item span="2 m:1">
+          <n-card size="small" title="用量 Top 对象">
             <n-data-table
               :columns="scopeColumns"
               :data="data?.top_scopes || []"
               :bordered="false"
               size="small"
-              :max-height="360"
+              :max-height="300"
             />
           </n-card>
-        </n-tab-pane>
-      </n-tabs>
+        </n-grid-item>
+      </n-grid>
     </n-spin>
   </n-space>
 </template>
