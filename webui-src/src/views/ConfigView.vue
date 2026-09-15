@@ -31,7 +31,7 @@ const ping = ref<PingInfo | null>(null);
 const GROUPS: { name: string; hint: string; keys: string[] }[] = [
   { name: "总开关", hint: "整个插件与各功能模块的开关", keys: ["enabled", "llm_guard_enabled", "quota_enabled", "stats_enabled"] },
   { name: "策略", hint: "默认放行还是默认禁止、管理员是否豁免", keys: ["default_effect", "admin_exempt"] },
-  { name: "指令权限", hint: "指令的黑白名单（具体规则在「指令」页配置）", keys: ["command_guard_enabled", "default_command_effect", "command_deny_notice", "command_guard_priority"] },
+  { name: "指令权限", hint: "指令的黑白名单（具体规则在「指令」页配置）", keys: ["command_guard_enabled", "default_command_effect", "command_deny_notice", "command_guard_priority", "track_command_usage"] },
   { name: "拒绝行为", hint: "被拦截时如何提示用户与管理员", keys: ["deny_notice", "silent", "notice_cooldown_sec", "notify_admin"] },
   { name: "额度", hint: "token 限额的计数口径与工作模式", keys: ["quota_mode", "count_cached_tokens", "warn_ratio"] },
   { name: "同步", hint: "好友 / 群列表的同步与头像", keys: ["sync_interval_min", "sync_timeout_sec", "load_avatars", "avatar_source", "avatar_cache_days", "avatar_timeout_sec"] },

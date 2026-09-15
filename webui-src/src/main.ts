@@ -3,6 +3,7 @@ import { createRouter, createWebHashHistory } from "vue-router";
 
 import App from "./App.vue";
 import OverviewView from "./views/OverviewView.vue";
+import StatsView from "./views/StatsView.vue";
 import FriendsView from "./views/FriendsView.vue";
 import GroupsView from "./views/GroupsView.vue";
 import QuotaView from "./views/QuotaView.vue";
@@ -15,6 +16,7 @@ const router = createRouter({
   routes: [
     { path: "/", redirect: "/overview" },
     { path: "/overview", name: "overview", component: OverviewView },
+    { path: "/stats", name: "stats", component: StatsView },
     { path: "/friends", name: "friends", component: FriendsView },
     { path: "/groups", name: "groups", component: GroupsView },
     { path: "/quota", name: "quota", component: QuotaView },

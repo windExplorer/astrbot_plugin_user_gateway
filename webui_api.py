@@ -433,8 +433,14 @@ async def h_friends(plugin) -> dict:
     platform = _q("platform") or None
     kw = _q("q")
     effect_filter = _q("effect")
+    # LLM 权限与指令权限是两套规则，所以支持分别过滤（都命中才算通过）
+    cmd_filter = _q("effect_command")
 
-    full = sort in ("usage", "name", "qq", "level", "last") or effect_filter in ("allow", "deny", "inherit")
+    full = (
+        sort in ("usage", "name", "qq", "level", "last")
+        or effect_filter in ("allow", "deny", "inherit")
+        or cmd_filter in ("allow", "deny", "inherit")
+    )
     if full:
         res = await plugin.store.list_friends(platform_id=platform, keyword=kw, limit=5000, offset=0)
     else:
@@ -448,6 +454,8 @@ async def h_friends(plugin) -> dict:
 
     if effect_filter in ("allow", "deny", "inherit"):
         rows = [r for r in rows if str(r.get("effect") or "inherit") == effect_filter]
+    if cmd_filter in ("allow", "deny", "inherit"):
+        rows = [r for r in rows if str(r.get("effect_command") or "inherit") == cmd_filter]
 
     if sort == "usage":
         rows.sort(key=lambda r: int(r.get("today_tokens") or 0), reverse=True)
@@ -477,10 +485,12 @@ async def h_groups(plugin) -> dict:
     platform = _q("platform") or None
     kw = _q("q")
     effect_filter = _q("effect")
+    cmd_filter = _q("effect_command")
 
     full = (
         sort in ("usage", "name", "group", "size", "level", "last")
         or effect_filter in ("allow", "deny", "inherit")
+        or cmd_filter in ("allow", "deny", "inherit")
     )
     if full:
         res = await plugin.store.list_groups(platform_id=platform, keyword=kw, limit=5000, offset=0)
@@ -495,6 +505,8 @@ async def h_groups(plugin) -> dict:
 
     if effect_filter in ("allow", "deny", "inherit"):
         rows = [r for r in rows if str(r.get("effect") or "inherit") == effect_filter]
+    if cmd_filter in ("allow", "deny", "inherit"):
+        rows = [r for r in rows if str(r.get("effect_command") or "inherit") == cmd_filter]
 
     if sort == "usage":
         rows.sort(key=lambda r: int(r.get("today_tokens") or 0), reverse=True)
@@ -801,6 +813,52 @@ async def h_usage(plugin) -> dict:
     res["page"] = _qi("page", 1, 1, 10**6)
     res["size"] = _qi("size", 50, 1, 500)
     return ok(res)
+
+
+async def h_usage_export(plugin) -> dict:
+    """导出用量明细为 CSV。
+
+    走桥接（``apiGet``）而不是直接下载：控制台页面跑在 sandbox iframe 里，
+    拿不到可下载的 URL，所以后端返回 ``{filename, content}``，前端用 Blob 落地。
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    from_ts, to_ts = _range_bounds(_q("range", "7d"), _q("from"), _q("to"))
+    try:
+        content = await plugin.store.export_usage_csv(
+            from_ts=from_ts,
+            to_ts=to_ts,
+            scope_type=_q("scope_type") or None,
+            scope_id=_q("scope_id") or None,
+            sender_id=_q("sender_id") or None,
+            status=_q("status") or None,
+            kind=_q("kind") or None,
+        )
+    except Exception as e:
+        logger.error(f"[UserGateway] 导出明细失败: {e}")
+        return err(f"导出失败：{e}")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return ok({"filename": f"user_gateway_usage_{stamp}.csv", "content": content})
+
+
+async def h_stats_commands(plugin) -> dict:
+    """指令维度统计：最常触发 / 最常被拦 Top N + 时段热力图（24h × 7d）。"""
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    from_ts, to_ts = _range_bounds(_q("range", "7d"), _q("from"), _q("to"))
+    limit = _qi("limit", 10, 1, 50)
+    top_ok = await plugin.store.top_commands(from_ts, to_ts, status="ok", limit=limit)
+    top_denied = await plugin.store.top_commands(from_ts, to_ts, status="denied", limit=limit)
+    heat = await plugin.store.hour_heatmap(from_ts, to_ts, kind=_q("heat_kind", "llm") or "llm")
+    return ok(
+        {
+            "range": {"from": from_ts, "to": to_ts},
+            "top_ok": top_ok,
+            "top_denied": top_denied,
+            "heatmap": heat,
+            "track_enabled": bool(plugin._cfg("track_command_usage", True)),
+        },
+    )
 
 
 async def h_audit(plugin) -> dict:
@@ -1230,6 +1288,8 @@ def register_apis(plugin) -> None:
         ("/avatars", h_avatars, ["GET"]),
         ("/avatars/refresh", h_avatars_refresh, ["POST"]),
         ("/usage", h_usage, ["GET"]),
+        ("/usage/export", h_usage_export, ["GET"]),
+        ("/stats/commands", h_stats_commands, ["GET"]),
         ("/audit", h_audit, ["GET"]),
     ]
     for path, fn, methods in routes:

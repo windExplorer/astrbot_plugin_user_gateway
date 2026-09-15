@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import time
 from typing import Any, Iterable, Optional
 
@@ -971,6 +973,115 @@ class Store:
                 parts.append(f"{col} = ?")
                 args.append(str(val))
         return (" WHERE " + " AND ".join(parts)) if parts else "", args
+
+    async def top_commands(
+        self,
+        from_ts: int,
+        to_ts: int,
+        *,
+        status: str = "ok",
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """指令维度排行：``[{command, cnt}]``。
+
+        ``status='ok'`` 取「最常触发的指令」，``status='denied'`` 取「最常被拦的指令」。
+        只统计 ``kind='command'`` 的流水，与 LLM 的口径完全分开。
+        """
+        async with self._conn().execute(
+            """SELECT command_name AS command, COUNT(*) AS cnt
+               FROM usage_log
+               WHERE kind = 'command' AND status = ? AND ts >= ? AND ts <= ? AND command_name <> ''
+               GROUP BY command_name ORDER BY cnt DESC, command_name LIMIT ?""",
+            (str(status), int(from_ts), int(to_ts), int(limit)),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def hour_heatmap(
+        self,
+        from_ts: int,
+        to_ts: int,
+        *,
+        kind: str = "llm",
+    ) -> list[dict[str, Any]]:
+        """时段热力图：``[{dow, hour, cnt}]``。
+
+        ``dow`` 用 SQLite 的 ``%w``（0 = 周日），``hour`` 为 0–23，均按**本地时间**分桶
+        （与趋势图同口径，避免 Python 侧时区换算）。前端按 7×24 网格填充。
+        """
+        async with self._conn().execute(
+            """SELECT CAST(strftime('%w', ts, 'unixepoch', 'localtime') AS INTEGER) AS dow,
+                      CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+                      COUNT(*) AS cnt
+               FROM usage_log
+               WHERE kind = ? AND ts >= ? AND ts <= ?
+               GROUP BY dow, hour""",
+            (str(kind), int(from_ts), int(to_ts)),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def export_usage_csv(
+        self,
+        *,
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        scope_type: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        sender_id: Optional[str] = None,
+        status: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: int = 50000,
+    ) -> str:
+        """把明细导出成 CSV 文本（后端生成，避免前端一次性拉全量）。
+
+        细节：
+        - 开头加 **UTF-8 BOM**，否则 Excel 打开中文会乱码（Windows 上的经典坑）；
+        - 时间列输出本地时间字符串，方便直接看；
+        - 行数上限 ``limit``（默认 5 万）防御性兜底，避免内存与响应体爆掉。
+        """
+        where, args = self._usage_where(from_ts, to_ts, scope_type, scope_id, sender_id, status, kind)
+        async with self._conn().execute(
+            f"SELECT * FROM usage_log{where} ORDER BY ts DESC, id DESC LIMIT ?",
+            [*args, int(limit)],
+        ) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+
+        head = [
+            "时间", "类型", "状态", "拒绝原因", "指令", "对象类型", "对象", "发起人",
+            "群", "模型", "输入", "缓存", "输出", "合计", "估算", "延迟ms",
+        ]
+        buf = io.StringIO()
+        buf.write("\ufeff")  # BOM：Excel 打开中文不乱码
+        writer = csv.writer(buf)
+        writer.writerow(head)
+        for r in rows:
+            total = (
+                int(r.get("tok_in_other") or 0)
+                + int(r.get("tok_in_cached") or 0)
+                + int(r.get("tok_out") or 0)
+            )
+            writer.writerow(
+                [
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(r.get("ts") or 0))),
+                    "LLM" if str(r.get("kind")) == "llm" else "指令",
+                    "被拒"
+                    if str(r.get("status")) == "denied"
+                    else ("失败" if str(r.get("status")) == "error" else "正常"),
+                    str(r.get("deny_reason") or ""),
+                    str(r.get("command_name") or ""),
+                    "群" if str(r.get("scope_type")) == "group" else "好友",
+                    str(r.get("scope_id") or ""),
+                    str(r.get("sender_id") or ""),
+                    str(r.get("group_id") or ""),
+                    str(r.get("model") or ""),
+                    int(r.get("tok_in_other") or 0),
+                    int(r.get("tok_in_cached") or 0),
+                    int(r.get("tok_out") or 0),
+                    total,
+                    1 if int(r.get("estimated") or 0) else 0,
+                    int(r.get("latency_ms") or 0),
+                ],
+            )
+        return buf.getvalue()
 
     async def summary(self, from_ts: int, to_ts: int) -> dict[str, Any]:
         """区间总览：总量、分项、趋势、榜单、拒绝原因。供控制台总览页使用。"""

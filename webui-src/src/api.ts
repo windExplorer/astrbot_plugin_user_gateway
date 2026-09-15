@@ -517,3 +517,91 @@ export interface ConfigPayload {
   items: Record<string, any>;
   schema: Record<string, any>;
 }
+
+// ---------------------------------------------------------------- 统计
+
+/** 一条用量 / 事件流水（LLM 调用、被拒、指令触发与被拦都走这张表）。 */
+export interface UsageRow {
+  id: number;
+  ts: number;
+  kind: "llm" | "command" | string;
+  status: "ok" | "denied" | "error" | string;
+  deny_reason: string;
+  command_name: string;
+  scope_type: string;
+  scope_id: string;
+  sender_id: string;
+  group_id: string;
+  provider_id: string;
+  model: string;
+  tok_in_other: number;
+  tok_in_cached: number;
+  tok_out: number;
+  estimated: number;
+  latency_ms: number;
+}
+
+/** 明细查询条件（也用于导出，保证「看到的」和「导出的」一致）。 */
+export interface UsageFilter {
+  range?: "1d" | "7d" | "30d";
+  kind?: string;
+  status?: string;
+  scope_type?: string;
+  scope_id?: string;
+  sender_id?: string;
+  page?: number;
+  size?: number;
+}
+
+function usageQuery(f: UsageFilter): string {
+  const p = new URLSearchParams();
+  p.set("range", f.range || "7d");
+  for (const k of ["kind", "status", "scope_type", "scope_id", "sender_id"] as const) {
+    const v = f[k];
+    if (v) p.set(k, String(v));
+  }
+  p.set("page", String(f.page || 1));
+  p.set("size", String(f.size || 50));
+  return p.toString();
+}
+
+/** 用量明细（分页）。 */
+export function apiUsage(f: UsageFilter = {}) {
+  return apiGet<{ total: number; rows: UsageRow[]; page: number; size: number }>(
+    `/usage?${usageQuery(f)}`,
+  );
+}
+
+/** 导出用量明细为 CSV。后端返回文本内容，由前端用 Blob 落地（桥接下无法直接下载 URL）。 */
+export function apiExportUsage(f: UsageFilter = {}) {
+  return apiGet<{ filename: string; content: string }>(`/usage/export?${usageQuery(f)}`, 60000);
+}
+
+/** 指令维度统计：最常触发 / 最常被拦 Top 榜 + 24h×7d 时段热力图。 */
+export interface CommandStats {
+  range: { from: number; to: number };
+  top_ok: { command: string; cnt: number }[];
+  top_denied: { command: string; cnt: number }[];
+  heatmap: { dow: number; hour: number; cnt: number }[];
+  /** 「记录指令触发流水」开关，关闭时 Top 榜只有被拦记录 */
+  track_enabled: boolean;
+}
+
+export function apiCommandStats(range: "1d" | "7d" | "30d" = "7d", limit = 10) {
+  return apiGet<CommandStats>(`/stats/commands?range=${range}&limit=${limit}`);
+}
+
+/** 管理员操作审计（谁在什么时候改了什么规则）。 */
+export interface AuditRow {
+  id: number;
+  ts: number;
+  actor: string;
+  action: string;
+  payload: string;
+}
+
+export function apiAudit(page = 1, size = 50) {
+  return apiGet<{ total: number; rows: AuditRow[]; page: number; size: number }>(
+    `/audit?page=${page}&size=${size}`,
+  );
+}

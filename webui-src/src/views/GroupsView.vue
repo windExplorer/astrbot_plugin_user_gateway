@@ -32,6 +32,7 @@ import {
 } from "../api";
 import { dropAvatars, loadAvatars } from "../avatarStore";
 import EffectSegment from "../components/EffectSegment.vue";
+import PermissionHelp from "../components/PermissionHelp.vue";
 import SubjectAvatar from "../components/SubjectAvatar.vue";
 import SubjectDrawer from "../components/SubjectDrawer.vue";
 
@@ -45,6 +46,7 @@ const page = ref(1);
 const size = ref(50);
 const keyword = ref("");
 const effectFilter = ref("");
+const cmdFilter = ref("");
 const sort = ref("active");
 const checked = ref<string[]>([]);
 const levels = ref<LevelRow[]>([]);
@@ -102,7 +104,9 @@ async function load() {
   try {
     const res = await apiGet<Paged<GroupRow>>(
       `/groups?page=${page.value}&size=${size.value}&sort=${sort.value}` +
-        `&effect=${encodeURIComponent(effectFilter.value)}&q=${encodeURIComponent(keyword.value)}`,
+        `&effect=${encodeURIComponent(effectFilter.value)}` +
+        `&effect_command=${encodeURIComponent(cmdFilter.value)}` +
+        `&q=${encodeURIComponent(keyword.value)}`,
     );
     rows.value = res.rows || [];
     total.value = res.total || 0;
@@ -375,12 +379,13 @@ onMounted(async () => {
 </script>
 
 <template>
-  <n-card size="small">
+  <permission-help kind="group" />
+
+  <n-card size="small" style="margin-top: 12px">
     <template #header>
       <n-space align="center" :size="10">
         <span>群聊</span>
         <n-tag size="small" :bordered="false">{{ total }} 个</n-tag>
-        <n-tag size="small" type="info" :bordered="false">群成员级管控将在 M3 上线</n-tag>
       </n-space>
     </template>
     <template #header-extra>
@@ -394,10 +399,16 @@ onMounted(async () => {
           @keyup.enter="search"
         />
         <select v-model="effectFilter" class="plain-select" @change="search">
-          <option value="">全部权限</option>
-          <option value="allow">放行</option>
-          <option value="deny">禁止</option>
-          <option value="inherit">继承</option>
+          <option value="">全部 LLM 权限</option>
+          <option value="allow">LLM 放行</option>
+          <option value="deny">LLM 禁止</option>
+          <option value="inherit">LLM 继承</option>
+        </select>
+        <select v-model="cmdFilter" class="plain-select" @change="search">
+          <option value="">全部指令权限</option>
+          <option value="allow">指令放行</option>
+          <option value="deny">指令禁止</option>
+          <option value="inherit">指令继承</option>
         </select>
         <n-select
           v-model:value="sort"

@@ -680,11 +680,12 @@ class UserGatewayPlugin(Star):
             if not names:
                 return
             subject = self._subject_of(event)
-            if subject.is_admin and bool(self._cfg("admin_exempt", True)):
-                return
+            exempt = subject.is_admin and bool(self._cfg("admin_exempt", True))
+            allowed: list[str] = []
             for name in names:
                 verdict = self.gate.check_command(subject, name, self._rules())
-                if verdict.allow:
+                if verdict.allow or exempt:
+                    allowed.append(name)
                     continue
                 await self._log_command_denied(subject, name, verdict)
                 await self._notify_command_denied(event, subject, name, verdict)
@@ -692,8 +693,36 @@ class UserGatewayPlugin(Star):
                 event.stop_event()
                 logger.info(f"[UserGateway] 已拦截指令 {name} {subject.umo} → {verdict.detail}")
                 return
+            # 放行的也记一条流水（「最常触发的指令」排行要用）。
+            # 只记第一个：一条消息通常只对应一个主指令，全记会让榜单被同一条消息刷高。
+            if allowed:
+                await self._log_command_used(subject, allowed[0])
         except Exception:
             logger.exception("[UserGateway] 指令闸门异常，已放行（fail-open）")
+
+    async def _log_command_used(self, subject: Subject, command: str) -> None:
+        """写一条「指令已触发」流水（``kind=command`` + ``status=ok``）。
+
+        用途：统计页的「最常触发的指令」排行 + 指令维度的审计追溯。
+        可用配置 ``track_command_usage`` 关掉（指令极频繁的部署可以省这次写库）；
+        ``kind='command'`` 与 LLM 的口径完全分开，不会污染调用次数 / token 统计。
+        """
+        if not self._cfg("track_command_usage", True):
+            return
+        try:
+            await self.store.log_usage(
+                platform_id=subject.platform_id,
+                umo=subject.umo,
+                scope_type="group" if subject.group_id else "user",
+                scope_id=subject.group_id or subject.sender_id,
+                sender_id=subject.sender_id,
+                group_id=subject.group_id,
+                kind="command",
+                command_name=command,
+                status="ok",
+            )
+        except Exception as e:
+            logger.warning(f"[UserGateway] 写指令流水失败（忽略）: {e}")
 
     async def _log_command_denied(self, subject: Subject, command: str, verdict: Any) -> None:
         """写一条指令拦截流水（``kind=command``，不影响 LLM 的调用统计口径）。"""

@@ -70,6 +70,7 @@ const themeOverrides: GlobalThemeOverrides = {
 
 const menuOptions = [
   { label: () => h(RouterLink, { to: "/overview" }, { default: () => "总览" }), key: "/overview" },
+  { label: () => h(RouterLink, { to: "/stats" }, { default: () => "统计" }), key: "/stats" },
   { label: () => h(RouterLink, { to: "/friends" }, { default: () => "私聊" }), key: "/friends" },
   { label: () => h(RouterLink, { to: "/groups" }, { default: () => "群聊" }), key: "/groups" },
   { label: () => h(RouterLink, { to: "/quota" }, { default: () => "限额" }), key: "/quota" },

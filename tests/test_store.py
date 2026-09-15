@@ -165,6 +165,52 @@ async def main() -> int:
         except ValueError:
             check(True, "非白名单列被拒绝（防注入）")
 
+        print("\n[5.1] 指令统计与 CSV 导出（M6）")
+        for i, (cmd, state) in enumerate(
+            [
+                ("帮助", "ok"),
+                ("帮助", "ok"),
+                ("签到", "ok"),
+                ("帮助", "denied"),
+                ("签到", "denied"),
+                ("签到", "denied"),
+                ("签到", "denied"),
+            ],
+        ):
+            await st.log_usage(
+                ts=now - i * 60,
+                scope_type="user",
+                scope_id="10001",
+                sender_id="10001",
+                kind="command",
+                command_name=cmd,
+                status=state,
+                deny_reason="command" if state == "denied" else "",
+            )
+        top_ok = await st.top_commands(now - 3600, now + 60, status="ok")
+        check(top_ok[0]["command"] == "帮助" and int(top_ok[0]["cnt"]) == 2, f"最常触发排行 = {top_ok}")
+        check(top_ok[1]["command"] == "签到" and int(top_ok[1]["cnt"]) == 1, "排行按次数降序")
+        top_denied = await st.top_commands(now - 3600, now + 60, status="denied")
+        check(
+            top_denied[0]["command"] == "签到" and int(top_denied[0]["cnt"]) == 3,
+            f"最常被拦排行 = {top_denied}",
+        )
+        # 关键：指令流水不能污染 LLM 口径
+        s2 = await st.summary(now - 3600, now + 60)
+        check(s2["totals"]["calls"] == 5, f"指令流水不影响 calls（实得 {s2['totals']['calls']}）")
+        check(s2["totals"]["tok_total"] == 541, "指令流水不带 token，总量不变")
+        heat = await st.hour_heatmap(now - 3600, now + 60, kind="command")
+        check(sum(int(r["cnt"]) for r in heat) == 7, "热力图按 (星期, 小时) 分桶，覆盖 7 条指令事件")
+        csv_text = await st.export_usage_csv(from_ts=now - 3600, to_ts=now + 60)
+        check(csv_text.startswith("\ufeff"), "CSV 带 UTF-8 BOM（Excel 不乱码）")
+        # 注意 BOM 会留在首行开头，比较前先脱掉（不脱的话 startswith 必然为假）
+        csv_lines = [ln for ln in csv_text.splitlines() if ln]
+        head = csv_lines[0].lstrip("\ufeff")
+        check(head.startswith("时间,类型"), f"CSV 表头正确：{head[:16]}")
+        check(len(csv_lines) == 1 + 12, f"CSV 行数 = 表头 + 12 条（实得 {len(csv_lines)}）")
+        check("指令" in csv_text and "帮助" in csv_text, "CSV 含指令类型与指令名")
+        check((await st.export_usage_csv(kind="command")) .count("\n") == 8, "导出支持按类型过滤（7 条指令 + 表头）")
+
         # 单对象统计（详情抽屉用）
         su = await st.subject_stats("user", "10001", now - 3600, now + 60)
         check(su["totals"]["calls"] == 4, f"用户统计 calls = 4（实得 {su['totals']['calls']}）")

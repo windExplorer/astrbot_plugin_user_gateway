@@ -2,13 +2,14 @@
 // ECharts 轻封装：只注册用到的图表与组件（按需引入，避免整包打进单文件产物）。
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import * as echarts from "echarts/core";
-import { BarChart, LineChart, PieChart } from "echarts/charts";
+import { BarChart, HeatmapChart, LineChart, PieChart } from "echarts/charts";
 import {
   DataZoomComponent,
   GridComponent,
   LegendComponent,
   TitleComponent,
   TooltipComponent,
+  VisualMapComponent,
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 
@@ -16,11 +17,13 @@ echarts.use([
   LineChart,
   BarChart,
   PieChart,
+  HeatmapChart,
   GridComponent,
   TooltipComponent,
   LegendComponent,
   TitleComponent,
   DataZoomComponent,
+  VisualMapComponent,
   CanvasRenderer,
 ]);
 

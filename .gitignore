@@ -225,3 +225,7 @@ webui-src/src/version.ts
 *.local
 npm-debug.log*
 yarn-error.log*
+
+# 本地自检的临时输出（跑 tests 时用的重定向文件，不入库）
+_t_*.txt
+_t.log
