@@ -124,8 +124,11 @@ class UserGatewayPlugin(Star):
         self.store: Optional[Store] = None
 
         # 闸门热路径用的内存规则缓存（reload_rules() 重建）
-        self._effect_user: dict[str, str] = {}
-        self._effect_group: dict[str, str] = {}
+        # 值是 {scope_id: {scene: effect}}（v6 起带场景维度，见 gate.Rules 的说明）
+        self._effect_user: dict[str, dict[str, str]] = {}
+        self._effect_group: dict[str, dict[str, str]] = {}
+        # 群成员专属：「群号:QQ」→ {scene: effect}（v7）
+        self._effect_member: dict[str, dict[str, str]] = {}
         # 等级：{(kind, level_id): effect}、{scope_type: {scope_id: level_id}}
         self._level_effect: dict[tuple[str, int], str] = {}
         self._subject_level_user: dict[str, int] = {}
@@ -301,6 +304,7 @@ class UserGatewayPlugin(Star):
         try:
             self._effect_user = await self.store.effect_map("user")
             self._effect_group = await self.store.effect_map("group")
+            self._effect_member = await self.store.effect_map("member")
 
             # 等级默认权限与模型路由
             levels = await self.store.list_levels()
@@ -356,7 +360,8 @@ class UserGatewayPlugin(Star):
             if self._cfg("debug_log", False):
                 logger.info(
                     f"[UserGateway] 规则已加载: 好友权限 {len(self._effect_user)} / "
-                    f"群权限 {len(self._effect_group)} / 等级 {len(self._level_effect)} / "
+                    f"群权限 {len(self._effect_group)} / "
+                    f"群成员权限 {len(self._effect_member)} / 等级 {len(self._level_effect)} / "
                     f"归级 {len(self._subject_level_user)}+{len(self._subject_level_group)} / "
                     f"限额 {sum(len(v) for v in self._limits.values())} 条 / "
                     f"用量计数 {len(self._usage_user)}+{len(self._usage_group)} 条 / "
@@ -378,6 +383,7 @@ class UserGatewayPlugin(Star):
         return Rules(
             effect_user=self._effect_user,
             effect_group=self._effect_group,
+            effect_member=self._effect_member,
             level_effect=self._level_effect,
             subject_level={"user": self._subject_level_user, "group": self._subject_level_group},
             limits=self._limits,

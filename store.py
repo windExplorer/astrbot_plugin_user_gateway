@@ -31,7 +31,24 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
     ) from e
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+
+# 「群成员」规则的 scope_id 约定：``"<群号>:<QQ>"``。
+# 权限模型里「某人在某个群」是一个独立维度（比「好友专属（群聊）」更具体），
+# 用扁平的复合键最省事，不需要给 policy 再加列。
+MEMBER_SCOPE_SEP = ":"
+
+
+def member_scope_id(group_id: Any, user_id: Any) -> str:
+    """拼出群成员规则的 ``scope_id``（``群号:QQ``）。"""
+    return f"{str(group_id or '').strip()}{MEMBER_SCOPE_SEP}{str(user_id or '').strip()}"
+
+
+def parse_member_scope_id(scope_id: Any) -> tuple[str, str]:
+    """拆开群成员规则的 ``scope_id`` → ``(group_id, user_id)``；格式不对返回两个空串。"""
+    text = str(scope_id or "")
+    group_id, _, user_id = text.partition(MEMBER_SCOPE_SEP)
+    return (group_id.strip(), user_id.strip())
 
 # 权限规则的「场景」维度：
 #   ANY（''）  → 两个场景都生效（旧数据、以及群 / 全局这类本来就不分场景的规则）
@@ -98,11 +115,29 @@ CREATE TABLE IF NOT EXISTS group_cache (
     PRIMARY KEY (platform_id, group_id)
 );
 
+-- 群成员缓存（v7）：从协议端 get_group_member_list 拉取，用于「群成员级管控」。
+-- 只缓存成员身份信息；权限规则仍在 policy 表（scope_type='member'）。
+CREATE TABLE IF NOT EXISTS group_member (
+    platform_id TEXT    NOT NULL DEFAULT '',
+    group_id    TEXT    NOT NULL,
+    user_id     TEXT    NOT NULL,
+    nickname    TEXT    NOT NULL DEFAULT '',
+    card        TEXT    NOT NULL DEFAULT '',
+    role        TEXT    NOT NULL DEFAULT '',
+    level       TEXT    NOT NULL DEFAULT '',
+    joined_at   INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (platform_id, group_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gm_group ON group_member(group_id, role);
+
 -- 权限规则
 -- feature: 'llm' | 'command'（对象级指令总权限） | 'command:<指令名>'
 -- scene  : ''（通用，两个场景都生效；旧数据都是这个） | 'private' | 'group'
 --          —— 用来把「好友/好友等级」这一层的规则按会话类型拆开：
 --             私聊禁用某人，不影响他在群里继续用。
+-- scope_type='member' 时 scope_id 是 ``"<群号>:<QQ>"``（见 member_scope_id()），
+--         表示「这个人在这个群里」的规则，比群规则更具体。
 CREATE TABLE IF NOT EXISTS policy (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     scope_type  TEXT    NOT NULL,
@@ -304,6 +339,8 @@ class Store:
             await cls._migrate_v4_to_v5(db)
         if old_version < 6:
             await cls._migrate_v5_to_v6(db)
+        # v6 → v7 只新增了一张空表（group_member），上面的 SCHEMA_SQL 已经建好，
+        # 没有数据要搬，所以不需要单独的迁移步骤 —— 这里留个说明避免以后误以为漏了。
 
     @staticmethod
     async def _migrate_v5_to_v6(db: aiosqlite.Connection) -> None:
@@ -1519,6 +1556,117 @@ class Store:
             parts.append("(" + " OR ".join(f"{c} LIKE ?" for c in search_cols) + ")")
             args.extend([like] * len(search_cols))
         return (" WHERE " + " AND ".join(parts)) if parts else "", args
+
+    # ------------------------------------------------------------------ #
+    # 群成员缓存（v7：群成员级管控用）
+    # ------------------------------------------------------------------ #
+    async def upsert_group_members(
+        self,
+        platform_id: str,
+        group_id: str,
+        items: Iterable[dict[str, Any]],
+    ) -> int:
+        """整体覆盖式写入某群的成员缓存，返回写入条数。
+
+        覆盖式 = 先删掉该群旧成员再写入（协议端退群的人在本地也应消失）。
+        **不动 policy 表**：成员退了但规则还留着是更安全的默认（回来即生效）。
+        """
+        gid = str(group_id or "").strip()
+        if not gid:
+            return 0
+        rows = [
+            (
+                platform_id,
+                gid,
+                str(it.get("user_id") or "").strip(),
+                str(it.get("nickname") or "").strip(),
+                str(it.get("card") or "").strip(),
+                str(it.get("role") or "").strip(),
+                str(it.get("level") or "").strip(),
+                int(it.get("joined_at") or it.get("join_time") or 0),
+                now_ts(),
+            )
+            for it in items
+            if str(it.get("user_id") or "").strip()
+        ]
+        db = self._conn()
+        await db.execute("DELETE FROM group_member WHERE group_id = ?", (gid,))
+        if rows:
+            await db.executemany(
+                "INSERT INTO group_member(platform_id, group_id, user_id, nickname, card, role, "
+                "level, joined_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(platform_id, group_id, user_id) DO UPDATE SET "
+                "nickname = excluded.nickname, card = excluded.card, role = excluded.role, "
+                "level = excluded.level, joined_at = excluded.joined_at, "
+                "updated_at = excluded.updated_at",
+                rows,
+            )
+        await db.commit()
+        return len(rows)
+
+    async def list_group_members(
+        self,
+        group_id: str,
+        keyword: str = "",
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """某群的成员列表（昵称 / 群名片 / QQ 模糊搜索），返回 ``{total, rows}``。
+
+        排序：群主 → 管理员 → 普通成员，同级按群名片/昵称。
+        """
+        where, args = self._cache_where(None, keyword, ("user_id", "nickname", "card"))
+        where = (where + " AND " if where else " WHERE ") + "group_id = ?"
+        args = [*args, str(group_id)]
+        order = (
+            "CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, "
+            "COALESCE(NULLIF(card, ''), nickname), user_id"
+        )
+        db = self._conn()
+        async with db.execute(f"SELECT COUNT(*) AS c FROM group_member{where}", args) as cur:
+            row = await cur.fetchone()
+            total = int(row["c"]) if row else 0
+        async with db.execute(
+            f"SELECT * FROM group_member{where} ORDER BY {order} LIMIT ? OFFSET ?",
+            [*args, int(limit), int(offset)],
+        ) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+        return {"total": total, "rows": rows}
+
+    async def group_member_counts(self) -> dict[str, int]:
+        """每个群已缓存多少成员 ``{group_id: n}``（列表页展示「成员已同步 N 人」）。"""
+        async with self._conn().execute(
+            "SELECT group_id, COUNT(*) AS c FROM group_member GROUP BY group_id"
+        ) as cur:
+            return {str(r["group_id"]): int(r["c"]) for r in await cur.fetchall()}
+
+    async def get_group_member(self, group_id: str, user_id: str) -> Optional[dict[str, Any]]:
+        async with self._conn().execute(
+            "SELECT * FROM group_member WHERE group_id = ? AND user_id = ?",
+            (str(group_id), str(user_id)),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def usage_sums_in_group(
+        self,
+        group_id: str,
+        from_ts: int,
+        to_ts: int,
+    ) -> dict[str, int]:
+        """某群内**按发言人**聚合的 token 用量 ``{sender_id: tokens}``（成员列表展示用）。
+
+        与 :meth:`usage_sums` 的区别：那个按 `sender_id` 跨群汇总，
+        这个只在指定群里统计，才能回答「这个人在**这个群**用了多少」。
+        """
+        async with self._conn().execute(
+            """SELECT sender_id, COALESCE(SUM(tok_in_other + tok_in_cached + tok_out), 0) AS tokens
+               FROM usage_log
+               WHERE group_id = ? AND ts >= ? AND ts <= ? AND sender_id <> ''
+               GROUP BY sender_id""",
+            (str(group_id), int(from_ts), int(to_ts)),
+        ) as cur:
+            return {str(r["sender_id"]): int(r["tokens"] or 0) for r in await cur.fetchall()}
 
     # ------------------------------------------------------------------ #
     # 审计

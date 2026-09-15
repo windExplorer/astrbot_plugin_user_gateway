@@ -40,6 +40,7 @@ REASON_QUOTA = "quota"
 REASON_COMMAND = "command"
 
 # 档位名（与 store.LAYERS 对应）
+LAYER_MEMBER = "member"
 LAYER_USER = "user"
 LAYER_USER_LEVEL = "user_level"
 LAYER_GROUP = "group"
@@ -53,6 +54,7 @@ SCENE_PRIVATE = "private"
 SCENE_GROUP = "group"
 
 LAYER_LABELS: dict[str, str] = {
+    LAYER_MEMBER: "群成员专属",
     LAYER_USER: "好友专属",
     LAYER_USER_LEVEL: "好友等级",
     LAYER_GROUP: "群专属",
@@ -70,6 +72,15 @@ MODEL_SOURCE_LABELS: dict[str, str] = {
 def layer_label(layer: str) -> str:
     """档位的中文名（控制台与日志共用）。"""
     return LAYER_LABELS.get(layer, layer or "未知")
+
+
+def member_scope_id(group_id: Any, user_id: Any) -> str:
+    """群成员规则的 scope_id（``群号:QQ``）。
+
+    与 ``store.member_scope_id`` 是同一约定 —— gate 刻意不 import store
+    （本模块要能脱离 aiosqlite 单独跑测试），所以这里保留一份。
+    """
+    return f"{str(group_id or '').strip()}:{str(user_id or '').strip()}"
 
 
 def effect_in_scene(raw: Any, scene: str) -> str:
@@ -120,6 +131,8 @@ class Rules:
 
     effect_user: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     effect_group: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    effect_member: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    """``{"群号:QQ": {scene: effect}}`` —— **群成员专属**权限（只在群聊里生效，最具体的一层）。"""
     level_effect: Mapping[Any, str] = field(default_factory=dict)
     level_effect_group: Mapping[Any, str] = field(default_factory=dict)
     subject_level: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
@@ -255,7 +268,7 @@ class Gate:
         """按「从具体到兜底」列出该对象适用的档位。
 
         私聊：好友专属 → 好友等级 → 全局
-        群聊：好友专属 → 好友等级 → 群专属 → 群等级 → 全局
+        群聊：群成员专属 → 好友专属 → 好友等级 → 群专属 → 群等级 → 全局
         （群聊里也先看人：这是 v0.2 定的优先级，等级只是插进这条链的中间层）
 
         每个档位都带上本次的 ``scene``：好友 / 好友等级这两层在私聊与群聊里都会参与判定，
@@ -266,6 +279,19 @@ class Gate:
         scene = Gate.scene_of(subject)
         out: list[LayerRef] = []
 
+        # 群成员专属放在**最前面**：它限定了「这个人 + 这个群」，是范围最窄的一层，
+        # 所以能覆盖好友 / 等级 / 群规则（例如「整群禁止，但给某个成员放行」）。
+        if uid and gid:
+            out.append(
+                LayerRef(
+                    LAYER_MEMBER,
+                    "member",
+                    member_scope_id(gid, uid),
+                    "user",
+                    uid,
+                    scene,
+                )
+            )
         if uid:
             out.append(LayerRef(LAYER_USER, "user", uid, "user", uid, scene))
             lv = rules.level_id_of("user", uid)
@@ -343,6 +369,8 @@ class Gate:
         """
 
         def lookup(ref: LayerRef) -> str:
+            if ref.layer == LAYER_MEMBER:
+                return effect_in_scene(rules.effect_member.get(ref.scope_id), ref.scene)
             if ref.layer == LAYER_USER:
                 return effect_in_scene(rules.effect_user.get(ref.scope_id), ref.scene)
             if ref.layer == LAYER_GROUP:

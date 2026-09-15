@@ -262,6 +262,8 @@ export interface GroupRow {
   quota_mode: "enforce" | "observe" | null;
   quota_layer: string;
   today_tokens: number;
+  /** 已缓存的成员数（0 = 还没同步过成员，群成员级管控不可用） */
+  member_cached?: number;
   last_bot_ts: number;
   last_bot_kind: string;
   last_bot_command: string;
@@ -611,6 +613,54 @@ export interface CommandStats {
 
 export function apiCommandStats(range: "1d" | "7d" | "30d" = "7d", limit = 10) {
   return apiGet<CommandStats>(`/stats/commands?range=${range}&limit=${limit}`);
+}
+
+// ---------------------------------------------------------------- 群成员
+
+/** 一个群成员（缓存自协议端）+ 他的权限与本群今日用量。 */
+export interface GroupMemberRow {
+  platform_id: string;
+  group_id: string;
+  user_id: string;
+  nickname: string;
+  card: string;
+  /** owner | admin | member */
+  role: string;
+  level: string;
+  joined_at: number;
+  updated_at: number;
+  /** 展示名：群名片优先，其次昵称 */
+  display_name: string;
+  avatar_id: string;
+  /** 权限规则的 scope_id（`群号:QQ`），写规则时用它 */
+  scope_id: string;
+  effect: "allow" | "deny" | "inherit";
+  effect_command: "allow" | "deny" | "inherit";
+  /** 该成员在**这个群**里的今日 token 用量 */
+  today_tokens: number;
+}
+
+/** 某个群的成员列表（读本地缓存，不打协议端）。 */
+export function apiGroupMembers(groupId: string, q = "", page = 1, size = 200) {
+  const p = new URLSearchParams({ group_id: groupId, page: String(page), size: String(size) });
+  if (q) p.set("q", q);
+  return apiGet<{
+    total: number;
+    rows: GroupMemberRow[];
+    page: number;
+    size: number;
+    group_id: string;
+    synced_at: number;
+  }>(`/group/members?${p.toString()}`);
+}
+
+/** 从协议端同步某个群的成员列表（较慢，需要协议端支持 get_group_member_list）。 */
+export function apiSyncGroupMembers(groupId: string, platformId = "") {
+  return apiPost<{ ok: boolean; count: number; group_id: string; platform_id: string; error?: string }>(
+    "/group/members/sync",
+    { group_id: groupId, platform_id: platformId },
+    60000,
+  );
 }
 
 /** 管理员操作审计（谁在什么时候改了什么规则）。 */

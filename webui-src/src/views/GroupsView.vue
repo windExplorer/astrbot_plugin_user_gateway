@@ -32,6 +32,7 @@ import {
 } from "../api";
 import { dropAvatars, loadAvatars } from "../avatarStore";
 import EffectSegment from "../components/EffectSegment.vue";
+import GroupMembersDrawer from "../components/GroupMembersDrawer.vue";
 import PermissionHelp from "../components/PermissionHelp.vue";
 import SubjectAvatar from "../components/SubjectAvatar.vue";
 import SubjectDrawer from "../components/SubjectDrawer.vue";
@@ -57,6 +58,12 @@ const batchLevelId = ref<number | null>(null);
 // 详情抽屉
 const drawerShow = ref(false);
 const drawerId = ref("");
+
+// 群成员级管控抽屉（对群里个别人单独设权限）
+const membersShow = ref(false);
+const membersGroupId = ref("");
+const membersGroupName = ref("");
+const membersPlatformId = ref("");
 
 const levelOptions = computed(() => [
   { label: "未分组", value: 0 },
@@ -250,6 +257,13 @@ function openDetail(row: GroupRow) {
   drawerShow.value = true;
 }
 
+function openMembers(row: GroupRow) {
+  membersGroupId.value = row.group_id;
+  membersGroupName.value = row.name || row.group_id;
+  membersPlatformId.value = row.platform_id || "";
+  membersShow.value = true;
+}
+
 const columns: DataTableColumns<GroupRow> = [
   { type: "selection" },
   {
@@ -379,9 +393,25 @@ const columns: DataTableColumns<GroupRow> = [
   {
     title: "",
     key: "actions",
-    width: 70,
+    width: 128,
     render: (row) =>
-      h(NButton, { size: "tiny", quaternary: true, onClick: () => openDetail(row) }, { default: () => "详情" }),
+      h(NSpace, { size: 2 }, {
+        default: () => [
+          h(NButton, { size: "tiny", quaternary: true, onClick: () => openDetail(row) }, { default: () => "详情" }),
+          h(NTooltip, { trigger: "hover" }, {
+            trigger: () =>
+              h(
+                NButton,
+                { size: "tiny", quaternary: true, onClick: () => openMembers(row) },
+                { default: () => (row.member_cached ? `成员 ${row.member_cached}` : "成员") },
+              ),
+            default: () =>
+              row.member_cached
+                ? `对该群成员单独设权限（已缓存 ${row.member_cached} 人）`
+                : "对该群成员单独设权限（还没同步过成员，打开后点「同步成员」）",
+          }),
+        ],
+      }),
   },
 ];
 
@@ -496,6 +526,14 @@ onMounted(async () => {
   </n-card>
 
   <subject-drawer v-model:show="drawerShow" type="group" :id="drawerId" @changed="load" />
+
+  <group-members-drawer
+    v-model:show="membersShow"
+    :group-id="membersGroupId"
+    :group-name="membersGroupName"
+    :platform-id="membersPlatformId"
+    @changed="load"
+  />
 </template>
 
 <style scoped>

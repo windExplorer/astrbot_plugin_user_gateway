@@ -43,7 +43,7 @@ async def main() -> int:
         check(Path(db_path).exists(), "数据库文件已创建")
 
         print("\n[2] settings")
-        check(await st.get_setting("schema_version") == "6", "schema_version 已写入 6")
+        check(await st.get_setting("schema_version") == "7", "schema_version 已写入 7")
         check(await st.get_setting("nope", "d") == "d", "缺省值回退")
         await st.set_setting("sync_last_at", "123")
         check(await st.get_setting("sync_last_at") == "123", "写入后可读")
@@ -422,7 +422,7 @@ async def main() -> int:
 
         st3 = Store(v1_path)
         await st3.open()
-        check(await st3.get_setting("schema_version") == "6", "版本号直接升到最新（v1 → v6 连续迁移）")
+        check(await st3.get_setting("schema_version") == "7", "版本号直接升到最新（v1 → v7 连续迁移）")
         q = await st3.get_quota("user", "10001", "day")
         check(q is not None and q["limit_tokens"] == 1000 and "used_tokens" not in q,
               "限额保留、用量的列已移除")
@@ -468,7 +468,7 @@ async def main() -> int:
 
         st5 = Store(v2_path)
         await st5.open()
-        check(await st5.get_setting("schema_version") == "6", "版本号升到 6（v2 → v3 → v4 → v5 → v6 连续迁移）")
+        check(await st5.get_setting("schema_version") == "7", "版本号升到 7（v2 → v3 → v4 → v5 → v6 → v7 连续迁移）")
         lv = await st5.get_level(1)
         check(lv is not None and lv["name"] == "老等级", "v2 的等级数据保留")
         check(
@@ -541,7 +541,7 @@ async def main() -> int:
 
         st8 = Store(v5_path)
         await st8.open()
-        check(await st8.get_setting("schema_version") == "6", "版本号升到 6")
+        check(await st8.get_setting("schema_version") == "7", "版本号升到 7")
         em = await st8.effect_map("user")
         check(em == {"10001": {"": "deny"}}, f"旧规则落到「通用」场景（实得 {em}）")
         check(await st8.resolve_policy("user", "10001", "llm", "group") == "deny",
@@ -552,6 +552,8 @@ async def main() -> int:
         check(lv["effect_group"] == "inherit" and lv["command_effect_group"] == "inherit",
               "等级新增的群聊默认权限默认为 inherit（= 跟随主值）")
         check(lv["effect"] == "deny" and lv["command_effect"] == "allow", "等级原有权限保留")
+        check((await st8.list_group_members("88888"))["total"] == 0,
+              "v7 新增的 group_member 表在迁移时自动建好")
         # 重建后的唯一键必须含 scene：同对象同 feature 能同时存「私聊」与「通用」
         await st8.set_policy("user", "10001", "allow", feature="llm", scene="private")
         check(len(await st8.list_policies(scope_type="user", feature="llm")) == 2,
@@ -561,7 +563,7 @@ async def main() -> int:
         await st8.close()
         st9 = Store(v5_path)
         await st9.open()
-        check(await st9.get_setting("schema_version") == "6", "重开不会重复迁移")
+        check(await st9.get_setting("schema_version") == "7", "重开不会重复迁移")
         check(await st9.resolve_policy("user", "10001", "llm", "private") == "allow", "重开后规则仍在")
         await st9.close()
 
@@ -593,6 +595,56 @@ async def main() -> int:
         check("old" not in await st7.command_policies(), "清理后该指令规则消失")
         check(len(await st7.list_policies(feature="command:help")) == 1, "不相关的指令规则不受影响")
         await st7.close()
+
+    print("\n[14] 群成员缓存与群内用量")
+    # 这里另起一个库：上面的 st 已经在 [10] 关掉了（生命周期用例），复用会报「尚未 open()」
+    with tempfile.TemporaryDirectory() as tmp7:
+        st = Store(str(Path(tmp7) / "members.db"))
+        await st.open()
+        n = await st.upsert_group_members(
+            "p1",
+            "88888",
+            [
+                {"user_id": "10001", "nickname": "小明", "card": "同事", "role": "owner"},
+                {"user_id": "10002", "nickname": "小红", "role": "admin"},
+                {"user_id": "10003", "nickname": "小刚", "role": "member"},
+                {"user_id": ""},  # 空 QQ 应被忽略
+            ],
+        )
+        check(n == 3, f"覆盖式写入 3 个成员（实得 {n}）")
+        lst = await st.list_group_members("88888")
+        check(lst["total"] == 3, f"成员总数 = {lst['total']}")
+        check(lst["rows"][0]["user_id"] == "10001", "排序：群主在最前")
+        check(lst["rows"][1]["role"] == "admin", "排序：管理员次之")
+        check(lst["rows"][0]["card"] == "同事", "群名片一并缓存")
+        check((await st.list_group_members("88888", keyword="小红"))["total"] == 1, "按昵称搜索")
+        check((await st.list_group_members("88888", keyword="10003"))["total"] == 1, "按 QQ 搜索")
+        check((await st.list_group_members("99999"))["total"] == 0, "别的群没有成员")
+
+        again = await st.upsert_group_members(
+            "p1", "88888", [{"user_id": "10001", "nickname": "小明改名", "role": "owner"}]
+        )
+        check(
+            again == 1 and (await st.list_group_members("88888"))["total"] == 1,
+            "再次同步是覆盖式（退群的人从缓存里消失）",
+        )
+        check((await st.get_group_member("88888", "10001"))["nickname"] == "小明改名", "单个成员可读")
+        check((await st.group_member_counts()).get("88888") == 1, "每群成员数统计")
+
+        # 该群内按发言人聚合用量（成员列表展示「他在这个群用了多少」）
+        await st.log_usage(
+            ts=int(time.time()),
+            scope_type="group",
+            scope_id="88888",
+            sender_id="10002",
+            group_id="88888",
+            status="ok",
+            tok_out=42,
+        )
+        gs = await st.usage_sums_in_group("88888", 0, 10**12)
+        check(gs.get("10002") == 42, f"群内按发言人聚合（实得 {gs}）")
+        check(gs.get("10001", 0) == 0, "没有 token 的记录聚合为 0")
+        await st.close()
 
     print()
     if _failures:

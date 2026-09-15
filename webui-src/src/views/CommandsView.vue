@@ -168,16 +168,21 @@ function sceneTag(scene?: string): string {
   return "";
 }
 
+/** 规则作用对象的文字：好友 / 群 / 群成员（``群号:QQ`` 得翻译一下才看得懂）。 */
+function scopeLabel(r: { scope_type: string; scope_id: string }): string {
+  if (r.scope_type === "member") {
+    const [gid, uid] = String(r.scope_id || "").split(":");
+    return `群 ${gid} 的成员 ${uid}`;
+  }
+  return `${r.scope_type === "user" ? "好友" : "群"} ${r.scope_id}`;
+}
+
 function ruleSummary(row: CommandRow): string {
   const rules = row.rules || [];
   if (!rules.length) return "";
   const text = rules
     .slice(0, 2)
-    .map(
-      (r) =>
-        `${r.scope_type === "user" ? "好友" : "群"} ${r.scope_id}` +
-        `${sceneTag(r.scene)} ${r.effect === "deny" ? "禁止" : "放行"}`,
-    )
+    .map((r) => `${scopeLabel(r)}${sceneTag(r.scene)} ${r.effect === "deny" ? "禁止" : "放行"}`)
     .join("；");
   return rules.length > 2 ? `${text} 等 ${rules.length} 条` : text;
 }
@@ -233,11 +238,7 @@ const columns: DataTableColumns<CommandRow> = [
         trigger: () => h("span", { style: "font-size:12.5px" }, ruleSummary(row)),
         default: () =>
           (row.rules || [])
-            .map(
-              (r) =>
-                `${r.scope_type === "user" ? "好友" : "群"} ${r.scope_id}${sceneTag(r.scene)}：` +
-                `${r.effect === "deny" ? "禁止" : "放行"}`,
-            )
+            .map((r) => `${scopeLabel(r)}${sceneTag(r.scene)}：${r.effect === "deny" ? "禁止" : "放行"}`)
             .join("\n"),
       });
     },

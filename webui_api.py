@@ -36,8 +36,12 @@ except Exception:  # pragma: no cover - 仅本地静态检查时缺失
 
 try:  # 与 main.py 同样的双形态导入（包内正常加载 / 平铺调试）
     from .gate import effect_in_scene
+    from .store import member_scope_id, parse_member_scope_id
+    from .sync import sync_group_members
 except ImportError:  # pragma: no cover - 本地平铺调试
     from gate import effect_in_scene  # type: ignore
+    from store import member_scope_id, parse_member_scope_id  # type: ignore
+    from sync import sync_group_members  # type: ignore
 
 ROUTE_PREFIX = "/astrbot_plugin_user_gateway"
 
@@ -227,6 +231,7 @@ def _fmt_group(row: dict, ctx: dict[str, Any]) -> dict:
         "quota_mode": q["mode"] or None,
         "quota_layer": q["layer"],
         "today_tokens": int(ctx["today"].get(gid, 0)),
+        "member_cached": int((ctx.get("member_counts") or {}).get(gid, 0)),
         "last_bot_ts": int(bm.get("ts") or 0),
         "last_bot_kind": str(bm.get("kind") or ""),
         "last_bot_command": str(bm.get("command") or ""),
@@ -323,6 +328,24 @@ async def h_ping(plugin) -> dict:
     )
 
 
+def _fmt_member(row: dict, ctx: dict[str, Any]) -> dict:
+    """把群成员缓存行补上权限状态与本群今日用量（供「群成员」抽屉直接渲染）。"""
+    gid = str(row.get("group_id") or "")
+    uid = str(row.get("user_id") or "")
+    sid = member_scope_id(gid, uid)
+    return {
+        **row,
+        "avatar_id": uid,
+        "scope_id": sid,
+        "display_name": (row.get("card") or "").strip()
+        or (row.get("nickname") or "").strip()
+        or uid,
+        "effect": effect_in_scene(ctx["policy"].get(sid), "group") or "inherit",
+        "effect_command": effect_in_scene(ctx["cmd_master"].get(sid), "group") or "inherit",
+        "today_tokens": int(ctx["today"].get(uid, 0)),
+    }
+
+
 def _filter_level(rows: list[dict], level_filter: str) -> list[dict]:
     """按等级过滤行（``level_filter`` 为空 = 不过滤）。
 
@@ -373,6 +396,8 @@ async def _list_ctx(plugin, kind: str, scene: str = "private") -> dict[str, Any]
         "cmd_master": dict((getattr(plugin, "_cmd_master", {}) or {}).get(kind) or {}),
         "last_bot": await store.bot_message_map(kind),
         "today": await store.usage_sums("sender_id" if kind == "user" else "group_id", from_ts, to_ts),
+        # 每个群已缓存多少成员（没同步过的群 = 0，页面上据此提示「先同步成员」）
+        "member_counts": await store.group_member_counts(),
     }
 
 
@@ -585,6 +610,70 @@ async def h_sync(plugin) -> dict:
     return ok(res)
 
 
+async def h_group_members(plugin) -> dict:
+    """某个群的成员列表（含权限状态与本群今日用量）。
+
+    数据来自本地缓存（``group_member`` 表），**不会**在这里打协议端 ——
+    成员列表很重，同步走 ``POST /group/members/sync``，由用户显式触发。
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    gid = _q("group_id").strip()
+    if not gid:
+        return err("缺少 group_id")
+    page = _qi("page", 1, 1, 10**6)
+    size = _qi("size", 200, 1, 1000)
+    res = await plugin.store.list_group_members(
+        gid, keyword=_q("q"), limit=size, offset=(page - 1) * size
+    )
+    # 权限直接取插件内存里的快照（与闸门同一份），保证「界面看到的」就是「实际用的」
+    policy = (getattr(plugin, "_effect_member", {}) or {})
+    cmd_master = ((getattr(plugin, "_cmd_master", {}) or {}).get("member") or {})
+    from_ts, to_ts = _today_bounds()
+    try:
+        usage = await plugin.store.usage_sums_in_group(gid, from_ts, to_ts)
+    except Exception as e:
+        logger.warning(f"[UserGateway] 统计群内成员用量失败（忽略）: {e}")
+        usage = {}
+    ctx = {"policy": policy, "cmd_master": cmd_master, "today": usage}
+    rows = [_fmt_member(r, ctx) for r in res.get("rows", [])]
+    synced_at = max([int(r.get("updated_at") or 0) for r in rows], default=0)
+    return ok(
+        {
+            "total": res.get("total", 0),
+            "rows": rows,
+            "page": page,
+            "size": size,
+            "group_id": gid,
+            "synced_at": synced_at,
+        },
+    )
+
+
+async def h_sync_group_members(plugin) -> dict:
+    """从协议端同步某个群的成员列表（``get_group_member_list``）。"""
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    body = await _payload()
+    gid = str(body.get("group_id") or "").strip()
+    if not gid:
+        return err("缺少 group_id")
+    timeout = float(plugin._cfg("sync_timeout_sec", 15) or 15)
+    res = await sync_group_members(
+        plugin.context,
+        plugin.store,
+        gid,
+        str(body.get("platform_id") or "").strip(),
+        timeout,
+    )
+    if not res.get("ok"):
+        return err(str(res.get("error") or "同步失败"))
+    await plugin.store.log_audit(
+        "console", "sync_group_members", json.dumps({"group_id": gid, "n": res.get("count")}, ensure_ascii=False)
+    )
+    return ok(res)
+
+
 async def h_subject(plugin) -> dict:
     """单个对象（好友 / 群）的详情：基础信息 + 权限 + 额度 + 区间用量与曲线。
 
@@ -712,12 +801,18 @@ async def h_set_policy(plugin) -> dict:
             scene = ""
         if scene not in ("", "private", "group"):
             return err("scene 必须是 private / group（留空 = 两个场景都生效）")
-        if scope_type not in ("user", "group", "global"):
-            return err("scope_type 必须是 user / group / global")
+        if scope_type not in ("user", "group", "member", "global"):
+            return err("scope_type 必须是 user / group / member / global")
         if scope_type == "global":
             if feature == "llm":
                 return err("LLM 权限的全局默认请在「配置」页用「全局默认策略」设置")
             scope_id = "*"
+        if scope_type == "member":
+            # 群成员规则：scope_id 必须是「群号:QQ」，且只在群聊里参与判定
+            gid, uid = parse_member_scope_id(scope_id)
+            if not (gid and uid):
+                return err("群成员规则的 scope_id 必须是「群号:QQ」")
+            scope_id = member_scope_id(gid, uid)
         if not scope_id:
             return err("scope_id 不能为空")
         if effect not in ("allow", "deny", "inherit"):
@@ -1359,6 +1454,8 @@ def register_apis(plugin) -> None:
         ("/friends", h_friends, ["GET"]),
         ("/groups", h_groups, ["GET"]),
         ("/sync", h_sync, ["POST"]),
+        ("/group/members", h_group_members, ["GET"]),
+        ("/group/members/sync", h_sync_group_members, ["POST"]),
         ("/subject", h_subject, ["GET"]),
         ("/policy", h_get_policy, ["GET"]),
         ("/policy", h_set_policy, ["POST"]),

@@ -42,9 +42,69 @@ def _iter_aiocqhttp_platforms(context: Any) -> list[Any]:
     return out
 
 
-async def _call(bot: Any, action: str, timeout: float) -> Any:
-    """调用一次 OneBot 动作（带超时）。"""
-    return await asyncio.wait_for(bot.call_action(action), timeout=timeout)
+async def _call(bot: Any, action: str, timeout: float, **params: Any) -> Any:
+    """调用一次 OneBot 动作（带超时；``params`` 透传给 call_action）。"""
+    return await asyncio.wait_for(bot.call_action(action, **params), timeout=timeout)
+
+
+async def sync_group_members(
+    context: Any,
+    store: Any,
+    group_id: str,
+    platform_id: str = "",
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """同步**某个群**的成员列表到缓存（``get_group_member_list``）。
+
+    为什么不跟着定时同步一起跑：成员列表比群列表大得多（几百人 × 几百群），
+    默认只在用户点「同步成员」时拉取；需要定时同步可在配置里打开 ``sync_group_members``。
+
+    Returns:
+        ``{ok, group_id, count, platform_id, error}`` —— 失败也只记录不抛。
+    """
+    gid = str(group_id or "").strip()
+    result: dict[str, Any] = {"ok": False, "group_id": gid, "count": 0, "platform_id": "", "error": ""}
+    if not gid:
+        result["error"] = "缺少群号"
+        return result
+    if not (store and getattr(store, "ready", False)):
+        result["error"] = "数据库未就绪"
+        return result
+    try:
+        gid_int = int(gid)
+    except (TypeError, ValueError):
+        result["error"] = f"群号必须是数字：{gid}（目前只支持 QQ 群）"
+        return result
+
+    platforms = _iter_aiocqhttp_platforms(context)
+    if platform_id:
+        same = [p for p in platforms if str(getattr(p.meta(), "id", "") or "") == platform_id]
+        platforms = same or platforms
+    if not platforms:
+        result["error"] = "未找到 aiocqhttp 平台实例（请在 AstrBot 里配置并启用一个 OneBot 适配器）"
+        return result
+
+    errors: list[str] = []
+    for p in platforms:
+        pid = ""
+        try:
+            pid = str(p.meta().id or "")
+        except Exception:
+            pid = ""
+        try:
+            bot = p.get_client()
+            members = await _call(bot, "get_group_member_list", timeout, group_id=gid_int)
+            if not isinstance(members, list):
+                raise TypeError(f"get_group_member_list 返回了非列表: {type(members).__name__}")
+            n = await store.upsert_group_members(pid, gid, members)
+            result.update(ok=True, count=n, platform_id=pid)
+            logger.info(f"[UserGateway] 群 {gid} 成员同步完成：{n} 人")
+            return result
+        except Exception as e:
+            errors.append(f"{pid or '?'}: {e}")
+            logger.warning(f"[UserGateway] 同步群 {gid} 成员失败（{pid or '?'}）: {e}")
+    result["error"] = "；".join(errors) or "同步失败"
+    return result
 
 
 async def sync_all(context: Any, store: Any, timeout: float = 15.0) -> dict[str, Any]:
@@ -132,6 +192,12 @@ class SyncScheduler:
         async with self._lock:
             timeout = float(self.plugin._cfg("sync_timeout_sec", 15) or 15)
             res = await sync_all(self.plugin.context, self.plugin.store, timeout)
+            try:
+                members = await self._sync_members_if_enabled(timeout)
+                if members:
+                    res["total_members"] = members
+            except Exception as e:
+                logger.warning(f"[UserGateway] 同步群成员失败（忽略）: {e}")
             self.last_at = int(time.time())
             self.last_result = res
             try:
@@ -146,6 +212,34 @@ class SyncScheduler:
             else:
                 logger.warning(f"[UserGateway] 同步失败：{res.get('error')}")
             return res
+
+    async def _sync_members_if_enabled(self, timeout: float) -> int:
+        """配置打开时，把所有已缓存群的成员也同步一遍。
+
+        **默认关闭**（``sync_group_members=false``）：成员数是「群数 × 人数」量级，
+        全量拉取很吃协议端，通常只在需要做群成员级管控时手动同步个别群。
+        打开后返回共同步到的成员条数。
+        """
+        if not bool(self.plugin._cfg("sync_group_members", False)):
+            return 0
+        store = self.plugin.store
+        if not (store and getattr(store, "ready", False)):
+            return 0
+        res = await store.list_groups(limit=2000, offset=0)
+        total = 0
+        for row in res.get("rows", []) or []:
+            got = await sync_group_members(
+                self.plugin.context,
+                store,
+                str(row.get("group_id") or ""),
+                str(row.get("platform_id") or ""),
+                timeout,
+            )
+            if got.get("ok"):
+                total += int(got.get("count") or 0)
+        if total:
+            logger.info(f"[UserGateway] 群成员同步完成：共同步 {total} 条")
+        return total
 
     async def start(self) -> None:
         """启动后台轮询（``sync_interval_min<=0`` 时不启动）。"""

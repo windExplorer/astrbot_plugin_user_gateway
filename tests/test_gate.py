@@ -76,6 +76,7 @@ def R(**kw) -> G.Rules:
     return G.Rules(
         effect_user=_by_scene(kw.get("effect_user")),
         effect_group=_by_scene(kw.get("effect_group")),
+        effect_member=_by_scene(kw.get("effect_member")),
         level_effect=kw.get("level_effect") or {},
         level_effect_group=kw.get("level_effect_group") or {},
         subject_level=kw.get("subject_level") or {},
@@ -245,10 +246,11 @@ def main() -> int:
         G.Subject(sender_id="10001", group_id="88888"),
         R(subject_level={"user": {"10001": 1}, "group": {"88888": 2}}),
     )
-    check([r.layer for r in refs] == ["user", "user_level", "group", "group_level", "global"],
+    check([r.layer for r in refs] == ["member", "user", "user_level", "group", "group_level", "global"],
           f"群聊档位链顺序正确（实得 {[r.layer for r in refs]}）")
+    check(refs[0].scope_id == "88888:10001", "群成员层的 scope_id 是「群号:QQ」")
     check([r.layer for r in G.Gate.layers_for(G.Subject(sender_id="10001"), R())] == ["user", "global"],
-          "私聊档位链只有好友专属与全局")
+          "私聊档位链只有好友专属与全局（没有群成员层）")
 
     print("\n[7] 提示冷却")
     cd = G.Cooldown(ttl=60)
@@ -509,6 +511,43 @@ def main() -> int:
         not gate.check_command(G.Subject(sender_id="10001", group_id="88888"), "draw", cp).allow,
         "单条指令：群里被禁",
     )
+
+    print("\n[16] 群成员级管控（member 层）")
+    m = R(effect_member={"88888:10001": "deny"})
+    v = gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), m)
+    check(not v.allow and v.layer == "member", "群成员专属禁止 → 群里被拒，来源是 member 层")
+    check(gate.check_permission(G.Subject(sender_id="10001", group_id="99999"), m).allow,
+          "只对这个群生效：换个群不受影响")
+    check(gate.check_permission(G.Subject(sender_id="10001"), m).allow, "私聊不受群成员规则影响")
+    # 成员层最关键的能力：整群禁止，给个别成员放行
+    m2 = R(effect_group={"88888": "deny"}, effect_member={"88888:10001": "allow"})
+    check(gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), m2).allow,
+          "整群禁止 + 该成员放行 → 他能用（成员层比群层更具体）")
+    check(not gate.check_permission(G.Subject(sender_id="10002", group_id="88888"), m2).allow,
+          "同群其它成员仍被群规则拦下")
+    # 也能压过好友级与等级（成员层是最具体的一层）
+    m3 = R(
+        effect_user={"10001": "deny"},
+        level_effect={("user", 3): "deny"},
+        subject_level={"user": {"10001": 3}},
+        effect_member={"88888:10001": "allow"},
+    )
+    check(gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), m3).allow,
+          "成员层压过好友专属与好友等级")
+    check(not gate.check_permission(G.Subject(sender_id="10001"), m3).allow,
+          "同一套规则在私聊里仍按好友专属禁止")
+    # 指令权限同理
+    mc = R(
+        command_master={"group": {"88888": "deny"}, "member": {"88888:10001": "allow"}},
+    )
+    check(gate.check_command(G.Subject(sender_id="10001", group_id="88888"), "draw", mc).allow,
+          "指令：群禁但该成员放行 → 他能用指令")
+    check(not gate.check_command(G.Subject(sender_id="10002", group_id="88888"), "draw", mc).allow,
+          "指令：同群其它成员仍被群规则拦下")
+    mc2 = R(command_master={"member": {"88888:10001": "deny"}})
+    check(not gate.check_command(G.Subject(sender_id="10001", group_id="88888"), "draw", mc2).allow,
+          "指令：只禁该成员 → 他被拦")
+    check(gate.check_command(G.Subject(sender_id="10001"), "draw", mc2).allow, "指令：私聊不受影响")
 
     print()
     if _failures:
