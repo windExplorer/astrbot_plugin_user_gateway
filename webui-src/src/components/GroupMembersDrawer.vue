@@ -139,7 +139,8 @@ async function applyPolicy(
     await apiPost("/policy", {
       items: items.map((i) => ({
         scope_type: "member",
-        scope_id: `${props.groupId}:${i.user_id}`,
+        // 优先用后端下发的 scope_id（群号:QQ），避免前端自己拼格式
+        scope_id: i.scope_id || `${props.groupId}:${i.user_id}`,
         effect: i.effect,
         feature,
       })),

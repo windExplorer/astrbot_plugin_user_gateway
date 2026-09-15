@@ -301,12 +301,14 @@ async def h_ping(plugin) -> dict:
             "rules": {
                 "effect_users": len(getattr(plugin, "_effect_user", {}) or {}),
                 "effect_groups": len(getattr(plugin, "_effect_group", {}) or {}),
+                "effect_members": len(getattr(plugin, "_effect_member", {}) or {}),
                 "levels": len(getattr(plugin, "_level_effect", {}) or {}),
                 "leveled_users": len(getattr(plugin, "_subject_level_user", {}) or {}),
                 "leveled_groups": len(getattr(plugin, "_subject_level_group", {}) or {}),
                 "limits": sum(len(v) for v in (getattr(plugin, "_limits", {}) or {}).values()),
                 "usage_users": len(getattr(plugin, "_usage_user", {}) or {}),
                 "usage_groups": len(getattr(plugin, "_usage_group", {}) or {}),
+                "usage_members": len(getattr(plugin, "_usage_member", {}) or {}),
             },
             # 头像缓存概况（抓了多少、占多少、最旧的是什么时候）
             "avatars": (
@@ -646,7 +648,12 @@ async def h_group_members(plugin) -> dict:
         usage = {}
     ctx = {"policy": policy, "cmd_master": cmd_master, "today": usage, "plugin": plugin}
     rows = [_fmt_member(r, ctx) for r in res.get("rows", [])]
-    synced_at = max([int(r.get("updated_at") or 0) for r in rows], default=0)
+    # 同步时间取该群全量成员的最大 updated_at（分页结果只反映当前页，会偏旧）
+    try:
+        synced_at = await plugin.store.group_members_synced_at(gid)
+    except Exception as e:
+        logger.debug(f"[UserGateway] 读取成员同步时间失败（忽略）: {e}")
+        synced_at = max([int(r.get("updated_at") or 0) for r in rows], default=0)
     return ok(
         {
             "total": res.get("total", 0),
@@ -797,6 +804,9 @@ async def h_set_policy(plugin) -> dict:
         items = [body]
 
     applied = []
+    # 两遍处理（v1.0.0）：第一遍只做校验与规整，任何一条不合法都直接报错返回、
+    # 不落库 —— 否则批量中途失败会出现「前几条已写库、内存规则又没刷新」的中间态。
+    specs: list[dict[str, str]] = []
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -828,8 +838,9 @@ async def h_set_policy(plugin) -> dict:
             return err("effect 必须是 allow / deny / inherit")
         if feature not in ("llm", "command") and not feature.startswith("command:"):
             return err("feature 必须是 llm / command（对象级指令权限）/ command:<指令名>")
-        await plugin.store.set_policy(scope_type, scope_id, effect, feature=feature, scene=scene)
-        applied.append(
+        if feature.startswith("command:") and not feature[len("command:"):].strip():
+            return err("command: 后面必须带指令名")
+        specs.append(
             {
                 "scope_type": scope_type,
                 "scope_id": scope_id,
@@ -838,6 +849,12 @@ async def h_set_policy(plugin) -> dict:
                 "scene": scene,
             }
         )
+
+    for s in specs:
+        await plugin.store.set_policy(
+            s["scope_type"], s["scope_id"], s["effect"], feature=s["feature"], scene=s["scene"]
+        )
+        applied.append(s)
 
     if not applied:
         return err("没有可应用的规则")
@@ -901,6 +918,9 @@ async def h_set_quota(plugin) -> dict:
         items = [body]
 
     applied = []
+    # 两遍处理（v1.0.0）：先全量校验并规整，任何一条不合法直接报错、不落库，
+    # 避免「前几条已写入、内存规则没刷新」的中间态。
+    specs: list[dict[str, Any]] = []
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -927,8 +947,7 @@ async def h_set_quota(plugin) -> dict:
 
         raw_limit = it.get("limit_tokens")
         if _as_bool(it.get("delete"), default=False) or raw_limit is None:
-            await plugin.store.delete_quota(scope_type, scope_id, period)
-            applied.append({"scope_type": scope_type, "scope_id": scope_id, "period": period, "deleted": True})
+            specs.append({"scope_type": scope_type, "scope_id": scope_id, "period": period, "delete": True})
             continue
         try:
             limit_tokens = int(raw_limit)
@@ -936,17 +955,32 @@ async def h_set_quota(plugin) -> dict:
             return err("limit_tokens 必须是整数（0 表示不限；null / delete=true 表示删除）")
         if limit_tokens < 0:
             return err("limit_tokens 不能为负")
+        specs.append(
+            {
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "period": period,
+                "delete": False,
+                "limit_tokens": limit_tokens,
+                "mode": mode,
+            }
+        )
 
+    for s in specs:
+        if s.pop("delete"):
+            await plugin.store.delete_quota(s["scope_type"], s["scope_id"], s["period"])
+            applied.append({"scope_type": s["scope_type"], "scope_id": s["scope_id"], "period": s["period"], "deleted": True})
+            continue
         await plugin.store.upsert_quota(
-            scope_type,
-            scope_id,
-            period,
-            limit_tokens,
-            mode=mode,
-            reset_at=plugin.quota_reset_at(period),
+            s["scope_type"],
+            s["scope_id"],
+            s["period"],
+            s["limit_tokens"],
+            mode=s["mode"],
+            reset_at=plugin.quota_reset_at(s["period"]),
         )
         applied.append(
-            {"scope_type": scope_type, "scope_id": scope_id, "period": period, "limit_tokens": limit_tokens, "mode": mode},
+            {"scope_type": s["scope_type"], "scope_id": s["scope_id"], "period": s["period"], "limit_tokens": s["limit_tokens"], "mode": s["mode"]},
         )
 
     if not applied:

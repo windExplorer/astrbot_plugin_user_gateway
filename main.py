@@ -364,11 +364,13 @@ class UserGatewayPlugin(Star):
             self._usage_user = await self.store.usage_map("user")
             self._usage_group = await self.store.usage_map("group")
             self._usage_member = await self.store.usage_map("member")
-            # 指令权限：单条指令的规则 + 对象级总权限（好友 / 群 / 全局）
+            # 指令权限：单条指令的规则 + 对象级总权限（好友 / 群 / 群成员 / 全局）。
+            # 注意 member / global 两类也要装：档位链里有成员层与全局层，
+            # 漏装 = 界面写进去的规则闸门不认（v1.0.0 修复）。
             self._cmd_policy = await self.store.command_policies()
             self._cmd_master = {
                 st: await self.store.effect_map(st, feature=COMMAND_MASTER_FEATURE)
-                for st in ("user", "group")
+                for st in ("user", "group", "member", "global")
             }
 
             if self._cfg("debug_log", False):
@@ -381,7 +383,8 @@ class UserGatewayPlugin(Star):
                     f"用量计数 {len(self._usage_user)}+{len(self._usage_group)} 条 / "
                     f"指令规则 {sum(len(s) for s in self._cmd_policy.values())} 条 / "
                     f"对象级指令权限 {len(self._cmd_master.get('user') or {})}"
-                    f"+{len(self._cmd_master.get('group') or {})} 条"
+                    f"+{len(self._cmd_master.get('group') or {})}"
+                    f"+{len(self._cmd_master.get('member') or {})} 条"
                 )
         except Exception as e:
             # 加载失败按"没有规则"处理（全部继承默认策略），不影响消息通行

@@ -1,0 +1,15 @@
+﻿v1.0.0：发布评审与修复
+
+全库五维评审（M9-M11 为重点）后的修复版：
+
+- [Critical] gate._level_effect：好友等级「群聊场景值」= inherit 字符串时
+  不回落主值（or 链把 "inherit" 当已配置），导致「私聊禁、群里放」
+- [Critical] reload_rules：_cmd_master 只装 user/group，成员层与全局层的
+  对象级指令总权限写了不生效（UI 可写、闸门不读）
+- [Required] store.import_rules 改单事务原子写（失败整体回滚），
+  校验口径与 /policy /quota 对齐（feature 白名单、member scope_id 格式、
+  global 不收 llm、mode/reset_at 规整）
+- [Required] /policy /quota 批量写先全量校验再落库，避免库与内存快照不一致
+- 前端：对象体检残留群号清理、成员抽屉用后端 scope_id、
+  CommandMatrixRow 类型独立、成员同步时间取全量 MAX(updated_at)
+- 自检：gate [16] 成员/全局指令总权限 + inherit 回落回归；store 导入坏行扩充

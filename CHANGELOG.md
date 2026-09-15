@@ -2,6 +2,52 @@
 
 本文件记录各版本的改动。版本号与 `metadata.yaml` 保持一致。
 
+## v1.0.0（发布评审：修复 + 稳固）
+
+功能层面收口（M0–M11 全部完成），本版是一次**全库代码评审 + 修复**，之后进入维护态。
+
+### 修复（Critical）
+
+- **好友等级的「群聊场景值」inherit 时不回落主值**（`gate._level_effect`）：
+  reload 出来的场景值是字符串 `"inherit"`（真值），旧的 `or` 链永远回落不到主值——
+  「私聊禁、群里放」会违背「inherit = 跟随主值」的承诺，覆盖几乎所有存量等级
+  （新建等级的场景值默认就是 inherit）。修复：非显式 `allow / deny` 一律视为没配。
+- **群成员 / 全局的「对象级指令总权限」写进去不生效**（`reload_rules`）：
+  `_cmd_master` 只加载了 `user / group` 两类，而档位链里有成员层与全局层——
+  成员抽屉里给某成员设「禁止指令」后他在群里照样能用，界面还回显「继承」。
+  修复：加载范围扩成 `user / group / member / global`。
+
+### 修复（Required）
+
+- **规则导入改为单事务原子写**（`store.import_rules`）：
+  此前 replace 模式先删后导、逐行各自 commit，中途失败会留下
+  「旧规则已清空、新规则只进一半」且无法回滚。现在导入期间统一提交一次，
+  失败整体 `rollback`。
+- **导入校验与 `/policy`、`/quota` 口径对齐**：feature 白名单（含 `command:` 后非空）、
+  群成员 scope_id 必须是「群号:QQ」、`global` 不收 LLM 规则、
+  坏 `mode` 规整、坏 `reset_at` 归 `None`（字符串写进 INTEGER 列会让重置永不命中）。
+  上述形态从「静默入库成死数据」改为跳过并计数。
+- **批量写接口先全量校验再落库**（`/policy`、`/quota`）：此前边校验边写，
+  中途失败时前几条已进库而内存规则未刷新，SQLite 与闸门快照不一致。
+- **`/ping` 的规则统计补上 member 维度**（`effect_members` / `usage_members`）。
+
+### 修复（前端）
+
+- 「对象体检」切换类型时清掉残留的群号选择（切回成员模式不必再切走再切回）；
+- 群成员抽屉写规则优先用后端下发的 `scope_id`，不在前端拼「群号:QQ」；
+- `CommandMatrixRow` 类型不再错误地继承 `CommandRow`（矩阵行并没有
+  `global_effect` / `rules` 字段，避免按类型取到 `undefined`）；
+- 「群聊 → 成员」的同步时间改取**该群全量**成员的最大 `updated_at`
+  （此前取分页结果的 max，翻页时显示偏旧）。
+
+### 自检
+
+- gate 新增 [16] 指令总权限的成员 / 全局层（成员层只在群聊参与、
+  全局 deny 兜底、全局 allow ≠ 白名单通行证）；
+  「场景值 = 字符串 inherit → 回落主值」的回归用例（指令 + LLM 各一条）；
+- store 的导入坏行用例扩充：member 格式 / global+llm / 空 command 名 /
+  未知 feature 跳过、坏 mode 规整、坏 reset_at 归 None。
+
 ## v0.12.0（M11：指令 × 对象矩阵 —— 「对象体检」）
 
 ### 背景

@@ -736,15 +736,30 @@ async def main() -> int:
         # 坏数据：跳过坏行，而不是整次导入失败
         bad = {
             "levels": [{"kind": "user", "name": "坏等级", "effect": "什么鬼"}],
-            "quotas": [{"scope_type": "user", "scope_id": "10002", "period": "week", "limit_tokens": 1}],
+            "quotas": [
+                {"scope_type": "user", "scope_id": "10002", "period": "week", "limit_tokens": 1},
+                # v1.0.0：坏 mode 规整成 enforce、坏 reset_at 归 None（不能透传进库）
+                {"scope_type": "user", "scope_id": "10002", "period": "day", "limit_tokens": 7,
+                 "mode": "OBSERVE", "reset_at": "明天"},
+            ],
             "policies": [
                 {"scope_type": "user", "scope_id": "10002", "feature": "llm", "effect": "allow", "scene": "??"},
                 {"scope_type": "user", "scope_id": "10002", "feature": "llm", "effect": "deny"},
+                # v1.0.0：这些形态只会变成死数据，必须跳过
+                {"scope_type": "member", "scope_id": "88888", "feature": "llm", "effect": "deny"},
+                {"scope_type": "global", "scope_id": "*", "feature": "llm", "effect": "deny"},
+                {"scope_type": "user", "scope_id": "10002", "feature": "command:", "effect": "deny"},
+                {"scope_type": "user", "scope_id": "10002", "feature": "什么鬼", "effect": "deny"},
             ],
         }
         st2 = await dst.import_rules(bad, mode="merge")
-        check(st2["skipped"] == 2, f"非法 period / scene 被跳过（实得 skipped={st2['skipped']}）")
+        # 跳过 = 非法 period / scene / member 格式 / global+llm / 空 command 名 / 未知 feature
+        check(st2["skipped"] == 6, f"各类坏行被跳过（实得 skipped={st2['skipped']}）")
         check(await dst.get_effect("user", "10002", "llm", "") == "deny", "同批里的合法行照常导入")
+        q = await dst.list_quotas_of("user", "10002")
+        day = [x for x in q if x["period"] == "day"]
+        check(day and day[0]["mode"] == "observe" and not day[0].get("reset_at"),
+              "坏 mode 规整（OBSERVE→observe）、坏 reset_at 归 None")
         names = [lv["name"] for lv in await dst.list_levels()]
         check("坏等级" in names, "未知 effect 的等级被规整成 inherit 而不是丢弃")
         check(

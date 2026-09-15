@@ -334,7 +334,12 @@ class Gate:
         else:
             main, group = rules.level_command_effect, rules.level_command_effect_group
         if ref.layer == LAYER_USER_LEVEL and ref.scene == SCENE_GROUP:
-            return str(group.get(key) or main.get(key) or "")
+            g = str(group.get(key) or "").strip()
+            # 群聊专属值只有显式 allow / deny 才算「配了」；"inherit"（含库里的默认值）
+            # 都视为没配 → 回落到主值。之前用 `or` 链判断，"inherit" 是真值字符串，
+            # 永远回落不下去（v1.0.0 修复）。
+            if g in ("allow", "deny"):
+                return g
         return str(main.get(key) or "")
 
     def _first_effect(

@@ -129,12 +129,14 @@ export interface PingInfo {
   rules?: {
     effect_users: number;
     effect_groups: number;
+    effect_members?: number;
     levels?: number;
     leveled_users?: number;
     leveled_groups?: number;
     limits?: number;
     usage_users?: number;
     usage_groups?: number;
+    usage_members?: number;
   };
   /** 头像缓存概况 */
   avatars?: Record<string, any>;
@@ -703,9 +705,16 @@ export function apiSyncGroupMembers(groupId: string, platformId = "") {
 
 // ---------------------------------------------------------------- 指令 × 对象矩阵
 
-/** 矩阵里的一行：某条指令对「这个对象」的结论。 */
-export interface CommandMatrixRow extends CommandRow {
+/** 矩阵里的一行：某条指令对「这个对象」的结论（后端 /commands/matrix 的行结构，
+ * 与 /commands 的 CommandRow 不同：没有 global_effect / rules 等字段，别混用）。 */
+export interface CommandMatrixRow {
+  name: string;
+  /** 与 name 同值（后端保留两个字段是为了语义清晰） */
   command: string;
+  desc: string;
+  plugin: string;
+  aliases: string[];
+  is_group: boolean;
   /** 最终结论：能不能用 */
   allow: boolean;
   /** 结论来自哪一层（空 = 系统默认） */

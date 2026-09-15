@@ -1624,117 +1624,161 @@ class Store:
         db = self._conn()
         stats = {"mode": mode, "levels": 0, "subject_levels": 0, "quotas": 0, "policies": 0, "skipped": 0}
 
-        if mode == "replace":
-            # 先清空这四张表（不动用量 / 日志 / 成员 / 最后消息）
-            await db.execute("DELETE FROM subject_level")
-            await db.execute("DELETE FROM llm_quota")
-            await db.execute("DELETE FROM quota_level")
-            await db.execute("DELETE FROM policy")
-            await db.commit()
+        # 原子性（v1.0.0）：upsert_level / set_subject_level / upsert_quota / set_policy
+        # 的正常路径各自 commit；导入期间把 db.commit 压成「静默」，最后统一提交一次。
+        # 否则 replace 模式先删后导，中途失败会留下「旧规则已清空、新规则只进一半」
+        # ——对迁移场景就是数据丢失。
+        real_commit = db.commit
 
-        # 1) 等级：按 (kind, name) upsert，并记下 旧id → 新id
-        id_map: dict[str, int] = {}
-        for lv in _as_list(data.get("levels")):
-            kind = str(lv.get("kind") or "").strip()
-            name = str(lv.get("name") or "").strip()
-            if kind not in ("user", "group") or not name:
-                stats["skipped"] += 1
-                continue
-            new_id = await self.upsert_level(
-                kind,
-                name,
-                description=str(lv.get("description") or ""),
-                effect=_norm_effect(lv.get("effect")),
-                command_effect=_norm_effect(lv.get("command_effect")),
-                effect_group=_norm_effect(lv.get("effect_group")),
-                command_effect_group=_norm_effect(lv.get("command_effect_group")),
-                sort_order=_as_int(lv.get("sort_order"), 0),
-                provider_id=str(lv.get("provider_id") or ""),
-                fallback_provider_id=str(lv.get("fallback_provider_id") or ""),
-            )
-            old_id = lv.get("id")
-            if old_id is not None:
-                id_map[str(old_id)] = int(new_id)
-            stats["levels"] += 1
+        async def _noop_commit() -> None:
+            return None
 
-        def _map_level(raw: Any) -> Optional[int]:
-            """把旧的等级 id 换算成导入后的新 id；映射不到就返回 None（跳过该行）。"""
-            if raw in (None, ""):
-                return None
-            got = id_map.get(str(raw))
-            return int(got) if got else None
+        db.commit = _noop_commit  # type: ignore[method-assign]
+        try:
+            if mode == "replace":
+                # 先清空这四张表（不动用量 / 日志 / 成员 / 最后消息）
+                await db.execute("DELETE FROM subject_level")
+                await db.execute("DELETE FROM llm_quota")
+                await db.execute("DELETE FROM quota_level")
+                await db.execute("DELETE FROM policy")
 
-        # 2) 对象归级
-        for row in _as_list(data.get("subject_levels")):
-            scope_type = str(row.get("scope_type") or "").strip()
-            scope_id = str(row.get("scope_id") or "").strip()
-            level_id = _map_level(row.get("level_id"))
-            if scope_type not in ("user", "group") or not scope_id or not level_id:
-                stats["skipped"] += 1
-                continue
-            await self.set_subject_level(scope_type, scope_id, level_id)
-            stats["subject_levels"] += 1
-
-        # 3) 额度（level 维度的 scope_id 同样要换成新 id）
-        for row in _as_list(data.get("quotas")):
-            scope_type = str(row.get("scope_type") or "").strip()
-            scope_id = str(row.get("scope_id") or "").strip()
-            period = str(row.get("period") or "").strip()
-            if scope_type not in ("user", "group", "member", "level", "global"):
-                stats["skipped"] += 1
-                continue
-            if period not in PERIODS:
-                stats["skipped"] += 1
-                continue
-            if scope_type == "level":
-                mapped = _map_level(scope_id)
-                if mapped is None:
+            # 1) 等级：按 (kind, name) upsert，并记下 旧id → 新id
+            id_map: dict[str, int] = {}
+            for lv in _as_list(data.get("levels")):
+                kind = str(lv.get("kind") or "").strip()
+                name = str(lv.get("name") or "").strip()
+                if kind not in ("user", "group") or not name:
                     stats["skipped"] += 1
                     continue
-                scope_id = str(mapped)
-            elif scope_type == "global":
-                scope_id = "*"
-            elif not scope_id:
-                stats["skipped"] += 1
-                continue
-            await self.upsert_quota(
-                scope_type,
-                scope_id,
-                period,
-                _as_int(row.get("limit_tokens"), 0),
-                mode=str(row.get("mode") or "enforce"),
-                reset_at=row.get("reset_at"),
-            )
-            stats["quotas"] += 1
+                new_id = await self.upsert_level(
+                    kind,
+                    name,
+                    description=str(lv.get("description") or ""),
+                    effect=_norm_effect(lv.get("effect")),
+                    command_effect=_norm_effect(lv.get("command_effect")),
+                    effect_group=_norm_effect(lv.get("effect_group")),
+                    command_effect_group=_norm_effect(lv.get("command_effect_group")),
+                    sort_order=_as_int(lv.get("sort_order"), 0),
+                    provider_id=str(lv.get("provider_id") or ""),
+                    fallback_provider_id=str(lv.get("fallback_provider_id") or ""),
+                )
+                old_id = lv.get("id")
+                if old_id is not None:
+                    id_map[str(old_id)] = int(new_id)
+                stats["levels"] += 1
 
-        # 4) 权限规则（LLM / 指令 / 群成员；scene 一并带上）
-        for row in _as_list(data.get("policies")):
-            scope_type = str(row.get("scope_type") or "").strip()
-            scope_id = str(row.get("scope_id") or "").strip()
-            feature = str(row.get("feature") or "llm").strip() or "llm"
-            scene = str(row.get("scene") or "").strip()
-            if scope_type not in ("user", "group", "member", "global"):
-                stats["skipped"] += 1
-                continue
-            if scope_type != "user":
-                scene = ""
-            if scope_type == "global":
-                scope_id = "*"
-            if not scope_id or scene not in ("", "private", "group"):
-                stats["skipped"] += 1
-                continue
-            await self.set_policy(
-                scope_type,
-                scope_id,
-                _norm_effect(row.get("effect")),
-                feature=feature,
-                note=str(row.get("note") or ""),
-                scene=scene,
-            )
-            stats["policies"] += 1
+            def _map_level(raw: Any) -> Optional[int]:
+                """把旧的等级 id 换算成导入后的新 id；映射不到就返回 None（跳过该行）。"""
+                if raw in (None, ""):
+                    return None
+                got = id_map.get(str(raw))
+                return int(got) if got else None
 
-        await db.commit()
-        return stats
+            # 2) 对象归级
+            for row in _as_list(data.get("subject_levels")):
+                scope_type = str(row.get("scope_type") or "").strip()
+                scope_id = str(row.get("scope_id") or "").strip()
+                level_id = _map_level(row.get("level_id"))
+                if scope_type not in ("user", "group") or not scope_id or not level_id:
+                    stats["skipped"] += 1
+                    continue
+                await self.set_subject_level(scope_type, scope_id, level_id)
+                stats["subject_levels"] += 1
+
+            # 3) 额度（level 维度的 scope_id 同样要换成新 id）
+            for row in _as_list(data.get("quotas")):
+                scope_type = str(row.get("scope_type") or "").strip()
+                scope_id = str(row.get("scope_id") or "").strip()
+                period = str(row.get("period") or "").strip()
+                if scope_type not in ("user", "group", "member", "level", "global"):
+                    stats["skipped"] += 1
+                    continue
+                if period not in PERIODS:
+                    stats["skipped"] += 1
+                    continue
+                if scope_type == "level":
+                    mapped = _map_level(scope_id)
+                    if mapped is None:
+                        stats["skipped"] += 1
+                        continue
+                    scope_id = str(mapped)
+                elif scope_type == "global":
+                    scope_id = "*"
+                elif not scope_id:
+                    stats["skipped"] += 1
+                    continue
+                # mode / reset_at 不透传原始值（v1.0.0）：坏 mode 会被当成 enforce、
+                # 字符串 reset_at 写进 INTEGER 列会让「重置到期」永不命中 → 计数永不清零。
+                q_mode = str(row.get("mode") or "enforce").strip().lower()
+                if q_mode not in ("enforce", "observe"):
+                    q_mode = "enforce"
+                try:
+                    reset_at = (
+                        int(row.get("reset_at")) if row.get("reset_at") not in (None, "") else None
+                    )
+                except (TypeError, ValueError):
+                    reset_at = None
+                await self.upsert_quota(
+                    scope_type,
+                    scope_id,
+                    period,
+                    _as_int(row.get("limit_tokens"), 0),
+                    mode=q_mode,
+                    reset_at=reset_at,
+                )
+                stats["quotas"] += 1
+
+            # 4) 权限规则（LLM / 指令 / 群成员；scene 一并带上）
+            # 校验口径与 /policy 接口对齐（v1.0.0）：feature 白名单、member 的 scope_id
+            # 必须是「群号:QQ」、global 不收 LLM 规则——收下这些只会变成死数据。
+            for row in _as_list(data.get("policies")):
+                scope_type = str(row.get("scope_type") or "").strip()
+                scope_id = str(row.get("scope_id") or "").strip()
+                feature = str(row.get("feature") or "llm").strip() or "llm"
+                scene = str(row.get("scene") or "").strip()
+                if scope_type not in ("user", "group", "member", "global"):
+                    stats["skipped"] += 1
+                    continue
+                if feature.startswith("command:") and not feature[len("command:"):].strip():
+                    stats["skipped"] += 1
+                    continue
+                if feature not in ("llm", "command") and not feature.startswith("command:"):
+                    stats["skipped"] += 1
+                    continue
+                if scope_type == "global" and feature == "llm":
+                    stats["skipped"] += 1
+                    continue
+                if scope_type != "user":
+                    scene = ""
+                if scope_type == "global":
+                    scope_id = "*"
+                if scope_type == "member":
+                    mgid, muid = parse_member_scope_id(scope_id)
+                    if not (mgid and muid):
+                        stats["skipped"] += 1
+                        continue
+                    scope_id = member_scope_id(mgid, muid)
+                if not scope_id or scene not in ("", "private", "group"):
+                    stats["skipped"] += 1
+                    continue
+                await self.set_policy(
+                    scope_type,
+                    scope_id,
+                    _norm_effect(row.get("effect")),
+                    feature=feature,
+                    note=str(row.get("note") or ""),
+                    scene=scene,
+                )
+                stats["policies"] += 1
+
+            await real_commit()  # 整个导入一次提交（上面各步骤的 commit 已被静默）
+            return stats
+        except Exception:
+            await db.rollback()  # 中途失败 → 全部回滚，绝不留「清空了旧规则、只导了一半」的中间态
+            raise
+        finally:
+            db.commit = real_commit
+
 
     # ------------------------------------------------------------------ #
     # 群成员缓存（v7：群成员级管控用）
@@ -1782,6 +1826,22 @@ class Store:
             )
         await db.commit()
         return len(rows)
+
+    async def group_members_synced_at(self, group_id: str) -> int:
+        """某群成员缓存的最后同步时间（该群**全量**成员的最大 updated_at）。
+
+        不用分页结果的 max()：size < total 时那只是「当前页里最新的一条」，
+        显示出来的同步时间会偏旧。
+        """
+        gid = str(group_id or "").strip()
+        if not gid:
+            return 0
+        async with self._conn().execute(
+            "SELECT COALESCE(MAX(updated_at), 0) FROM group_member WHERE group_id = ?",
+            (gid,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0] or 0) if row else 0
 
     async def list_group_members(
         self,

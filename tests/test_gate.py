@@ -478,6 +478,25 @@ def main() -> int:
     check(not gate.check_permission(G.Subject(sender_id="10002"), lv2).allow, "私聊仍按主值禁止")
     v = gate.check_permission(G.Subject(sender_id="10002", group_id="88888"), lv2)
     check(v.allow and v.layer == "user_level", "群聊专属放行 → 群里可用，且来源仍是好友等级")
+    # 真实数据形态（v1.0.0 回归）：reload 出来的「群聊专属值」是字符串 "inherit"，
+    # 不是「键不存在」——回落逻辑必须把这两种形态都当作「没配」
+    lv3 = R(
+        level_effect={("user", 3): "deny"},
+        level_effect_group={("user", 3): "inherit"},
+        subject_level={"user": {"10002": 3}},
+    )
+    check(
+        not gate.check_permission(G.Subject(sender_id="10002", group_id="88888"), lv3).allow,
+        "群聊专属值=字符串 inherit → 回落主值（此前被当没配而漏拦）",
+    )
+    lv4 = R(
+        level_effect={("user", 3): "allow"},
+        level_command_effect={("user", 3): "deny"},
+        level_command_effect_group={("user", 3): "inherit"},
+        subject_level={"user": {"10002": 3}},
+    )
+    v = gate.check_command(G.Subject(sender_id="10002", group_id="88888"), "draw", lv4)
+    check(not v.allow and v.layer == "user_level", "指令权限的群聊 inherit 同样回落主值")
     lvg = R(level_effect={("group", 5): "deny"}, subject_level={"group": {"88888": 5}})
     check(
         not gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), lvg).allow,
@@ -602,6 +621,31 @@ def main() -> int:
     )
     check(gate.check_quota(G.Subject(sender_id="10001", group_id="88888"), mq5).allow,
           "成员层有额度 → 群层的超额不再影响他（档位占位语义）")
+
+    print("\n[16] 指令总权限的成员 / 全局层（v1.0.0：reload 必须装上这两类）")
+    m_only = R(command_master={"member": {"88888:10001": "deny"}})
+    v = gate.check_command(G.Subject(sender_id="10001", group_id="88888"), "draw", m_only)
+    check(not v.allow and v.layer == "member", "成员层指令总权限=禁止 → 只拦他在这个群的指令")
+    check(gate.check_command(G.Subject(sender_id="10001"), "draw", m_only).allow,
+          "同一人私聊不受成员层规则影响（成员层只在群聊参与）")
+    m_level = R(
+        subject_level={"user": {"10002": 3}},
+        level_command_effect={("user", 3): "deny"},
+    )
+    v = gate.check_command(G.Subject(sender_id="10002", group_id="88888"), "draw", m_level)
+    check(not v.allow and v.layer == "user_level", "成员/全局层之外，等级禁止照常生效")
+    g_deny = R(command_master={"global": {"*": "deny"}})
+    v = gate.check_command(G.Subject(sender_id="10003"), "draw", g_deny)
+    check(not v.allow and v.layer == "global", "全局指令总权限=禁止 → 谁都用不了（兜底层）")
+    # 全局层的「放行」不是万能通行证：它只解除对象级拦截，第二段（单条指令/默认策略）照走
+    g_master = R(command_master={"global": {"*": "allow"}})
+    g_gate = make_gate(default_command_effect="deny")
+    check(
+        not g_gate.check_command(G.Subject(sender_id="10001"), "draw", g_master).allow,
+        "全局指令总权限=放行 ≠ 白名单通行证：默认策略=禁止时单条指令仍被拦",
+    )
+    check(gate.check_command(G.Subject(sender_id="10001"), "draw", g_master).allow,
+          "默认策略=放行时，全局放行不改变结果")
 
     print()
     if _failures:

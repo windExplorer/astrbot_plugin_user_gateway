@@ -245,6 +245,9 @@ function mxScope(): { scopeType: string; scopeId: string; scene: "private" | "gr
 
 async function loadMatrixObjects() {
   mxId.value = "";
+  // 群成员模式才有「先选群」这一步；其它模式清掉残留的群号，
+  // 否则切回 member 时下拉显示旧群但成员列表是空的（还得切走再切回来才触发）
+  if (mxType.value !== "member") mxGroupId.value = "";
   mxRows.value = [];
   mxSummary.value = null;
   try {
