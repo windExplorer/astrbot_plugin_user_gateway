@@ -75,6 +75,7 @@ $includeList = @(
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
+    "logo.png",   # plugin logo shown in the AstrBot plugin list (docs: root logo.png)
     "pages"
 )
 
