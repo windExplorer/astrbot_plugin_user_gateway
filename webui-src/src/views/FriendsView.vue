@@ -68,6 +68,14 @@ const activeFilterCount = computed(
 function fmtTokens(n: number | undefined | null): string {
   return n ? `${(n / 1000).toFixed(1)}K` : "0";
 }
+/** 卡片上的权限徽标：只展示，不编辑（编辑进详情抽屉）。 */
+function effectMeta(v: string | undefined | null) {
+  const e = v || "inherit";
+  return {
+    type: e === "deny" ? ("error" as const) : e === "allow" ? ("success" as const) : ("default" as const),
+    text: e === "deny" ? "禁止" : e === "allow" ? "放行" : "继承",
+  };
+}
 /** 移动端筛选面板的「搜索」：应用条件并收起面板。 */
 function applyFilters() {
   search();
@@ -598,14 +606,13 @@ onUnmounted(() => {
             </div>
             <span class="m-arrow">›</span>
           </div>
-          <div class="m-row" @click.stop>
-            <span class="m-label">LLM</span>
-            <effect-segment :effect="row.effect" @change="(v: string) => applyEffect([{ scope_id: row.uin, effect: v }])" />
-            <span class="m-label" style="margin-left: 12px">指令</span>
-            <effect-segment
-              :effect="row.effect_command || 'inherit'"
-              @change="(v: string) => applyPolicy([{ scope_id: row.uin, effect: v }], 'command')"
-            />
+          <div class="m-row">
+            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect).type">
+              LLM：{{ effectMeta(row.effect).text }}
+            </n-tag>
+            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect_command).type">
+              指令：{{ effectMeta(row.effect_command).text }}
+            </n-tag>
           </div>
           <div class="m-meta">
             <span>今日 {{ fmtTokens(row.today_tokens) }}</span>

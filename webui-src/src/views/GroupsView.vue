@@ -66,6 +66,14 @@ const activeFilterCount = computed(
 function fmtTokens(n: number | undefined | null): string {
   return n ? `${(n / 1000).toFixed(1)}K` : "0";
 }
+/** 卡片上的权限徽标：只展示，不编辑（编辑进详情抽屉）。 */
+function effectMeta(v: string | undefined | null) {
+  const e = v || "inherit";
+  return {
+    type: e === "deny" ? ("error" as const) : e === "allow" ? ("success" as const) : ("default" as const),
+    text: e === "deny" ? "禁止" : e === "allow" ? "放行" : "继承",
+  };
+}
 /** 移动端筛选面板的「搜索」：应用条件并收起面板。 */
 function applyFilters() {
   search();
@@ -582,13 +590,12 @@ onUnmounted(() => {
             <span class="m-arrow">›</span>
           </div>
           <div class="m-row" @click.stop>
-            <span class="m-label">LLM</span>
-            <effect-segment :effect="row.effect" @change="(v: string) => applyEffect([{ scope_id: row.group_id, effect: v }])" />
-            <span class="m-label" style="margin-left: 12px">指令</span>
-            <effect-segment
-              :effect="row.effect_command || 'inherit'"
-              @change="(v: string) => applyPolicy([{ scope_id: row.group_id, effect: v }], 'command')"
-            />
+            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect).type">
+              LLM：{{ effectMeta(row.effect).text }}
+            </n-tag>
+            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect_command).type">
+              指令：{{ effectMeta(row.effect_command).text }}
+            </n-tag>
             <n-button size="tiny" quaternary style="margin-left: auto" @click="openMembers(row)">
               成员
             </n-button>
