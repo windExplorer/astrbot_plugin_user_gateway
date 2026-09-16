@@ -59,6 +59,8 @@ astrbot_plugin_user_gateway/
 - **必须单文件产物**：`vite.config.ts` 的 `inlineDynamicImports: true` 是有意为之——
   AstrBot 按资源路径重写并追加 asset_token，多 chunk 会被搞成 401 白屏。
   因此**路由懒加载没有收益**（动态 import 会被内联回单文件），视图保持同步导入；
+- **小图必须内联**：`assetsInlineLimit: 300KB` —— JS 运行时注入的图片（顶栏 logo 等）
+  走不了 token 重写，独立图片文件会 401；新增图片资源请保持在 300KB 内（超了先压缩）；
 - 样式经 `vite-plugin-css-injected-by-js` 内联进 JS（`cssCodeSplit: false`），只加载一个 js；
 - 图表容器自适应：`EChart.vue` 已挂 `ResizeObserver`，窄屏 / 旋转自动 resize，无需额外处理。
 

@@ -2,6 +2,25 @@
 
 本文件记录各版本的改动。版本号与 `metadata.yaml` 保持一致。
 
+## v1.0.11（修复：WebUI 里 Logo 不显示）
+
+### 原因
+
+Logo 之前作为**独立图片文件**随页面发布（`assets/logo-xxx.png`），而这套沙箱环境对
+运行时注入的资源请求有 asset_token 校验——独立图片文件拿不到 token，请求 401，
+图片就空了（与当年 CSS 必须内联进 JS 是同一个坑，见 `vite.config.ts` 注释）。
+
+### 修复
+
+- `assetsInlineLimit` 提到 **300KB**：Logo 内联成 data URI 直接进 JS 包，
+  不再产生独立图片请求（包体 +165KB，即 Logo 的 base64）；
+- `DEVELOPMENT.md` 构建约束补充：新增图片资源须保持在 300KB 内内联。
+
+### 说明
+
+- favicon 指向的 `pages/logo.png` 保留：iframe 里浏览器标签页本就不显示子页面的
+  favicon，但直接用 URL 打开控制台时仍然有效。
+
 ## v1.0.10（品牌 Logo）
 
 - 新增插件 Logo（`logo.png`），README 顶部展示；
