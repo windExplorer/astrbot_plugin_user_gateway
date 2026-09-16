@@ -63,6 +63,15 @@ astrbot_plugin_user_gateway/
   `user` / `group` / `member`，成员维度键为 `群号:QQ`）；
 - schema 版本存在 `settings` 表，历史 v1 → v7 均有可重入迁移脚本。
 
+## 已知边界（结构性限制）
+
+- 统计 / 额度 / 权限 / 模型路由全部挂在**消息事件管线**的钩子上
+  （`on_waiting_llm_request` / `on_llm_request` / `on_llm_response`）。
+  插件若**绕过管线直接调用 provider**（如 `provider.text_chat`，常见于定时 AI 播报、
+  会话总结类插件），这些钩子不会触发——对应消耗不计统计、不扣额度、不受管控。
+  已在 README 常见问题向用户说明；若要硬补需 patch 框架内部类，
+  且底层调用没有事件上下文、拿不到归属对象，暂不实施。
+
 ## 里程碑历史（M0–M11，全部完成）
 
 | 里程碑 | 内容 | 版本 |
