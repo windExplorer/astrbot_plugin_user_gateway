@@ -54,6 +54,14 @@ astrbot_plugin_user_gateway/
 1. 加入 `build_zip.ps1` 的 `$includeList`；
 2. 若该模块需要在插件热更新时生效，确认它被重新导入（见主 `main.py` 的导入区）。
 
+### 前端构建约束（勿改）
+
+- **必须单文件产物**：`vite.config.ts` 的 `inlineDynamicImports: true` 是有意为之——
+  AstrBot 按资源路径重写并追加 asset_token，多 chunk 会被搞成 401 白屏。
+  因此**路由懒加载没有收益**（动态 import 会被内联回单文件），视图保持同步导入；
+- 样式经 `vite-plugin-css-injected-by-js` 内联进 JS（`cssCodeSplit: false`），只加载一个 js；
+- 图表容器自适应：`EChart.vue` 已挂 `ResizeObserver`，窄屏 / 旋转自动 resize，无需额外处理。
+
 ## 存储要点
 
 - 单文件库 `user_gateway.db`，**WAL 模式 + `synchronous=NORMAL` + `foreign_keys=ON`**；

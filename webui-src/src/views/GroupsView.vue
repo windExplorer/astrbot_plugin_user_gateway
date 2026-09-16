@@ -66,6 +66,11 @@ const activeFilterCount = computed(
 function fmtTokens(n: number | undefined | null): string {
   return n ? `${(n / 1000).toFixed(1)}K` : "0";
 }
+/** 移动端筛选面板的「搜索」：应用条件并收起面板。 */
+function applyFilters() {
+  search();
+  mobileFilters.value = false;
+}
 
 // 详情抽屉
 const drawerShow = ref(false);
@@ -528,7 +533,7 @@ onUnmounted(() => {
         @update:value="search"
       />
       <n-space :size="8">
-        <n-button size="small" @click="search">搜索</n-button>
+        <n-button size="small" type="primary" ghost @click="applyFilters">搜索</n-button>
         <n-button size="small" :loading="syncing" @click="syncNow">同步列表</n-button>
         <n-button size="small" :loading="refreshingAvatars" @click="refreshAvatars">更新头像</n-button>
       </n-space>

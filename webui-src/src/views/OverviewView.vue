@@ -185,42 +185,42 @@ const scopeColumns: DataTableColumns<any> = [
   <n-space vertical :size="16">
     <n-spin :show="loading">
       <n-grid :cols="4" :x-gap="12" :y-gap="12" item-responsive responsive="screen">
-        <n-grid-item span="4 m:1">
+        <n-grid-item span="2 m:1">
           <n-card size="small" embedded>
             <n-statistic label="LLM 调用次数" :value="fmt(totals?.calls)" />
           </n-card>
         </n-grid-item>
-        <n-grid-item span="4 m:1">
+        <n-grid-item span="2 m:1">
           <n-card size="small" embedded>
             <n-statistic label="token 总量" :value="fmt(totals?.tok_total)" />
           </n-card>
         </n-grid-item>
-        <n-grid-item span="4 m:1">
+        <n-grid-item span="2 m:1">
           <n-card size="small" embedded>
             <n-statistic label="被拒次数" :value="fmt(totals?.denied)" />
           </n-card>
         </n-grid-item>
-        <n-grid-item span="4 m:1">
+        <n-grid-item span="2 m:1">
           <n-card size="small" embedded>
             <n-statistic label="平均延迟(ms)" :value="Math.round(Number(totals?.avg_latency || 0))" />
           </n-card>
         </n-grid-item>
-        <n-grid-item span="4 m:1">
+        <n-grid-item span="2 m:1">
           <n-card size="small" embedded>
             <n-statistic label="输入 token" :value="fmt(totals?.tok_in_other)" />
           </n-card>
         </n-grid-item>
-        <n-grid-item span="4 m:1">
+        <n-grid-item span="2 m:1">
           <n-card size="small" embedded>
             <n-statistic label="缓存 token" :value="fmt(totals?.tok_in_cached)" />
           </n-card>
         </n-grid-item>
-        <n-grid-item span="4 m:1">
+        <n-grid-item span="2 m:1">
           <n-card size="small" embedded>
             <n-statistic label="输出 token" :value="fmt(totals?.tok_out)" />
           </n-card>
         </n-grid-item>
-        <n-grid-item span="4 m:1">
+        <n-grid-item span="2 m:1">
           <n-card size="small" embedded>
             <n-statistic label="活跃用户 / 群" :value="`${totals?.users || 0} / ${totals?.groups || 0}`" />
           </n-card>
