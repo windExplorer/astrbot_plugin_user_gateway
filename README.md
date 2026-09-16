@@ -1,5 +1,9 @@
 # 萌萌权限控制台（astrbot_plugin_user_gateway）
 
+<p align="center">
+  <img src="logo.png" alt="萌萌权限控制台" width="180" />
+</p>
+
 AstrBot 插件：**按好友 / 按群细粒度管控 LLM 使用权限与 token 额度**，并提供用量统计与可视化控制台。
 
 - 插件展示名：**萌萌权限控制台**

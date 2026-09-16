@@ -25,6 +25,7 @@ import { apiGet, type PingInfo } from "./api";
 import { getContext, onContext, storageGet, storageSet } from "./bridge";
 import { PLUGIN_VERSION } from "./version";
 import { useIsMobile } from "./responsive";
+import logoUrl from "./assets/logo.png";
 
 const route = useRoute();
 
@@ -130,6 +131,11 @@ onMounted(pingBackend);
         >
           <div style="display: flex; align-items: center; gap: 10px; min-width: 0">
             <n-button v-if="isMobile" size="small" quaternary @click="mobileMenuOpen = true">菜单</n-button>
+            <img
+              :src="logoUrl"
+              alt="logo"
+              style="width: 30px; height: 30px; border-radius: 8px; object-fit: cover; display: block"
+            />
             <span style="font-size: 17px; font-weight: 600; white-space: nowrap">萌萌权限控制台</span>
             <n-tag v-if="!isMobile" size="small" type="info" :bordered="false">v{{ backendVersion }}</n-tag>
             <n-tag v-if="ping && !ping.db_ready" size="small" type="error" :bordered="false">数据库未就绪</n-tag>
@@ -170,7 +176,14 @@ onMounted(pingBackend);
         <n-drawer v-model:show="mobileMenuOpen" placement="left" :width="220">
           <n-drawer-content :body-content-style="{ padding: '8px 0' }">
             <template #header>
-              <span style="font-size: 15px; font-weight: 600">导航</span>
+              <span style="display: inline-flex; align-items: center; gap: 8px">
+                <img
+                  :src="logoUrl"
+                  alt="logo"
+                  style="width: 26px; height: 26px; border-radius: 6px; object-fit: cover; display: block"
+                />
+                <span style="font-size: 15px; font-weight: 600">导航</span>
+              </span>
             </template>
             <n-menu :value="activeKey" :options="menuOptions" :root-indent="18" />
           </n-drawer-content>
