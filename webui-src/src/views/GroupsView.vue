@@ -2,6 +2,8 @@
 // 群聊：QQ 群列表 + 等级 / LLM 权限 / 生效额度 / 最后回复，支持逐个与批量管控。
 // 群成员级管控（展开成员列表）按 PRD 排期在 M3，此处预留入口。
 import { computed, h, onMounted, onUnmounted, ref } from "vue";
+
+import { useIsMobile } from "../responsive";
 import {
   NButton,
   NCard,
@@ -54,6 +56,16 @@ const levelFilter = ref("");
 const checked = ref<string[]>([]);
 const levels = ref<LevelRow[]>([]);
 const batchLevelId = ref<number | null>(null);
+
+// 移动端：卡片列表 + 可折叠筛选面板（桌面端仍是完整表格）
+const isMobile = useIsMobile();
+const mobileFilters = ref(false);
+const activeFilterCount = computed(
+  () => [effectFilter.value, cmdFilter.value, levelFilter.value, keyword.value.trim()].filter(Boolean).length,
+);
+function fmtTokens(n: number | undefined | null): string {
+  return n ? `${(n / 1000).toFixed(1)}K` : "0";
+}
 
 // 详情抽屉
 const drawerShow = ref(false);
@@ -442,7 +454,11 @@ onUnmounted(() => {
       </n-space>
     </template>
     <template #header-extra>
-      <n-space :size="8" align="center">
+      <!-- 移动端：只留「筛选」入口（带生效条件数），控件收进下方可折叠面板 -->
+      <n-button v-if="isMobile" size="small" @click="mobileFilters = !mobileFilters">
+        筛选{{ activeFilterCount ? `（${activeFilterCount}）` : "" }}
+      </n-button>
+      <n-space v-else :size="8" align="center">
         <n-input
           v-model:value="keyword"
           size="small"
@@ -483,7 +499,42 @@ onUnmounted(() => {
       </n-space>
     </template>
 
-    <n-space v-if="checked.length" align="center" :size="8" style="margin-bottom: 10px">
+    <!-- 移动端筛选面板：控件纵向铺满，不挤在一行 -->
+    <div v-if="isMobile && mobileFilters" class="m-filters">
+      <n-input
+        v-model:value="keyword"
+        size="small"
+        placeholder="群号 / 群名"
+        clearable
+        @keyup.enter="search"
+      />
+      <select v-model="effectFilter" class="plain-select" @change="search">
+        <option value="">全部 LLM 权限</option>
+        <option value="allow">LLM 放行</option>
+        <option value="deny">LLM 禁止</option>
+        <option value="inherit">LLM 继承</option>
+      </select>
+      <select v-model="cmdFilter" class="plain-select" @change="search">
+        <option value="">全部指令权限</option>
+        <option value="allow">指令放行</option>
+        <option value="deny">指令禁止</option>
+        <option value="inherit">指令继承</option>
+      </select>
+      <n-select v-model:value="sort" size="small" :options="sortOptions" @update:value="search" />
+      <n-select
+        v-model:value="levelFilter"
+        size="small"
+        :options="levelFilterOptions"
+        @update:value="search"
+      />
+      <n-space :size="8">
+        <n-button size="small" @click="search">搜索</n-button>
+        <n-button size="small" :loading="syncing" @click="syncNow">同步列表</n-button>
+        <n-button size="small" :loading="refreshingAvatars" @click="refreshAvatars">更新头像</n-button>
+      </n-space>
+    </div>
+
+    <n-space v-if="checked.length && !isMobile" align="center" :size="8" style="margin-bottom: 10px">
       <span style="font-size: 12px; opacity: 0.7">已选 {{ checked.length }} 个</span>
       <n-dropdown trigger="click" :options="batchOptions" @select="onBatch">
         <n-button size="small" type="primary" ghost>批量权限</n-button>
@@ -511,7 +562,43 @@ onUnmounted(() => {
     </n-empty>
 
     <template v-else>
+      <!-- 移动端：卡片列表，只展示关键信息，点卡片进详情 -->
+      <div v-if="isMobile" class="m-list">
+        <div v-for="row in rows" :key="row.group_id" class="m-card" @click="openDetail(row)">
+          <div class="m-head">
+            <subject-avatar kind="group" :id="row.group_id" :name="row.name" :size="40" />
+            <div class="m-title">
+              <div class="m-name">{{ row.name || row.group_id }}</div>
+              <div class="m-sub">
+                {{ row.group_id }} · {{ row.level_name || "未分组" }}
+                <template v-if="row.member_count"> · {{ row.member_count }} 人</template>
+              </div>
+            </div>
+            <span class="m-arrow">›</span>
+          </div>
+          <div class="m-row" @click.stop>
+            <span class="m-label">LLM</span>
+            <effect-segment :effect="row.effect" @change="(v: string) => applyEffect([{ scope_id: row.group_id, effect: v }])" />
+            <span class="m-label" style="margin-left: 12px">指令</span>
+            <effect-segment
+              :effect="row.effect_command || 'inherit'"
+              @change="(v: string) => applyPolicy([{ scope_id: row.group_id, effect: v }], 'command')"
+            />
+            <n-button size="tiny" quaternary style="margin-left: auto" @click="openMembers(row)">
+              成员
+            </n-button>
+          </div>
+          <div class="m-meta">
+            <span>今日 {{ fmtTokens(row.today_tokens) }}</span>
+            <span v-if="row.last_bot_ts" class="m-reply">
+              {{ kindMeta(row.last_bot_kind).text }} · {{ relTime(row.last_bot_ts) }}
+            </span>
+            <span v-else style="opacity: 0.5">无回复记录</span>
+          </div>
+        </div>
+      </div>
       <n-data-table
+        v-else
         v-model:checked-row-keys="checked"
         :columns="columns"
         :data="rows"
@@ -527,7 +614,8 @@ onUnmounted(() => {
           v-model:page-size="size"
           :item-count="total"
           :page-sizes="[20, 50, 100]"
-          show-size-picker
+          :show-size-picker="!isMobile"
+          simple
           @update:page="load"
           @update:page-size="search"
         />
@@ -554,5 +642,80 @@ onUnmounted(() => {
   background: transparent;
   padding: 0 6px;
   font-size: 13px;
+}
+
+/* ---- 移动端卡片列表（与好友页一致） ---- */
+.m-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.m-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.m-card {
+  border: 1px solid rgba(128, 128, 128, 0.25);
+  border-radius: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+.m-card:active {
+  background: rgba(128, 128, 128, 0.12);
+}
+.m-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.m-title {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.35;
+}
+.m-name {
+  font-size: 14px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.m-sub {
+  font-size: 12px;
+  opacity: 0.6;
+}
+.m-arrow {
+  font-size: 20px;
+  opacity: 0.35;
+  line-height: 1;
+}
+.m-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+.m-label {
+  font-size: 12px;
+  opacity: 0.6;
+  width: 26px;
+}
+.m-meta {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.75;
+}
+.m-reply {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
 }
 </style>
