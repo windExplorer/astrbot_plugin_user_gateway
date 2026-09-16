@@ -18,7 +18,6 @@ import {
   NSelect,
   NSpace,
   NSpin,
-  NStatistic,
   NTag,
   useMessage,
 } from "naive-ui";
@@ -133,6 +132,14 @@ function fmtNum(n: number | undefined | null): string {
   if (v >= 1_000) return (v / 1_000).toFixed(1) + "K";
   return String(v);
 }
+
+/** 用量概览的迷你统计块（2×2，替代挤爆窄屏的 4 列 statistic）。 */
+const usageStats = computed(() => [
+  { label: "今日 token", value: fmtNum(detail.value?.today?.tok_total) },
+  { label: "今日调用", value: String(detail.value?.today?.calls || 0) },
+  { label: "7 日 token", value: fmtNum(detail.value?.stats?.totals?.tok_total) },
+  { label: "7 日被拒", value: String(detail.value?.stats?.totals?.denied || 0) },
+]);
 
 async function load() {
   if (!props.id) return;
@@ -543,18 +550,13 @@ watch(
           </n-card>
 
           <n-card size="small" title="用量概览">
-            <n-grid :cols="4" :x-gap="10" :y-gap="8">
-              <n-grid-item>
-                <n-statistic label="今日 token" :value="fmtNum(detail?.today?.tok_total)" />
-              </n-grid-item>
-              <n-grid-item>
-                <n-statistic label="今日调用" :value="String(detail?.today?.calls || 0)" />
-              </n-grid-item>
-              <n-grid-item>
-                <n-statistic label="7 日 token" :value="fmtNum(detail?.stats?.totals?.tok_total)" />
-              </n-grid-item>
-              <n-grid-item>
-                <n-statistic label="7 日被拒" :value="String(detail?.stats?.totals?.denied || 0)" />
+            <!-- 2×2 迷你统计块：窄屏（抽屉 94% 宽）下 4 列 statistic 会挤爆 -->
+            <n-grid :cols="2" :x-gap="10" :y-gap="10">
+              <n-grid-item v-for="s in usageStats" :key="s.label">
+                <div class="u-stat">
+                  <div class="u-stat-label">{{ s.label }}</div>
+                  <div class="u-stat-value">{{ s.value }}</div>
+                </div>
               </n-grid-item>
             </n-grid>
             <n-empty
@@ -582,3 +584,21 @@ watch(
     </n-drawer-content>
   </n-drawer>
 </template>
+
+<style scoped>
+/* 用量概览的迷你统计块（替代拥挤的 4 列 n-statistic） */
+.u-stat {
+  background: rgba(128, 128, 128, 0.09);
+  border-radius: 8px;
+  padding: 8px 10px;
+  line-height: 1.4;
+}
+.u-stat-label {
+  font-size: 11.5px;
+  opacity: 0.6;
+}
+.u-stat-value {
+  font-size: 15px;
+  font-weight: 600;
+}
+</style>
