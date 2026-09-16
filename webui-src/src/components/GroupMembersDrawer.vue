@@ -39,6 +39,10 @@ import {
   apiSyncGroupMembers,
   type GroupMemberRow,
 } from "../api";
+import { useIsMobile } from "../responsive";
+
+// 窄屏时成员抽屉占满屏宽（96%）
+const isMobile = useIsMobile();
 import { dropAvatars, loadAvatars } from "../avatarStore";
 import EffectSegment from "./EffectSegment.vue";
 import SubjectAvatar from "./SubjectAvatar.vue";
@@ -442,7 +446,7 @@ watch(
 </script>
 
 <template>
-  <n-drawer v-model:show="showDrawer" :width="920" placement="right">
+  <n-drawer v-model:show="showDrawer" :width="isMobile ? '96%' : 920" placement="right">
     <n-drawer-content :title="`群成员：${props.groupName || props.groupId}`" closable>
       <n-space vertical :size="12">
         <n-card size="small">
@@ -538,7 +542,7 @@ watch(
       v-model:show="quotaShow"
       preset="card"
       :title="`设置额度：${quotaTargetLabel}（仅本群生效）`"
-      style="width: 640px"
+      style="width: 640px; max-width: 94vw"
     >
       <n-space vertical :size="12">
         <span style="font-size: 12px; opacity: 0.7; line-height: 1.6">

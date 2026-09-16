@@ -707,6 +707,7 @@ onMounted(() => {
           :bordered="false"
           size="small"
           :max-height="280"
+          :scroll-x="430"
         />
       </n-space>
       <template #footer>

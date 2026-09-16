@@ -529,6 +529,7 @@ const heatOption = computed(() => {
               :bordered="false"
               size="small"
               :max-height="460"
+              :scroll-x="1000"
               :row-key="(r: UsageRow) => r.id"
             />
             <n-space justify="center" style="margin-top: 12px">
@@ -558,6 +559,7 @@ const heatOption = computed(() => {
               :bordered="false"
               size="small"
               :max-height="460"
+              :scroll-x="620"
               :row-key="(r: AuditRow) => r.id"
             />
             <n-space justify="center" style="margin-top: 12px">
@@ -573,7 +575,7 @@ const heatOption = computed(() => {
       </n-tabs>
     </n-spin>
 
-    <n-modal v-model:show="csvOpen" preset="card" :title="`导出内容：${csvName}`" style="width: 720px">
+    <n-modal v-model:show="csvOpen" preset="card" :title="`导出内容：${csvName}`" style="width: 720px; max-width: 94vw">
       <n-space vertical :size="10">
         <span style="font-size: 12px; opacity: 0.65">
           若浏览器拦截了自动下载，点「复制」把内容粘到记事本，另存为 .csv 即可（已带 UTF-8 BOM，Excel 不乱码）。

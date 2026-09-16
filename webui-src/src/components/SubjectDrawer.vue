@@ -25,8 +25,12 @@ import {
 
 import { apiLevels, apiPost, apiSetSubjectLevel, apiSubject, type LevelRow, type SubjectDetail } from "../api";
 import EChart from "../EChart.vue";
+import { useIsMobile } from "../responsive";
 import EffectSegment from "./EffectSegment.vue";
 import SubjectAvatar from "./SubjectAvatar.vue";
+
+// 窄屏时抽屉占满屏宽（94%）
+const isMobile = useIsMobile();
 
 const props = defineProps<{
   show: boolean;
@@ -375,7 +379,7 @@ watch(
 <template>
   <n-drawer
     :show="props.show"
-    :width="640"
+    :width="isMobile ? '94%' : 640"
     placement="right"
     @update:show="(v) => emit('update:show', v)"
   >
@@ -568,6 +572,7 @@ watch(
               :columns="recentColumns"
               :data="recentData"
               size="small"
+              :scroll-x="560"
               :bordered="false"
               :max-height="260"
             />

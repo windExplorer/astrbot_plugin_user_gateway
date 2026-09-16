@@ -348,7 +348,7 @@ onMounted(load);
       </n-space>
     </n-card>
 
-    <n-modal v-model:show="exportOpen" preset="card" :title="`导出内容：${exportName}`" style="width: 780px">
+    <n-modal v-model:show="exportOpen" preset="card" :title="`导出内容：${exportName}`" style="width: 780px; max-width: 94vw">
       <n-space vertical :size="10">
         <span style="font-size: 12px; opacity: 0.7">{{ exportMeta }}</span>
         <span style="font-size: 12px; opacity: 0.65">

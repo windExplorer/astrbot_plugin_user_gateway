@@ -635,7 +635,7 @@ onMounted(load);
         </n-space>
       </template>
       <n-empty v-if="!loading && !levels.length" description="还没有等级 —— 可以先建「普通 / VIP」两档试试" style="padding: 30px 0" />
-      <n-data-table v-else :columns="levelColumns" :data="levels" :loading="loading" :bordered="false" size="small" />
+      <n-data-table v-else :columns="levelColumns" :data="levels" :loading="loading" :bordered="false" size="small" :scroll-x="720" />
     </n-card>
 
     <!-- 对象专属额度 -->
@@ -650,11 +650,11 @@ onMounted(load);
         <n-button size="small" type="primary" @click="openQuotaEditor()">新增专属额度</n-button>
       </template>
       <n-empty v-if="!loading && !specificRows.length" description="还没有对象专属额度" style="padding: 30px 0" />
-      <n-data-table v-else :columns="quotaColumns" :data="specificRows" :loading="loading" :bordered="false" size="small" />
+      <n-data-table v-else :columns="quotaColumns" :data="specificRows" :loading="loading" :bordered="false" size="small" :scroll-x="520" />
     </n-card>
 
     <!-- 等级编辑弹窗 -->
-    <n-modal v-model:show="showLevelEditor" preset="card" :title="levelForm.id ? '编辑等级' : '新增等级'" style="width: 560px">
+    <n-modal v-model:show="showLevelEditor" preset="card" :title="levelForm.id ? '编辑等级' : '新增等级'" style="width: 560px; max-width: 94vw">
       <n-form label-placement="left" label-width="110">
         <n-form-item label="适用">
           <n-radio-group v-model:value="levelForm.kind" :disabled="!!levelForm.id">
@@ -723,7 +723,7 @@ onMounted(load);
           <n-select
             v-model:value="levelForm.provider_id"
             size="small"
-            style="width: 360px"
+            style="width: 360px; max-width: 100%"
             clearable
             filterable
             placeholder="搜索并选择模型（留空 = 跟随 AstrBot 默认）"
@@ -735,7 +735,7 @@ onMounted(load);
             <n-select
               v-model:value="levelForm.fallback_provider_id"
               size="small"
-              style="width: 360px"
+              style="width: 360px; max-width: 100%"
               clearable
               filterable
               placeholder="主模型不可用时改用它（可选）"
@@ -779,7 +779,7 @@ onMounted(load);
     </n-modal>
 
     <!-- 专属额度编辑弹窗 -->
-    <n-modal v-model:show="showQuotaEditor" preset="card" title="专属额度" style="width: 460px">
+    <n-modal v-model:show="showQuotaEditor" preset="card" title="专属额度" style="width: 460px; max-width: 94vw">
       <n-form label-placement="left" label-width="92">
         <n-form-item label="对象类型">
           <n-radio-group v-model:value="quotaForm.scope_type">

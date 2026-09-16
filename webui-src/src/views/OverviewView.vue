@@ -274,6 +274,7 @@ const scopeColumns: DataTableColumns<any> = [
               :bordered="false"
               size="small"
               :max-height="300"
+              :scroll-x="420"
             />
           </n-card>
         </n-grid-item>
