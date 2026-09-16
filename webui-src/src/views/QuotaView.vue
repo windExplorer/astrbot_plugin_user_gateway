@@ -552,7 +552,12 @@ const quotaColumns: DataTableColumns<QuotaRow> = [
   },
 ];
 
-const levelCount = computed(() => levels.value.length);
+// 等级筛选：全部 / 好友（私聊）/ 群（群聊）；数据一次拉全，这里只是前端过滤
+const levelKindFilter = ref<"" | "user" | "group">("");
+const filteredLevels = computed(() =>
+  levelKindFilter.value ? levels.value.filter((l) => l.kind === levelKindFilter.value) : levels.value,
+);
+const levelCount = computed(() => filteredLevels.value.length);
 
 onMounted(load);
 </script>
@@ -626,7 +631,12 @@ onMounted(load);
         </n-space>
       </template>
       <template #header-extra>
-        <n-space :size="8">
+        <n-space :size="8" align="center">
+          <n-radio-group v-model:value="levelKindFilter" size="small">
+            <n-radio-button value="">全部</n-radio-button>
+            <n-radio-button value="user">好友（私聊）</n-radio-button>
+            <n-radio-button value="group">群（群聊）</n-radio-button>
+          </n-radio-group>
           <n-button size="small" @click="load">刷新</n-button>
           <n-button size="small" @click="openLevelEditor()">新增好友等级</n-button>
           <n-button size="small" @click="openLevelEditor({ id: 0, kind: 'group', name: '', description: '', effect: 'inherit', sort_order: 0, members: 0, quotas: {} } as any)">
@@ -634,8 +644,12 @@ onMounted(load);
           </n-button>
         </n-space>
       </template>
-      <n-empty v-if="!loading && !levels.length" description="还没有等级 —— 可以先建「普通 / VIP」两档试试" style="padding: 30px 0" />
-      <n-data-table v-else :columns="levelColumns" :data="levels" :loading="loading" :bordered="false" size="small" :scroll-x="720" />
+      <n-empty
+        v-if="!loading && !filteredLevels.length"
+        :description="levels.length ? '该类型下还没有等级' : '还没有等级 —— 可以先建「普通 / VIP」两档试试'"
+        style="padding: 30px 0"
+      />
+      <n-data-table v-else :columns="levelColumns" :data="filteredLevels" :loading="loading" :bordered="false" size="small" :scroll-x="720" />
     </n-card>
 
     <!-- 对象专属额度 -->
