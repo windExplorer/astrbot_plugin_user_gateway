@@ -357,13 +357,13 @@ const columns: DataTableColumns<FriendRow> = [
   {
     title: "群聊等级",
     key: "level_id_group",
-    width: 130,
+    width: 140,
     render: (row) =>
       h(NSelect, {
         size: "tiny",
         value: row.level_id_group ?? -1,
         options: [
-          { label: "跟随私聊", value: -1 },
+          { label: "未分组（用群的档位）", value: -1 },
           ...levelOptions.value,
         ],
         consistentMenuWidth: false,

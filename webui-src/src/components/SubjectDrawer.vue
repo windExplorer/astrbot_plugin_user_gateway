@@ -74,7 +74,7 @@ const levelId = ref(0);
 const levelIdGroup = ref(-1);
 const levelOptions = ref<{ label: string; value: number }[]>([{ label: "未分组", value: 0 }]);
 const groupLevelOptions = computed(() => [
-  { label: "跟随私聊等级", value: -1 },
+  { label: "未分组（用群的档位）", value: -1 },
   ...levelOptions.value,
 ]);
 // 好友专属模型（仅私聊生效；空 = 跟随等级配置）
@@ -240,7 +240,9 @@ async function saveLevelGroup(v: number) {
         scene: "group",
       },
     ]);
-    message.success(v === -1 ? "群聊等级已恢复跟随私聊" : "群聊等级已更新");
+    message.success(
+      v === -1 ? "已清除群聊专属等级（群聊走群的档位）" : "群聊等级已更新",
+    );
     emit("changed");
     await load();
   } catch (e: any) {
@@ -533,7 +535,9 @@ watch(
                     :disabled="saving"
                     @update:value="saveLevelGroup"
                   />
-                  <span style="font-size: 12px; opacity: 0.6">群聊里用这档；「跟随私聊」= 两个场景同一档</span>
+                  <span style="font-size: 12px; opacity: 0.6">
+                    群聊里用这档；「未分组」= 不用他的好友等级，走群的档位
+                  </span>
                 </n-space>
               </template>
               <n-space v-else align="center" :size="10">

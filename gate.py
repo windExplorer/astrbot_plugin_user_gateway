@@ -165,11 +165,14 @@ class Rules:
         return int(got) if got else None
 
     def user_level_id_of(self, scope_id: str, scene: str) -> Optional[int]:
-        """好友在某场景下的等级（v8）：群聊优先用「群聊专属」，没配跟随私聊。"""
+        """好友在某场景下的等级（v8）。
+
+        私聊 = 私聊等级；**群聊默认不使用好友等级**（这个人就是普通群员，
+        走群的档位），只有显式配了「群聊专属等级」才参与判定。
+        """
         if scene == SCENE_GROUP:
             got = (self.subject_level_user_group or {}).get(str(scope_id))
-            if got:
-                return int(got)
+            return int(got) if got else None
         return self.level_id_of("user", scope_id)
 
 
