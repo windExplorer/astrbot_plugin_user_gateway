@@ -136,6 +136,8 @@ class Rules:
     level_effect: Mapping[Any, str] = field(default_factory=dict)
     level_effect_group: Mapping[Any, str] = field(default_factory=dict)
     subject_level: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+    subject_level_user_group: Mapping[str, int] = field(default_factory=dict)
+    """``{uin: level_id}`` —— 好友的**群聊专属**等级（v8；不配 = 跟随私聊等级）。"""
     limits: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     usage: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     level_model: Mapping[Any, Mapping[str, str]] = field(default_factory=dict)
@@ -161,6 +163,14 @@ class Rules:
         """对象所属等级 id；未归级返回 None。"""
         got = (self.subject_level.get(scope_type) or {}).get(str(scope_id))
         return int(got) if got else None
+
+    def user_level_id_of(self, scope_id: str, scene: str) -> Optional[int]:
+        """好友在某场景下的等级（v8）：群聊优先用「群聊专属」，没配跟随私聊。"""
+        if scene == SCENE_GROUP:
+            got = (self.subject_level_user_group or {}).get(str(scope_id))
+            if got:
+                return int(got)
+        return self.level_id_of("user", scope_id)
 
 
 @dataclass(frozen=True)
@@ -296,7 +306,8 @@ class Gate:
             )
         if uid:
             out.append(LayerRef(LAYER_USER, "user", uid, "user", uid, scene))
-            lv = rules.level_id_of("user", uid)
+            # 好友等级分场景（v8）：群聊用「群聊专属等级」，没配跟随私聊那档
+            lv = rules.user_level_id_of(uid, scene)
             if lv:
                 out.append(LayerRef(LAYER_USER_LEVEL, "level", str(lv), "user", uid, scene))
         if gid:

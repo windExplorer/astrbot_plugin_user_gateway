@@ -55,6 +55,7 @@ try:  # 包内相对导入（AstrBot 正常加载路径）
     )
     from .store import (
         COMMAND_MASTER_FEATURE,
+        MODEL_FEATURE,
         Store,
         member_scope_id,
         parse_member_scope_id,
@@ -81,6 +82,7 @@ except ImportError as _rel_err:
         )
         from store import (  # type: ignore
             COMMAND_MASTER_FEATURE,
+            MODEL_FEATURE,
             Store,
             member_scope_id,
             parse_member_scope_id,
@@ -144,6 +146,9 @@ class UserGatewayPlugin(Star):
         self._level_effect: dict[tuple[str, int], str] = {}
         self._subject_level_user: dict[str, int] = {}
         self._subject_level_group: dict[str, int] = {}
+        # 好友的群聊专属等级（v8）+ 好友专属模型（feature=model，仅私聊生效）
+        self._subject_level_user_group: dict[str, int] = {}
+        self._subject_model: dict[str, str] = {}
         # 等级模型路由：{(kind, level_id): {provider_id, model, fallback_provider_id}}
         self._level_route: dict[tuple[str, int], dict[str, str]] = {}
         # 限额规则：{scope_type(user|group|level|global): {scope_id: {period: row}}}
@@ -349,6 +354,17 @@ class UserGatewayPlugin(Star):
             }
             self._subject_level_user = await self.store.subject_level_map("user")
             self._subject_level_group = await self.store.subject_level_map("group")
+            # 好友的「群聊专属」等级（v8：私聊等级与群聊等级分开配）
+            self._subject_level_user_group = await self.store.subject_level_group_map()
+            # 好友专属模型（feature=model 的 policy；effect 存提供商 id，仅私聊生效）
+            self._subject_model = {
+                uid: pid
+                for uid, row in (
+                    await self.store.effect_map("user", feature=MODEL_FEATURE)
+                ).items()
+                for pid in [next(iter(row.values()), "") if row else ""]
+                if pid
+            }
 
             def _by_scope(rows: list[dict]) -> dict[str, dict[str, dict[str, Any]]]:
                 out: dict[str, dict[str, dict[str, Any]]] = {}
@@ -403,6 +419,7 @@ class UserGatewayPlugin(Star):
             effect_member=self._effect_member,
             level_effect=self._level_effect,
             subject_level={"user": self._subject_level_user, "group": self._subject_level_group},
+            subject_level_user_group=self._subject_level_user_group,
             limits=self._limits,
             usage={
                 "user": self._usage_user,
@@ -464,6 +481,33 @@ class UserGatewayPlugin(Star):
                 return
             subject = self._subject_of(event)
             self._last_route.pop(subject.umo, None)
+
+            # ① 好友专属模型（feature=model，仅私聊生效；优先级高于等级路由）
+            if not str(subject.group_id or ""):
+                override = (self._subject_model.get(str(subject.sender_id or "")) or "").strip()
+                if override:
+                    available = self.provider_ids() - self.circuit.open_ids()
+                    if override in available:
+                        event.set_extra("selected_provider", override)
+                        prov = self._provider_by_id(override)
+                        self._last_route[subject.umo] = {
+                            "provider_id": override,
+                            "model": str(prov.get_model() or "") if prov is not None else "",
+                            "used_fallback": False,
+                            "label": "好友专属",
+                            "layer": "subject_model",
+                        }
+                        if self._cfg("debug_log", False):
+                            logger.info(
+                                f"[UserGateway] 模型路由：{subject.umo} → {override}（好友专属）"
+                            )
+                        return
+                    if self._cfg("debug_log", False):
+                        logger.info(
+                            f"[UserGateway] 好友专属模型 {override} 当前不可用，回落等级路由｜{subject.umo}"
+                        )
+
+            # ② 等级模型路由
             route = self.gate.resolve_model(subject, self._rules())
             if not route:
                 return
@@ -1080,6 +1124,10 @@ class UserGatewayPlugin(Star):
                 out.update(picked)
                 if not picked:
                     out["reason"] = "配置的提供商当前不可用（未加载或已熔断），本次会走 AstrBot 默认模型"
+            # 好友专属模型：仅私聊生效，优先级高于等级配置
+            out["subject_model"] = (
+                (self._subject_model.get(str(scope_id)) or "") if scope_type == "user" else ""
+            )
             return out
         except Exception as e:
             logger.debug(f"[UserGateway] 解析模型路由失败（忽略）: {e}")

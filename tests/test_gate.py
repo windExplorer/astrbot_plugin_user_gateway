@@ -80,6 +80,7 @@ def R(**kw) -> G.Rules:
         level_effect=kw.get("level_effect") or {},
         level_effect_group=kw.get("level_effect_group") or {},
         subject_level=kw.get("subject_level") or {},
+        subject_level_user_group=kw.get("subject_level_user_group") or {},
         limits=kw.get("limits") or {},
         usage=kw.get("usage") or {},
         level_model=kw.get("level_model") or {},
@@ -461,6 +462,26 @@ def main() -> int:
     check(
         gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), sc4).allow,
         "群聊专属「放行」覆盖通用「禁止」",
+    )
+
+    # 好友等级分场景（v8）：群聊用「群聊专属等级」，没配跟随私聊
+    sl = R(
+        subject_level={"user": {"10002": 3}},
+        subject_level_user_group={"10002": 4},
+        level_effect={("user", 3): "deny", ("user", 4): "allow"},
+    )
+    check(not gate.check_permission(G.Subject(sender_id="10002"), sl).allow, "分场景归级：私聊走私聊等级")
+    check(
+        gate.check_permission(G.Subject(sender_id="10002", group_id="88888"), sl).allow,
+        "分场景归级：群聊走群聊专属等级",
+    )
+    sl2 = R(
+        subject_level={"user": {"10002": 3}},
+        level_effect={("user", 3): "allow"},
+    )
+    check(
+        gate.check_permission(G.Subject(sender_id="10002", group_id="88888"), sl2).allow,
+        "没配群聊专属 → 群聊跟随私聊等级（旧数据行为不变）",
     )
 
     # 好友等级：群聊有专属值，没配（inherit）就回落主值

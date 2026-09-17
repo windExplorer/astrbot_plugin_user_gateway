@@ -22,7 +22,15 @@ import {
   useMessage,
 } from "naive-ui";
 
-import { apiLevels, apiPost, apiSetSubjectLevel, apiSubject, type LevelRow, type SubjectDetail } from "../api";
+import {
+  apiLevels,
+  apiPost,
+  apiSetSubjectLevel,
+  apiSetSubjectModel,
+  apiSubject,
+  type LevelRow,
+  type SubjectDetail,
+} from "../api";
 import EChart from "../EChart.vue";
 import { useIsMobile } from "../responsive";
 import EffectSegment from "./EffectSegment.vue";
@@ -60,10 +68,22 @@ const cmdResolvedText = computed(() => {
   return `生效：${word}｜来源：${m.layer_label}`;
 });
 
-// 等级
+// 等级（v8 分场景）：levelId = 私聊；levelIdGroup = 群聊专属（-1 = 跟随私聊）
 const levels = ref<LevelRow[]>([]);
 const levelId = ref(0);
+const levelIdGroup = ref(-1);
 const levelOptions = ref<{ label: string; value: number }[]>([{ label: "未分组", value: 0 }]);
+const groupLevelOptions = computed(() => [
+  { label: "跟随私聊等级", value: -1 },
+  ...levelOptions.value,
+]);
+// 好友专属模型（仅私聊生效；空 = 跟随等级配置）
+const subjectModel = ref("");
+const modelSaving = ref(false);
+const modelOptions = computed(() => [
+  { label: "跟随等级配置（默认）", value: "" },
+  ...(detail.value?.model_route as any)?.available?.map((p: string) => ({ label: p, value: p })) || [],
+]);
 
 // 额度快捷编辑
 const qPeriod = ref<"day" | "month" | "total">("day");
@@ -83,9 +103,13 @@ function setScene(v: "private" | "group") {
   load();
 }
 
-// 生效模型（等级路由）：说明「这个会话实际会走哪个提供商/模型」
+// 生效模型（等级路由 / 好友专属）：说明「这个会话实际会走哪个提供商/模型」
 const modelRouteText = computed(() => {
   const r = detail.value?.model_route as any;
+  if (r?.subject_model) {
+    const ok = (r.available || []).includes(r.subject_model);
+    return `${r.subject_model}｜来源：好友专属（仅私聊生效）${ok ? "" : "｜该提供商当前不可用，将回落等级 / 默认"}`;
+  }
   if (!r || !r.layer) return "未配置（跟随 AstrBot 默认模型）";
   if (!r.provider_id) return r.reason || "配置的模型当前不可用，本次走 AstrBot 默认模型";
   return `${r.provider_id}${r.used_fallback ? "（备用）" : ""}｜来源：${r.label}`;
@@ -150,6 +174,8 @@ async function load() {
     effect.value = d.effect || "inherit";
     cmdEffect.value = String((d as any).command_master?.effect || "inherit");
     levelId.value = d.level_id || 0;
+    levelIdGroup.value = d.level_id_group ?? -1;
+    subjectModel.value = (d as any).subject_model || "";
     // 额度的初值：优先日额度，否则月、累计
     const rows = d.quotas || [];
     const pick = rows.find((q) => q.period === "day") || rows.find((q) => q.period === "month") || rows[0];
@@ -187,14 +213,54 @@ async function saveLevel(v: number) {
   levelId.value = v;
   saving.value = true;
   try {
-    await apiSetSubjectLevel([{ scope_type: props.type, scope_id: props.id, level_id: v || null }]);
-    message.success(v ? "等级已更新" : "已取消等级");
+    await apiSetSubjectLevel([
+      { scope_type: props.type, scope_id: props.id, level_id: v || null, scene: "private" },
+    ]);
+    message.success(v ? "私聊等级已更新" : "已取消私聊等级");
     emit("changed");
     await load();
   } catch (e: any) {
     message.error(e?.message || String(e));
   } finally {
     saving.value = false;
+  }
+}
+
+/** 群聊专属等级：-1 = 跟随私聊（提交 null）。 */
+async function saveLevelGroup(v: number) {
+  levelIdGroup.value = v;
+  saving.value = true;
+  try {
+    await apiSetSubjectLevel([
+      {
+        scope_type: props.type,
+        scope_id: props.id,
+        level_id: v === -1 ? null : v,
+        scene: "group",
+      },
+    ]);
+    message.success(v === -1 ? "群聊等级已恢复跟随私聊" : "群聊等级已更新");
+    emit("changed");
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    saving.value = false;
+  }
+}
+
+/** 好友专属模型：providerId 为空 = 恢复跟随等级配置。 */
+async function saveSubjectModel() {
+  modelSaving.value = true;
+  try {
+    await apiSetSubjectModel(props.id, subjectModel.value || "");
+    message.success(subjectModel.value ? "专属模型已保存（仅私聊生效）" : "已恢复跟随等级配置");
+    emit("changed");
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    modelSaving.value = false;
   }
 }
 
@@ -443,7 +509,33 @@ watch(
                   {{ cmdResolvedText }}（禁止 = 用不了任何指令）
                 </span>
               </n-space>
-              <n-space align="center" :size="10">
+              <template v-if="isUser">
+                <n-space align="center" :size="10">
+                  <span style="font-size: 13px; width: 56px">私聊等级</span>
+                  <n-select
+                    :value="levelId"
+                    size="small"
+                    style="width: 200px"
+                    :options="levelOptions"
+                    :disabled="saving"
+                    @update:value="saveLevel"
+                  />
+                  <span style="font-size: 12px; opacity: 0.6">等级可带默认权限与额度模板</span>
+                </n-space>
+                <n-space align="center" :size="10">
+                  <span style="font-size: 13px; width: 56px">群聊等级</span>
+                  <n-select
+                    :value="levelIdGroup"
+                    size="small"
+                    style="width: 200px"
+                    :options="groupLevelOptions"
+                    :disabled="saving"
+                    @update:value="saveLevelGroup"
+                  />
+                  <span style="font-size: 12px; opacity: 0.6">群聊里用这档；「跟随私聊」= 两个场景同一档</span>
+                </n-space>
+              </template>
+              <n-space v-else align="center" :size="10">
                 <span style="font-size: 13px">所属等级</span>
                 <n-select
                   :value="levelId"
@@ -455,12 +547,40 @@ watch(
                 />
                 <span style="font-size: 12px; opacity: 0.6">等级可带默认权限与额度模板</span>
               </n-space>
-              <span style="font-size: 12px; opacity: 0.65">
-                生效模型：{{ modelRouteText }}
-              </span>
               <span v-if="detail?.bot?.ts" style="font-size: 12px; opacity: 0.65">
                 最后回复：{{ new Date(detail.bot.ts * 1000).toLocaleString() }}（{{ detail.bot.kind === "llm" ? "LLM 回复" : detail.bot.kind === "command" ? "指令回复" : "普通消息" }}）
               </span>
+            </n-space>
+          </n-card>
+
+          <!-- 好友专属模型：优先级高于等级路由，仅私聊生效 -->
+          <n-card v-if="isUser" size="small" title="专属模型（私聊）">
+            <n-space vertical :size="8">
+              <n-space align="center" :size="8">
+                <n-select
+                  v-model:value="subjectModel"
+                  size="small"
+                  style="width: 260px; max-width: 100%"
+                  :options="modelOptions"
+                  placeholder="跟随等级配置（默认）"
+                  :disabled="modelSaving"
+                />
+                <n-button size="small" type="primary" :loading="modelSaving" @click="saveSubjectModel">
+                  保存
+                </n-button>
+                <n-button
+                  size="small"
+                  :disabled="modelSaving || !subjectModel"
+                  @click="subjectModel = ''; saveSubjectModel()"
+                >
+                  恢复默认
+                </n-button>
+              </n-space>
+              <span style="font-size: 12px; opacity: 0.6">
+                优先级高于等级里配置的模型，仅对该好友的<b>私聊</b>生效（群聊仍按群等级路由）；
+                留空 = 跟随等级配置。
+              </span>
+              <span style="font-size: 12px; opacity: 0.65">生效模型：{{ modelRouteText }}</span>
             </n-space>
           </n-card>
 

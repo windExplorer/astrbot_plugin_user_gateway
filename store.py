@@ -31,7 +31,14 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
     ) from e
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+
+# policy 表的 feature 维度补充：
+#   model → 好友专属模型（effect 存提供商 id；'' / 不存在 = 跟随等级配置）
+MODEL_FEATURE = "model"
+
+# set_user_level_scene 的哨兵：UNSET = 不动该场景（区别于 None = 取消）
+_LEVEL_UNSET = object()
 
 # 「群成员」规则的 scope_id 约定：``"<群号>:<QQ>"``。
 # 权限模型里「某人在某个群」是一个独立维度（比「好友专属（群聊）」更具体），
@@ -216,11 +223,14 @@ CREATE TABLE IF NOT EXISTS quota_level (
 );
 
 -- 对象归级：一个好友/群最多属于一个等级
+-- v8 起好友的等级**分场景**：level_id = 私聊（同时是群聊的默认），
+-- level_id_group = 群聊专属（NULL = 跟随私聊等级）；群对象只用 level_id。
 CREATE TABLE IF NOT EXISTS subject_level (
-    scope_type TEXT    NOT NULL,
-    scope_id   TEXT    NOT NULL,
-    level_id   INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
+    scope_type     TEXT    NOT NULL,
+    scope_id       TEXT    NOT NULL,
+    level_id       INTEGER,
+    level_id_group INTEGER,
+    updated_at     INTEGER NOT NULL,
     PRIMARY KEY (scope_type, scope_id)
 );
 CREATE INDEX IF NOT EXISTS idx_subject_level ON subject_level(level_id);
@@ -362,8 +372,39 @@ class Store:
             await cls._migrate_v4_to_v5(db)
         if old_version < 6:
             await cls._migrate_v5_to_v6(db)
+        if old_version < 8:
+            await cls._migrate_v7_to_v8(db)
         # v6 → v7 只新增了一张空表（group_member），上面的 SCHEMA_SQL 已经建好，
         # 没有数据要搬，所以不需要单独的迁移步骤 —— 这里留个说明避免以后误以为漏了。
+
+    @staticmethod
+    async def _migrate_v7_to_v8(db: aiosqlite.Connection) -> None:
+        """v7 → v8：好友等级分场景（私聊 / 群聊）。
+
+        ``subject_level.level_id`` 从 NOT NULL 放宽为可空，并新增
+        ``level_id_group``（群聊专属等级，NULL = 跟随私聊）。
+        SQLite 改不了列约束，走「建新表搬数据再改名」。
+        """
+        cols = await Store._table_columns(db, "subject_level")
+        if "level_id_group" in cols:
+            return
+        await db.execute(
+            """CREATE TABLE subject_level_new (
+                   scope_type     TEXT    NOT NULL,
+                   scope_id       TEXT    NOT NULL,
+                   level_id       INTEGER,
+                   level_id_group INTEGER,
+                   updated_at     INTEGER NOT NULL,
+                   PRIMARY KEY (scope_type, scope_id)
+               )"""
+        )
+        await db.execute(
+            "INSERT INTO subject_level_new(scope_type, scope_id, level_id, level_id_group, updated_at) "
+            "SELECT scope_type, scope_id, level_id, NULL, updated_at FROM subject_level"
+        )
+        await db.execute("DROP TABLE subject_level")
+        await db.execute("ALTER TABLE subject_level_new RENAME TO subject_level")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_subject_level ON subject_level(level_id)")
 
     @staticmethod
     async def _migrate_v5_to_v6(db: aiosqlite.Connection) -> None:
@@ -966,11 +1007,27 @@ class Store:
     # 对象归级
     # ------------------------------------------------------------------ #
     async def subject_level_map(self, scope_type: str) -> dict[str, int]:
-        """取某作用域下 ``{scope_id: level_id}`` 映射（闸门热路径全内存判定用）。"""
+        """取某作用域下 ``{scope_id: level_id}`` 映射（闸门热路径全内存判定用）。
+
+        v8 起好友的 ``level_id`` 可为 NULL（私聊未归级但群聊归了级），NULL 不进映射。
+        """
         async with self._conn().execute(
-            "SELECT scope_id, level_id FROM subject_level WHERE scope_type = ?", (scope_type,)
+            "SELECT scope_id, level_id FROM subject_level "
+            "WHERE scope_type = ? AND level_id IS NOT NULL",
+            (scope_type,),
         ) as cur:
             return {str(r["scope_id"]): int(r["level_id"]) for r in await cur.fetchall()}
+
+    async def subject_level_group_map(self) -> dict[str, int]:
+        """好友的**群聊专属**等级 ``{uin: level_id}``（NULL / 空不进映射）。
+
+        群聊场景里好友用这个等级；没配 = 跟随私聊等级。
+        """
+        async with self._conn().execute(
+            "SELECT scope_id, level_id_group FROM subject_level "
+            "WHERE scope_type = 'user' AND level_id_group IS NOT NULL"
+        ) as cur:
+            return {str(r["scope_id"]): int(r["level_id_group"]) for r in await cur.fetchall()}
 
     async def get_subject_level(self, scope_type: str, scope_id: str) -> Optional[int]:
         async with self._conn().execute(
@@ -981,7 +1038,10 @@ class Store:
         return int(row["level_id"]) if row else None
 
     async def set_subject_level(self, scope_type: str, scope_id: str, level_id: Optional[int]) -> None:
-        """给对象设定等级；``level_id`` 为空表示取消等级（删除记录）。"""
+        """给对象设定等级；``level_id`` 为空表示取消等级（删除记录）。
+
+        群对象 / 导入路径用这个（不分场景）；好友分场景请用 :meth:`set_user_level_scene`。
+        """
         db = self._conn()
         if not level_id:
             await db.execute(
@@ -994,6 +1054,57 @@ class Store:
                 "ON CONFLICT(scope_type, scope_id) DO UPDATE SET "
                 "level_id = excluded.level_id, updated_at = excluded.updated_at",
                 (scope_type, str(scope_id), int(level_id), now_ts()),
+            )
+        await db.commit()
+
+    async def get_user_level_scene(self, scope_id: str) -> tuple[Optional[int], Optional[int]]:
+        """取好友的分场景等级，``(私聊等级, 群聊等级)``；没配的为 None（群聊 None = 跟随私聊）。"""
+        async with self._conn().execute(
+            "SELECT level_id, level_id_group FROM subject_level WHERE scope_type = 'user' AND scope_id = ?",
+            (str(scope_id),),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None, None
+        return (
+            int(row["level_id"]) if row["level_id"] is not None else None,
+            int(row["level_id_group"]) if row["level_id_group"] is not None else None,
+        )
+
+    async def set_user_level_scene(
+        self,
+        scope_id: str,
+        *,
+        private_level: Any = _LEVEL_UNSET,
+        group_level: Any = _LEVEL_UNSET,
+    ) -> None:
+        """给好友设置**分场景**等级（v8）。
+
+        哨兵语义（这样 API 层才能区分「不动另一场景」和「清除另一场景」）：
+
+        - ``_LEVEL_UNSET``（默认）= 不动这个场景，保持原值；
+        - ``None`` = 取消该场景等级（群聊取消 = 跟随私聊）；
+        - ``int`` = 设为该等级（会话层已校验存在性与 kind）。
+
+        两个场景最终都是「取消」时整条记录删除。
+        """
+        db = self._conn()
+        cur_level, cur_group = await self.get_user_level_scene(scope_id)
+        lv = cur_level if private_level is _LEVEL_UNSET else private_level
+        lv_g = cur_group if group_level is _LEVEL_UNSET else group_level
+        if lv is None and lv_g is None:
+            await db.execute(
+                "DELETE FROM subject_level WHERE scope_type = 'user' AND scope_id = ?",
+                (str(scope_id),),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO subject_level(scope_type, scope_id, level_id, level_id_group, updated_at) "
+                "VALUES('user', ?, ?, ?, ?) "
+                "ON CONFLICT(scope_type, scope_id) DO UPDATE SET "
+                "level_id = excluded.level_id, level_id_group = excluded.level_id_group, "
+                "updated_at = excluded.updated_at",
+                (str(scope_id), lv, lv_g, now_ts()),
             )
         await db.commit()
 

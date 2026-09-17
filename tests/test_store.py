@@ -33,7 +33,7 @@ async def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         db_path = str(Path(tmp) / "user_gateway.db")
         st = Store(db_path)
         await st.open()
@@ -43,7 +43,7 @@ async def main() -> int:
         check(Path(db_path).exists(), "数据库文件已创建")
 
         print("\n[2] settings")
-        check(await st.get_setting("schema_version") == "7", "schema_version 已写入 7")
+        check(await st.get_setting("schema_version") == "8", "schema_version 已写入 8")
         check(await st.get_setting("nope", "d") == "d", "缺省值回退")
         await st.set_setting("sync_last_at", "123")
         check(await st.get_setting("sync_last_at") == "123", "写入后可读")
@@ -319,6 +319,25 @@ async def main() -> int:
         await st.set_subject_level("user", "10001", None)
         check(await st.get_subject_level("user", "10001") is None, "取消归级")
 
+        # 分场景归级（v8）：私聊 / 群聊等级分开配
+        await st.set_user_level_scene("10001", private_level=lv_vip, group_level=None)
+        p, g = await st.get_user_level_scene("10001")
+        check(p == lv_vip and g is None, "私聊等级写入；群聊未配 = None（跟随私聊）")
+        await st.set_user_level_scene("10001", group_level=lv_vip)
+        p, g = await st.get_user_level_scene("10001")
+        check(p == lv_vip and g == lv_vip, "只改群聊等级不影响私聊")
+        check((await st.subject_level_group_map()) == {"10001": lv_vip}, "subject_level_group_map")
+        await st.set_user_level_scene("10001", group_level=None)
+        p, g = await st.get_user_level_scene("10001")
+        check(p == lv_vip and g is None, "清除群聊专属（跟随私聊）不影响私聊")
+        check((await st.subject_level_group_map()) == {}, "清除后不进 group_map")
+        await st.set_user_level_scene("10001", private_level=None, group_level=lv_vip)
+        p, g = await st.get_user_level_scene("10001")
+        check(p is None and g == lv_vip, "私聊未归级但群聊归级（NULL / int 混存）")
+        check((await st.subject_level_map("user")) == {}, "私聊未归级不进 subject_level_map")
+        await st.set_user_level_scene("10001", private_level=None, group_level=None)
+        check(await st.get_user_level_scene("10001") == (None, None), "两个场景都取消 → 记录删除")
+
         await st.upsert_level("user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9)
         lv = await st.get_level(lv_vip)
         check(lv["name"] == "VIP改名" and lv["effect"] == "deny" and lv["sort_order"] == 9, "按 id 更新等级")
@@ -393,7 +412,7 @@ async def main() -> int:
         await st2.close()
 
     print("\n[11] v1 → v2 迁移")
-    with tempfile.TemporaryDirectory() as tmp2:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp2:
         v1_path = str(Path(tmp2) / "v1.db")
         import aiosqlite
 
@@ -430,7 +449,7 @@ async def main() -> int:
 
         st3 = Store(v1_path)
         await st3.open()
-        check(await st3.get_setting("schema_version") == "7", "版本号直接升到最新（v1 → v7 连续迁移）")
+        check(await st3.get_setting("schema_version") == "8", "版本号直接升到最新（v1 → v8 连续迁移）")
         q = await st3.get_quota("user", "10001", "day")
         check(q is not None and q["limit_tokens"] == 1000 and "used_tokens" not in q,
               "限额保留、用量的列已移除")
@@ -451,7 +470,7 @@ async def main() -> int:
         await st4.close()
 
     print("\n[12] v2 → v4 迁移（等级新增模型路由两列、并去掉 v3 临时的 model 列）")
-    with tempfile.TemporaryDirectory() as tmp3:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp3:
         v2_path = str(Path(tmp3) / "v2.db")
         raw2 = await aiosqlite.connect(v2_path)
         await raw2.executescript(
@@ -476,7 +495,7 @@ async def main() -> int:
 
         st5 = Store(v2_path)
         await st5.open()
-        check(await st5.get_setting("schema_version") == "7", "版本号升到 7（v2 → v3 → v4 → v5 → v6 → v7 连续迁移）")
+        check(await st5.get_setting("schema_version") == "8", "版本号升到 8（v2 → v3 → v4 → v5 → v6 → v7 → v8 连续迁移）")
         lv = await st5.get_level(1)
         check(lv is not None and lv["name"] == "老等级", "v2 的等级数据保留")
         check(
@@ -497,7 +516,7 @@ async def main() -> int:
         await st6.close()
 
     print("\n[12.1] v5 → v6 迁移（policy 加场景列、等级加群聊默认权限）")
-    with tempfile.TemporaryDirectory() as tmp5:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp5:
         import aiosqlite
 
         v5_path = str(Path(tmp5) / "v5.db")
@@ -549,7 +568,7 @@ async def main() -> int:
 
         st8 = Store(v5_path)
         await st8.open()
-        check(await st8.get_setting("schema_version") == "7", "版本号升到 7")
+        check(await st8.get_setting("schema_version") == "8", "版本号升到 8")
         em = await st8.effect_map("user")
         check(em == {"10001": {"": "deny"}}, f"旧规则落到「通用」场景（实得 {em}）")
         check(await st8.resolve_policy("user", "10001", "llm", "group") == "deny",
@@ -571,12 +590,12 @@ async def main() -> int:
         await st8.close()
         st9 = Store(v5_path)
         await st9.open()
-        check(await st9.get_setting("schema_version") == "7", "重开不会重复迁移")
+        check(await st9.get_setting("schema_version") == "8", "重开不会重复迁移")
         check(await st9.resolve_policy("user", "10001", "llm", "private") == "allow", "重开后规则仍在")
         await st9.close()
 
     print("\n[13] 指令规则（policy 的指令 feature 维度）")
-    with tempfile.TemporaryDirectory() as tmp4:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp4:
         st7 = Store(str(Path(tmp4) / "cmd.db"))
         await st7.open()
         await st7.set_policy("global", "*", "deny", feature="command:help")
@@ -606,7 +625,7 @@ async def main() -> int:
 
     print("\n[14] 群成员缓存与群内用量")
     # 这里另起一个库：上面的 st 已经在 [10] 关掉了（生命周期用例），复用会报「尚未 open()」
-    with tempfile.TemporaryDirectory() as tmp7:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp7:
         st = Store(str(Path(tmp7) / "members.db"))
         await st.open()
         n = await st.upsert_group_members(
@@ -680,7 +699,7 @@ async def main() -> int:
         await st.close()
 
     print("\n[16] 规则导出 / 导入（含等级 id 重映射）")
-    with tempfile.TemporaryDirectory() as tmp9:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp9:
         src = Store(str(Path(tmp9) / "src.db"))
         await src.open()
         vip = await src.upsert_level(

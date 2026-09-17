@@ -231,6 +231,10 @@ export interface FriendRow {
   /** 对象级「指令权限」（feature=command）的显式值 */
   effect_command: "allow" | "deny" | "inherit";
   level_id: number | null;
+  /** 私聊等级（原始配置；群聊场景的 level_id 已按「群聊专属 → 跟随私聊」解析） */
+  level_id_base: number | null;
+  /** 群聊专属等级（null = 跟随私聊） */
+  level_id_group: number | null;
   level_name: string;
   quota: EffectiveQuota;
   quota_limit: number | null;
@@ -415,11 +419,15 @@ export interface SubjectDetail {
   effect: "allow" | "deny" | "inherit";
   quotas: QuotaRow[];
   level_id: number | null;
+  /** 好友的群聊专属等级（null = 跟随私聊；仅 type=user 时有意义） */
+  level_id_group: number | null;
   level: LevelRow | null;
   level_quotas: QuotaRow[];
   quota_chain: QuotaChainItem[];
   quota: EffectiveQuota;
   model_route: ModelRoute;
+  /** 好友专属模型（provider_id；空 = 跟随等级配置，仅私聊生效） */
+  subject_model?: string;
   /** 对象级指令权限：自己配的值 + 实际生效的层 */
   command_master: {
     effect: "allow" | "deny" | "inherit";
@@ -546,11 +554,26 @@ export function apiDeleteLevel(id: number) {
   return apiPost<{ deleted: number }>("/levels/delete", { id });
 }
 
-/** 批量设置等级（``level_id=null`` 表示取消归级）。 */
+/** 批量设置等级（``level_id=null`` 表示取消归级）。
+ *  好友（scope_type=user）分场景（v8）：scene=group 时写「群聊专属等级」，
+ *  level_id=null 表示跟随私聊；scene=private（默认）写私聊等级。 */
 export function apiSetSubjectLevel(
-  items: { scope_type: "user" | "group"; scope_id: string; level_id: number | null }[],
+  items: {
+    scope_type: "user" | "group";
+    scope_id: string;
+    level_id: number | null;
+    scene?: "private" | "group";
+  }[],
 ) {
   return apiPost<{ applied: unknown[] }>("/subject-level", { items });
+}
+
+/** 好友专属模型（仅私聊生效；provider_id 为空 = 恢复跟随等级配置）。 */
+export function apiSetSubjectModel(scopeId: string, providerId: string) {
+  return apiPost<{ scope_id: string; provider_id: string }>("/subject/model", {
+    scope_id: scopeId,
+    provider_id: providerId,
+  });
 }
 
 /** 批量取头像（返回 data URI 映射；只请求需要的 id，失败的不出现）。 */

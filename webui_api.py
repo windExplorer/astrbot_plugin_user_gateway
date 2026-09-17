@@ -36,12 +36,12 @@ except Exception:  # pragma: no cover - 仅本地静态检查时缺失
 
 try:  # 与 main.py 同样的双形态导入（包内正常加载 / 平铺调试）
     from .gate import effect_in_scene
-    from .store import SCHEMA_VERSION as STORE_SCHEMA_VERSION
+    from .store import MODEL_FEATURE, SCHEMA_VERSION as STORE_SCHEMA_VERSION
     from .store import member_scope_id, parse_member_scope_id
     from .sync import sync_group_members
 except ImportError:  # pragma: no cover - 本地平铺调试
     from gate import effect_in_scene  # type: ignore
-    from store import SCHEMA_VERSION as STORE_SCHEMA_VERSION  # type: ignore
+    from store import MODEL_FEATURE, SCHEMA_VERSION as STORE_SCHEMA_VERSION  # type: ignore
     from store import member_scope_id, parse_member_scope_id  # type: ignore
     from sync import sync_group_members  # type: ignore
 
@@ -244,7 +244,10 @@ def _fmt_group(row: dict, ctx: dict[str, Any]) -> dict:
 def _fmt_friend(row: dict, ctx: dict[str, Any]) -> dict:
     """把好友缓存行补上等级、权限、生效额度、今日用量与「最后回复」。"""
     uin = str(row.get("uin") or "")
-    lv_id = (ctx["subject_level"].get("user") or {}).get(uin)
+    # 等级分场景（v8）：私聊用主等级；群聊场景用「群聊专属」，没配跟随私聊
+    base_id = (ctx["subject_level"].get("user") or {}).get(uin)
+    group_id = (ctx.get("subject_level_group") or {}).get(uin)
+    lv_id = (group_id or base_id) if ctx["scene"] == "group" else base_id
     lv = (ctx["levels"].get("user") or {}).get(int(lv_id)) if lv_id else None
     q = _effective_from_chain(ctx["plugin"].quota_chain("user", uin))
     bm = ctx["last_bot"].get(uin) or {}
@@ -256,6 +259,9 @@ def _fmt_friend(row: dict, ctx: dict[str, Any]) -> dict:
         "effect": effect_in_scene(ctx["policy"].get(uin), ctx["scene"]) or "inherit",
         "effect_command": effect_in_scene(ctx["cmd_master"].get(uin), ctx["scene"]) or "inherit",
         "level_id": int(lv_id) if lv_id else None,
+        # 两个场景的原始配置（前端按场景编辑时要区分「跟随私聊」和「未分组」）
+        "level_id_base": int(base_id) if base_id else None,
+        "level_id_group": int(group_id) if group_id else None,
         "level_name": (lv or {}).get("name") or "",
         "quota": q,
         "quota_limit": q["limit"] or None,
@@ -398,6 +404,8 @@ async def _list_ctx(plugin, kind: str, scene: str = "private") -> dict[str, Any]
             "user": getattr(plugin, "_subject_level_user", {}) or {},
             "group": getattr(plugin, "_subject_level_group", {}) or {},
         },
+        # 好友的「群聊专属」等级（v8）：好友列表按场景显示/编辑等级要用
+        "subject_level_group": getattr(plugin, "_subject_level_user_group", {}) or {},
         "policy": (
             getattr(plugin, "_effect_user", {}) or {}
             if kind == "user"
@@ -748,7 +756,12 @@ async def h_subject(plugin) -> dict:
     )
 
     # 等级 / 额度档位链 / 用量计数 / 最后回复
-    level_id = await plugin.store.get_subject_level(subject_type, subject_id)
+    # 好友的等级分场景（v8）：level_id = 私聊，level_id_group = 群聊专属（None = 跟随私聊）
+    if subject_type == "user":
+        level_id, level_id_group = await plugin.store.get_user_level_scene(subject_id)
+    else:
+        level_id = await plugin.store.get_subject_level("group", subject_id)
+        level_id_group = None
     level = await plugin.store.get_level(level_id) if level_id else None
     level_quotas = await plugin.store.list_quotas_of("level", str(level_id)) if level_id else []
     chain = plugin.quota_chain(subject_type, subject_id)
@@ -765,6 +778,7 @@ async def h_subject(plugin) -> dict:
             "effect": effect or "inherit",
             "quotas": quotas,
             "level_id": level_id,
+            "level_id_group": level_id_group,
             "level": level,
             "level_quotas": level_quotas,
             "model_route": model_route,
@@ -1410,8 +1424,11 @@ async def h_delete_level(plugin) -> dict:
 async def h_set_subject_level(plugin) -> dict:
     """给好友 / 群设置等级。
 
-    body: ``{scope_type, scope_id, level_id}`` 或 ``{items: [...]}``；
-    ``level_id`` 为 0 / null 表示取消等级。
+    body: ``{scope_type, scope_id, level_id, scene?}`` 或 ``{items: [...]}``；
+
+    - 群（scope_type=group）不分场景，``level_id`` 为 0 / null 表示取消；
+    - 好友（scope_type=user）**分场景**（v8）：``scene`` = ``private``（默认，写私聊等级）
+      或 ``group``（写群聊专属等级，``level_id`` 为 0 / null = 跟随私聊等级）。
     """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
@@ -1445,14 +1462,60 @@ async def h_set_subject_level(plugin) -> dict:
                     f"「{lv.get('name')}」是{'好友' if lv_kind == 'user' else '群聊'}等级，"
                     f"不能用在{'好友' if scope_type == 'user' else '群聊'}上"
                 )
-        await plugin.store.set_subject_level(scope_type, scope_id, level_id)
-        applied.append({"scope_type": scope_type, "scope_id": scope_id, "level_id": level_id})
+        if scope_type == "group":
+            await plugin.store.set_subject_level("group", scope_id, level_id)
+            applied.append({"scope_type": "group", "scope_id": scope_id, "level_id": level_id})
+            continue
+        # 好友：分场景
+        scene = str(it.get("scene") or "private").strip() or "private"
+        if scene not in ("private", "group"):
+            return err("scene 必须是 private 或 group")
+        if scene == "private":
+            await plugin.store.set_user_level_scene(scope_id, private_level=level_id)
+        else:
+            # null / 0 = 清除群聊专属（跟随私聊等级）
+            await plugin.store.set_user_level_scene(
+                scope_id, group_level=level_id if level_id else None
+            )
+        applied.append(
+            {"scope_type": "user", "scope_id": scope_id, "level_id": level_id, "scene": scene}
+        )
 
     if not applied:
         return err("没有可应用的变化")
     await plugin.store.log_audit("console", "set_subject_level", json.dumps(applied, ensure_ascii=False))
     await plugin.reload_rules()
     return ok({"applied": applied})
+
+
+async def h_set_subject_model(plugin) -> dict:
+    """好友专属模型（v1.2.0）：优先级高于等级里配置的模型，**仅私聊生效**。
+
+    body: ``{scope_id, provider_id}``；``provider_id`` 为空 = 恢复跟随等级配置。
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    body = await _payload()
+    scope_id = str(body.get("scope_id") or "").strip()
+    provider_id = str(body.get("provider_id") or "").strip()
+    if not scope_id:
+        return err("scope_id 不能为空")
+    if provider_id and provider_id not in plugin.provider_ids():
+        return err("该提供商未加载或不存在（先在 AstrBot「模型提供商」里启用）")
+    await plugin.store.set_policy(
+        "user",
+        scope_id,
+        provider_id or "inherit",
+        feature=MODEL_FEATURE,
+        note="好友专属模型（仅私聊生效）",
+    )
+    await plugin.store.log_audit(
+        "console",
+        "set_subject_model",
+        json.dumps({"scope_id": scope_id, "provider_id": provider_id}, ensure_ascii=False),
+    )
+    await plugin.reload_rules()
+    return ok({"scope_id": scope_id, "provider_id": provider_id})
 
 
 # ---------------------------------------------------------------------- #
@@ -1656,6 +1719,7 @@ def register_apis(plugin) -> None:
         ("/levels", h_set_level, ["POST"]),
         ("/levels/delete", h_delete_level, ["POST"]),
         ("/subject-level", h_set_subject_level, ["POST"]),
+        ("/subject/model", h_set_subject_model, ["POST"]),
         ("/providers", h_providers, ["GET"]),
         ("/avatars", h_avatars, ["GET"]),
         ("/avatars/refresh", h_avatars_refresh, ["POST"]),
