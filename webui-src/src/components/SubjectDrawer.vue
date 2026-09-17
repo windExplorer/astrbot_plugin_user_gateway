@@ -57,6 +57,11 @@ const detail = ref<SubjectDetail | null>(null);
 const effect = ref<string>("inherit");
 // 对象级「指令权限」（feature=command）：禁止 = 这个人/这个群用不了任何指令
 const cmdEffect = ref<string>("inherit");
+// 好友详情的分场景显式值（v1.3.0）：权限卡平铺展示私聊 / 群聊两套，不再靠切换
+const effectPrivate = ref<string>("inherit");
+const effectGroup = ref<string>("inherit");
+const cmdPrivate = ref<string>("inherit");
+const cmdGroup = ref<string>("inherit");
 
 const cmdResolvedText = computed(() => {
   const m = detail.value?.command_master as any;
@@ -92,16 +97,10 @@ const qMode = ref<"enforce" | "observe">("enforce");
 
 const isUser = computed(() => props.type === "user");
 
-// 作用场景：好友的权限分「私聊」「群聊」两个维度，切换后权限卡读写对应的那一套
+// 作用场景：v1.3.0 起权限卡平铺展示两套场景，这个值只作为加载参数保留
 // （群详情没有这个维度：群专属 / 群等级规则天然只属于群聊场景）
 const scene = ref<"private" | "group">("private");
 const sceneLabel = computed(() => (scene.value === "group" ? "群聊" : "私聊"));
-
-function setScene(v: "private" | "group") {
-  if (scene.value === v) return;
-  scene.value = v;
-  load();
-}
 
 // 生效模型（等级路由 / 好友专属）：说明「这个会话实际会走哪个提供商/模型」
 const modelRouteText = computed(() => {
@@ -173,6 +172,10 @@ async function load() {
     detail.value = d;
     effect.value = d.effect || "inherit";
     cmdEffect.value = String((d as any).command_master?.effect || "inherit");
+    effectPrivate.value = (d as any).effect_private || "inherit";
+    effectGroup.value = (d as any).effect_group || "inherit";
+    cmdPrivate.value = String((d as any).cmd_private?.effect || "inherit");
+    cmdGroup.value = String((d as any).cmd_group?.effect || "inherit");
     levelId.value = d.level_id || 0;
     levelIdGroup.value = d.level_id_group ?? -1;
     // 注意：subject_model 在 model_route 里（后端挂在路由结果上），不在顶层
@@ -323,6 +326,29 @@ async function saveCommandEffect(next: string) {
           ? "已允许该对象使用指令"
           : "已恢复继承") + (isUser.value ? `（${sceneLabel.value}）` : ""),
     );
+    emit("changed");
+    await load();
+  } catch (e: any) {
+    message.error(e?.message || String(e));
+  } finally {
+    saving.value = false;
+  }
+}
+
+/** 好友分场景权限：直接写指定场景的显式规则（LLM 或指令总权限）。 */
+async function saveEffectScene(sc: "private" | "group", feature: "llm" | "command", next: string) {
+  saving.value = true;
+  try {
+    await apiPost("/policy", {
+      scope_type: "user",
+      scope_id: props.id,
+      effect: next,
+      feature,
+      scene: sc,
+    });
+    const what = feature === "command" ? "指令权限" : "LLM 权限";
+    const word = next === "allow" ? "放行" : next === "deny" ? "禁止" : "继承";
+    message.success(`${what}（${sc === "group" ? "群聊" : "私聊"}）已设为「${word}」`);
     emit("changed");
     await load();
   } catch (e: any) {
@@ -490,61 +516,99 @@ watch(
             />
           </n-card>
 
-          <n-card size="small" :title="isUser ? `权限（${sceneLabel}）` : '权限'">
-            <template v-if="isUser" #header-extra>
-              <n-radio-group :value="scene" size="small" @update:value="setScene">
-                <n-radio-button value="private">私聊</n-radio-button>
-                <n-radio-button value="group">群聊</n-radio-button>
-              </n-radio-group>
-            </template>
-            <n-space vertical :size="10">
-              <n-space align="center" :size="10">
-                <span style="font-size: 13px; width: 56px">LLM</span>
-                <effect-segment :effect="effect" :disabled="saving" @change="saveEffect" />
-                <span style="font-size: 12px; opacity: 0.6">
-                  三者互斥；「继承」= 不写专属规则，跟随等级 / 群{{ isUser ? ' / 另一个场景的通用规则' : '' }} / 全局默认
-                </span>
-              </n-space>
-              <n-space align="center" :size="10">
-                <span style="font-size: 13px; width: 56px">指令</span>
-                <effect-segment :effect="cmdEffect" :disabled="saving" @change="saveCommandEffect" />
-                <span style="font-size: 12px; opacity: 0.6">
-                  {{ cmdResolvedText }}（禁止 = 用不了任何指令）
-                </span>
-              </n-space>
+          <n-card size="small" :title="isUser ? '权限与等级（私聊 / 群聊分开配）' : '权限'">
+            <n-space vertical :size="12">
               <template v-if="isUser">
+                <div class="sc-block">
+                  <div class="sc-head">私聊</div>
+                  <n-space vertical :size="8">
+                    <n-space align="center" :size="10">
+                      <span class="sc-label">LLM 权限</span>
+                      <effect-segment
+                        :effect="effectPrivate"
+                        :disabled="saving"
+                        @change="(v: string) => saveEffectScene('private', 'llm', v)"
+                      />
+                    </n-space>
+                    <n-space align="center" :size="10">
+                      <span class="sc-label">指令权限</span>
+                      <effect-segment
+                        :effect="cmdPrivate"
+                        :disabled="saving"
+                        @change="(v: string) => saveEffectScene('private', 'command', v)"
+                      />
+                    </n-space>
+                    <n-space align="center" :size="10">
+                      <span class="sc-label">私聊等级</span>
+                      <n-select
+                        :value="levelId"
+                        size="small"
+                        style="width: 200px"
+                        :options="levelOptions"
+                        :disabled="saving"
+                        @update:value="saveLevel"
+                      />
+                    </n-space>
+                  </n-space>
+                </div>
+                <div class="sc-block">
+                  <div class="sc-head">群聊</div>
+                  <n-space vertical :size="8">
+                    <n-space align="center" :size="10">
+                      <span class="sc-label">LLM 权限</span>
+                      <effect-segment
+                        :effect="effectGroup"
+                        :disabled="saving"
+                        @change="(v: string) => saveEffectScene('group', 'llm', v)"
+                      />
+                    </n-space>
+                    <n-space align="center" :size="10">
+                      <span class="sc-label">指令权限</span>
+                      <effect-segment
+                        :effect="cmdGroup"
+                        :disabled="saving"
+                        @change="(v: string) => saveEffectScene('group', 'command', v)"
+                      />
+                    </n-space>
+                    <n-space align="center" :size="10">
+                      <span class="sc-label">群聊等级</span>
+                      <n-select
+                        :value="levelIdGroup"
+                        size="small"
+                        style="width: 200px"
+                        :options="groupLevelOptions"
+                        :disabled="saving"
+                        @update:value="saveLevelGroup"
+                      />
+                    </n-space>
+                  </n-space>
+                </div>
+                <span style="font-size: 12px; opacity: 0.6; line-height: 1.7">
+                  「继承」= 该场景不写专属规则：私聊跟随等级 / 通用规则 / 全局默认，
+                  群聊跟随群专属 / 群等级 / 全局默认；指令「禁止」= 用不了任何指令
+                  （不含等级与单条指令细则）；群聊等级「未分组」= 不用他的好友等级，走群的档位。
+                </span>
+              </template>
+              <template v-else>
                 <n-space align="center" :size="10">
-                  <span style="font-size: 13px; width: 56px">私聊等级</span>
+                  <span style="font-size: 13px; width: 56px">LLM</span>
+                  <effect-segment :effect="effect" :disabled="saving" @change="saveEffect" />
+                  <span style="font-size: 12px; opacity: 0.6">
+                    三者互斥；「继承」= 不写专属规则，跟随群等级 / 全局默认
+                  </span>
+                </n-space>
+                <n-space align="center" :size="10">
+                  <span style="font-size: 13px; width: 56px">指令</span>
+                  <effect-segment :effect="cmdEffect" :disabled="saving" @change="saveCommandEffect" />
+                  <span style="font-size: 12px; opacity: 0.6">
+                    {{ cmdResolvedText }}（禁止 = 用不了任何指令）
+                  </span>
+                </n-space>
+                <n-space align="center" :size="10">
+                  <span style="font-size: 13px">所属等级</span>
                   <n-select
                     :value="levelId"
                     size="small"
-                    style="width: 200px"
-                    :options="levelOptions"
-                    :disabled="saving"
-                    @update:value="saveLevel"
-                  />
-                  <span style="font-size: 12px; opacity: 0.6">等级可带默认权限与额度模板</span>
-                </n-space>
-                <n-space align="center" :size="10">
-                  <span style="font-size: 13px; width: 56px">群聊等级</span>
-                  <n-select
-                    :value="levelIdGroup"
-                    size="small"
-                    style="width: 200px"
-                    :options="groupLevelOptions"
-                    :disabled="saving"
-                    @update:value="saveLevelGroup"
-                  />
-                  <span style="font-size: 12px; opacity: 0.6">
-                    群聊里用这档；「未分组」= 不用他的好友等级，走群的档位
-                  </span>
-                </n-space>
-              </template>
-              <n-space v-else align="center" :size="10">
-                <span style="font-size: 13px">所属等级</span>
-                <n-select
-                  :value="levelId"
-                  size="small"
                   style="width: 200px"
                   :options="levelOptions"
                   :disabled="saving"
@@ -552,6 +616,7 @@ watch(
                 />
                 <span style="font-size: 12px; opacity: 0.6">等级可带默认权限与额度模板</span>
               </n-space>
+              </template>
               <span v-if="detail?.bot?.ts" style="font-size: 12px; opacity: 0.65">
                 最后回复：{{ new Date(detail.bot.ts * 1000).toLocaleString() }}（{{ detail.bot.kind === "llm" ? "LLM 回复" : detail.bot.kind === "command" ? "指令回复" : "普通消息" }}）
               </span>
@@ -582,9 +647,9 @@ watch(
                   恢复默认
                 </n-button>
               </n-space>
-              <span style="font-size: 12px; opacity: 0.6">
-                优先级高于等级里配置的模型，仅对该好友的<b>私聊</b>生效（群聊仍按群等级路由）；
-                留空 = 跟随等级配置。
+              <span style="font-size: 12px; opacity: 0.6; line-height: 1.7">
+                只影响该好友的<b>私聊</b>；在<b>群里</b>聊天仍然走<b>那个群的模型</b>（群等级路由），
+                不会用他的专属模型。优先级高于等级里配置的模型；留空 = 跟随等级配置。
               </span>
               <span style="font-size: 12px; opacity: 0.65">生效模型：{{ modelRouteText }}</span>
             </n-space>
@@ -712,6 +777,23 @@ watch(
 </template>
 
 <style scoped>
+/* 权限卡的分场景分组（私聊 / 群聊各一块，平铺不切换） */
+.sc-block {
+  border: 1px solid rgba(128, 128, 128, 0.25);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.sc-head {
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.72;
+  margin-bottom: 8px;
+}
+.sc-label {
+  font-size: 12.5px;
+  width: 64px;
+  flex-shrink: 0;
+}
 /* 用量概览的迷你统计块（替代拥挤的 4 列 n-statistic） */
 .u-stat {
   background: rgba(128, 128, 128, 0.09);

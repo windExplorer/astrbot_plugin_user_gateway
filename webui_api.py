@@ -251,13 +251,20 @@ def _fmt_friend(row: dict, ctx: dict[str, Any]) -> dict:
     lv = (ctx["levels"].get("user") or {}).get(int(lv_id)) if lv_id else None
     q = _effective_from_chain(ctx["plugin"].quota_chain("user", uin))
     bm = ctx["last_bot"].get(uin) or {}
+    pol = ctx["policy"].get(uin) or {}
+    cm = ctx["cmd_master"].get(uin) or {}
     return {
         **row,
         "display_name": (row.get("remark") or "").strip() or (row.get("nickname") or "").strip() or uin,
         "avatar": f"https://q1.qlogo.cn/g?b=qq&nk={uin}&s=100",
         "avatar_id": uin,
-        "effect": effect_in_scene(ctx["policy"].get(uin), ctx["scene"]) or "inherit",
-        "effect_command": effect_in_scene(ctx["cmd_master"].get(uin), ctx["scene"]) or "inherit",
+        "effect": effect_in_scene(pol, ctx["scene"]) or "inherit",
+        "effect_command": effect_in_scene(cm, ctx["scene"]) or "inherit",
+        # 分场景显式值（v1.2.3）：列表把私聊 / 群聊两套权限平铺成四列，不再靠场景切换
+        "effect_private": effect_in_scene(pol, "private") or "inherit",
+        "effect_group": effect_in_scene(pol, "group") or "inherit",
+        "effect_cmd_private": effect_in_scene(cm, "private") or "inherit",
+        "effect_cmd_group": effect_in_scene(cm, "group") or "inherit",
         "level_id": int(lv_id) if lv_id else None,
         # 两个场景的原始配置（前端按场景编辑时要区分「跟随私聊」和「未分组」）
         "level_id_base": int(base_id) if base_id else None,
@@ -741,6 +748,14 @@ async def h_subject(plugin) -> dict:
     scene = _scene_arg()
     # 好友这一层的权限分场景：抽屉里展示的是「当前场景」下的配置与结论
     effect = await plugin.store.resolve_policy(subject_type, subject_id, "llm", scene)
+    # 好友详情：把两套场景的权限显式值一起带回（抽屉平铺展示，不再靠场景切换）
+    effect_private = effect_group = None
+    cmd_private = cmd_group = None
+    if subject_type == "user":
+        effect_private = await plugin.store.get_effect("user", subject_id, "llm", "private")
+        effect_group = await plugin.store.get_effect("user", subject_id, "llm", "group")
+        cmd_private = plugin.command_master_of("user", subject_id, "private")
+        cmd_group = plugin.command_master_of("user", subject_id, "group")
     quotas = await plugin.store.list_quotas_of(subject_type, subject_id)
     stats = await plugin.store.subject_stats(subject_type, subject_id, from_ts, to_ts)
 
@@ -776,6 +791,10 @@ async def h_subject(plugin) -> dict:
             "id": subject_id,
             "info": info,
             "effect": effect or "inherit",
+            "effect_private": effect_private,
+            "effect_group": effect_group,
+            "cmd_private": cmd_private,
+            "cmd_group": cmd_group,
             "quotas": quotas,
             "level_id": level_id,
             "level_id_group": level_id_group,

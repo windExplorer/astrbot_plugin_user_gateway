@@ -214,21 +214,27 @@ function search() {
  * 写权限规则。``feature`` 决定改的是哪一类：
  * ``"llm"`` = LLM 对话权限，``"command"`` = 指令权限（对象级总开关）。
  */
-async function applyPolicy(items: { scope_id: string; effect: string }[], feature = "llm", silent = false) {
+async function applyPolicy(
+  items: { scope_id: string; effect: string }[],
+  feature = "llm",
+  silent = false,
+  policyScene: "private" | "group" = scene.value,
+) {
   if (!items.length) {
     message.warning("请先选择好友");
     return;
   }
-  const label = feature === "command" ? "指令权限" : "LLM 权限";
+  const label =
+    (feature === "command" ? "指令权限" : "LLM 权限") +
+    (policyScene === "group" ? "（群聊）" : "（私聊）");
   try {
     await apiPost("/policy", {
-      // scene：只改「当前作用场景」那一套规则（另一个场景不受影响）
       items: items.map((i) => ({
         scope_type: "user",
         scope_id: i.scope_id,
         effect: i.effect,
         feature,
-        scene: scene.value,
+        scene: policyScene,
       })),
     });
     if (!silent) message.success(`已更新 ${items.length} 个好友的${label}`);
@@ -375,24 +381,45 @@ const columns: DataTableColumns<FriendRow> = [
       }),
   },
   {
-    // 标题是函数 → 切换场景时跟着变（naive-ui 会把函数当渲染函数，读 scene.value 即自动响应）
-    title: () => `LLM 权限（${sceneLabel.value}）`,
-    key: "effect",
-    width: 195,
-    render: (row) => h(EffectSegment, { effect: row.effect, onChange: (v: string) => applyEffect([{ scope_id: row.uin, effect: v }]) }),
+    title: "LLM · 私聊",
+    key: "effect_private",
+    width: 150,
+    render: (row) =>
+      h(EffectSegment, {
+        effect: row.effect_private,
+        onChange: (v: string) => applyEffect([{ scope_id: row.uin, effect: v }], false, "private"),
+      }),
   },
   {
-    title: () => `指令权限（${sceneLabel.value}）`,
-    key: "effect_command",
-    width: 195,
+    title: "指令 · 私聊",
+    key: "effect_cmd_private",
+    width: 150,
     render: (row) =>
-      h(NTooltip, { trigger: "hover", placement: "top" }, {
-        trigger: () =>
-          h(EffectSegment, {
-            effect: row.effect_command || "inherit",
-            onChange: (v: string) => applyPolicy([{ scope_id: row.uin, effect: v }], "command"),
-          }),
-        default: () => "指令权限：禁止 = 这个人用不了任何指令（不含等级与单条指令的细则）",
+      h(EffectSegment, {
+        effect: row.effect_cmd_private,
+        onChange: (v: string) =>
+          applyPolicy([{ scope_id: row.uin, effect: v }], "command", false, "private"),
+      }),
+  },
+  {
+    title: "LLM · 群聊",
+    key: "effect_group",
+    width: 150,
+    render: (row) =>
+      h(EffectSegment, {
+        effect: row.effect_group,
+        onChange: (v: string) => applyEffect([{ scope_id: row.uin, effect: v }], false, "group"),
+      }),
+  },
+  {
+    title: "指令 · 群聊",
+    key: "effect_cmd_group",
+    width: 150,
+    render: (row) =>
+      h(EffectSegment, {
+        effect: row.effect_cmd_group,
+        onChange: (v: string) =>
+          applyPolicy([{ scope_id: row.uin, effect: v }], "command", false, "group"),
       }),
   },
   {
@@ -649,11 +676,17 @@ onUnmounted(() => {
             <span class="m-arrow">›</span>
           </div>
           <div class="m-row">
-            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect).type">
-              LLM：{{ effectMeta(row.effect).text }}
+            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect_private).type">
+              私 {{ effectMeta(row.effect_private).text }}
             </n-tag>
-            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect_command).type">
-              指令：{{ effectMeta(row.effect_command).text }}
+            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect_cmd_private).type">
+              私指令：{{ effectMeta(row.effect_cmd_private).text }}
+            </n-tag>
+            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect_group).type">
+              群 {{ effectMeta(row.effect_group).text }}
+            </n-tag>
+            <n-tag size="small" :bordered="false" :type="effectMeta(row.effect_cmd_group).type">
+              群指令：{{ effectMeta(row.effect_cmd_group).text }}
             </n-tag>
           </div>
           <div class="m-meta">
@@ -673,7 +706,7 @@ onUnmounted(() => {
         :loading="loading"
         :row-key="(row: FriendRow) => row.uin"
         :bordered="false"
-        :scroll-x="1420"
+        :scroll-x="1560"
         size="small"
       />
       <n-space justify="end" style="margin-top: 12px">
