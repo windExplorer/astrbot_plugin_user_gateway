@@ -175,7 +175,8 @@ async function load() {
     cmdEffect.value = String((d as any).command_master?.effect || "inherit");
     levelId.value = d.level_id || 0;
     levelIdGroup.value = d.level_id_group ?? -1;
-    subjectModel.value = (d as any).subject_model || "";
+    // 注意：subject_model 在 model_route 里（后端挂在路由结果上），不在顶层
+    subjectModel.value = (d as any).model_route?.subject_model || "";
     // 额度的初值：优先日额度，否则月、累计
     const rows = d.quotas || [];
     const pick = rows.find((q) => q.period === "day") || rows.find((q) => q.period === "month") || rows[0];
@@ -562,6 +563,7 @@ watch(
                   size="small"
                   style="width: 260px; max-width: 100%"
                   :options="modelOptions"
+                  filterable
                   placeholder="跟随等级配置（默认）"
                   :disabled="modelSaving"
                 />

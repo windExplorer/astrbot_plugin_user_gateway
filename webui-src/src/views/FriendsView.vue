@@ -85,6 +85,12 @@ function openDetail(uin: string) {
   drawerId.value = uin;
   drawerShow.value = true;
 }
+/** 等级 id → 名称（卡片展示用；0/null = 未分组）。 */
+function levelNameOf(id: number | null | undefined): string {
+  if (!id) return "未分组";
+  const lv = levels.value.find((l) => l.id === id);
+  return lv ? lv.name : String(id);
+}
 const checked = ref<string[]>([]);
 const levels = ref<LevelRow[]>([]);
 const batchLevelId = ref<number | null>(null);
@@ -237,14 +243,26 @@ function applyEffect(items: { scope_id: string; effect: string }[], silent = fal
   return applyPolicy(items, "llm", silent);
 }
 
-async function applyLevel(items: { scope_id: string; level_id: number | null }[]) {
+async function applyLevel(
+  items: { scope_id: string; level_id: number | null }[],
+  levelScene: "private" | "group" = "private",
+) {
   if (!items.length) {
     message.warning("请先选择好友");
     return;
   }
   try {
-    await apiSetSubjectLevel(items.map((i) => ({ scope_type: "user", scope_id: i.scope_id, level_id: i.level_id })));
-    message.success(`已更新 ${items.length} 个好友的等级`);
+    await apiSetSubjectLevel(
+      items.map((i) => ({
+        scope_type: "user",
+        scope_id: i.scope_id,
+        level_id: i.level_id,
+        scene: levelScene,
+      })),
+    );
+    message.success(
+      `已更新 ${items.length} 个好友的${levelScene === "group" ? "群聊" : "私聊"}等级`,
+    );
     checked.value = [];
     batchLevelId.value = null;
     await load();
@@ -323,16 +341,37 @@ const columns: DataTableColumns<FriendRow> = [
       ),
   },
   {
-    title: "等级",
+    title: "私聊等级",
     key: "level_id",
     width: 130,
     render: (row) =>
       h(NSelect, {
         size: "tiny",
-        value: row.level_id || 0,
+        value: row.level_id_base || 0,
         options: levelOptions.value,
         consistentMenuWidth: false,
-        onUpdateValue: (v: number) => applyLevel([{ scope_id: row.uin, level_id: v || null }]),
+        onUpdateValue: (v: number) =>
+          applyLevel([{ scope_id: row.uin, level_id: v || null }], "private"),
+      }),
+  },
+  {
+    title: "群聊等级",
+    key: "level_id_group",
+    width: 130,
+    render: (row) =>
+      h(NSelect, {
+        size: "tiny",
+        value: row.level_id_group ?? -1,
+        options: [
+          { label: "跟随私聊", value: -1 },
+          ...levelOptions.value,
+        ],
+        consistentMenuWidth: false,
+        onUpdateValue: (v: number) =>
+          applyLevel(
+            [{ scope_id: row.uin, level_id: v === -1 ? null : v }],
+            "group",
+          ),
       }),
   },
   {
@@ -602,7 +641,10 @@ onUnmounted(() => {
             <subject-avatar kind="user" :id="row.uin" :name="row.display_name" :size="40" />
             <div class="m-title">
               <div class="m-name">{{ row.display_name }}</div>
-              <div class="m-sub">{{ row.uin }} · {{ row.level_name || "未分组" }}</div>
+              <div class="m-sub">
+                {{ row.uin }} · 私聊 {{ levelNameOf(row.level_id_base) }}
+                <template v-if="row.level_id_group"> · 群聊 {{ levelNameOf(row.level_id_group) }}</template>
+              </div>
             </div>
             <span class="m-arrow">›</span>
           </div>
@@ -631,7 +673,7 @@ onUnmounted(() => {
         :loading="loading"
         :row-key="(row: FriendRow) => row.uin"
         :bordered="false"
-        :scroll-x="1290"
+        :scroll-x="1420"
         size="small"
       />
       <n-space justify="end" style="margin-top: 12px">
