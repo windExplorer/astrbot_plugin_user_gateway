@@ -244,11 +244,22 @@ def _fmt_group(row: dict, ctx: dict[str, Any]) -> dict:
 def _fmt_friend(row: dict, ctx: dict[str, Any]) -> dict:
     """把好友缓存行补上等级、权限、生效额度、今日用量与「最后回复」。"""
     uin = str(row.get("uin") or "")
-    # 等级分场景（v8）：私聊用主等级；群聊场景用「群聊专属」，没配跟随私聊
+    # 等级分场景（v8 / v1.2.2）：私聊用「私聊等级」（好友等级那一套），
+    # 群聊用「群聊等级」（限额页里 kind=group 的那套）。群聊没配 = 走群的档位，
+    # 所以**不回落**到私聊等级（v1.2.2 的语义）。
     base_id = (ctx["subject_level"].get("user") or {}).get(uin)
     group_id = (ctx.get("subject_level_group") or {}).get(uin)
-    lv_id = (group_id or base_id) if ctx["scene"] == "group" else base_id
-    lv = (ctx["levels"].get("user") or {}).get(int(lv_id)) if lv_id else None
+    scene_is_group = ctx["scene"] == "group"
+    lv_id = group_id if scene_is_group else base_id
+    lv = None
+    if lv_id:
+        lid = int(lv_id)
+        # 名字按对应 kind 的索引查；查不到再试另一个索引 —— level_id 全局唯一，
+        # 这样既支持「群聊等级填群聊等级」，也兼容 v1.2.x 时代填好友等级的旧数据。
+        user_lv = ctx["levels"].get("user") or {}
+        group_lv = ctx["levels"].get("group") or {}
+        first, second = (group_lv, user_lv) if scene_is_group else (user_lv, group_lv)
+        lv = first.get(lid) or second.get(lid)
     q = _effective_from_chain(ctx["plugin"].quota_chain("user", uin))
     bm = ctx["last_bot"].get(uin) or {}
     pol = ctx["policy"].get(uin) or {}

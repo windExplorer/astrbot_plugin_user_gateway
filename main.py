@@ -142,15 +142,17 @@ class UserGatewayPlugin(Star):
         self._effect_group: dict[str, dict[str, str]] = {}
         # 群成员专属：「群号:QQ」→ {scene: effect}（v7）
         self._effect_member: dict[str, dict[str, str]] = {}
-        # 等级：{(kind, level_id): effect}、{scope_type: {scope_id: level_id}}
-        self._level_effect: dict[tuple[str, int], str] = {}
+        # 等级：{level_id: effect}、{scope_type: {scope_id: level_id}}
+        # 等级键用 id 而非 (kind, id)：id 是 quota_level 的主键、全局唯一，
+        # kind 只是控制台的分组标签（好友等级 / 群聊等级），判定不需要它。
+        self._level_effect: dict[int, str] = {}
         self._subject_level_user: dict[str, int] = {}
         self._subject_level_group: dict[str, int] = {}
         # 好友的群聊专属等级（v8）+ 好友专属模型（feature=model，仅私聊生效）
         self._subject_level_user_group: dict[str, int] = {}
         self._subject_model: dict[str, str] = {}
-        # 等级模型路由：{(kind, level_id): {provider_id, model, fallback_provider_id}}
-        self._level_route: dict[tuple[str, int], dict[str, str]] = {}
+        # 等级模型路由：{level_id: {provider_id, fallback_provider_id}}
+        self._level_route: dict[int, dict[str, str]] = {}
         # 限额规则：{scope_type(user|group|level|global): {scope_id: {period: row}}}
         self._limits: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
         # 用量计数：{scope_type(user|group|member): {scope_id: {period: row}}}
@@ -162,11 +164,11 @@ class UserGatewayPlugin(Star):
         self._cmd_policy: dict[str, dict[str, dict[str, dict[str, str]]]] = {}
         # 对象级指令总权限：{scope_type: {scope_id: {scene: effect}}}
         self._cmd_master: dict[str, dict[str, dict[str, str]]] = {}
-        # 等级的默认「指令」权限：{(kind, level_id): effect}（与 LLM 的 _level_effect 分开）
-        self._level_cmd_effect: dict[tuple[str, int], str] = {}
-        # 上面两者的「群聊场景」版本（v6）：只对 kind='user'（好友等级）有意义
-        self._level_eff_group: dict[tuple[str, int], str] = {}
-        self._level_cmd_eff_group: dict[tuple[str, int], str] = {}
+        # 等级的默认「指令」权限：{level_id: effect}（与 LLM 的 _level_effect 分开）
+        self._level_cmd_effect: dict[int, str] = {}
+        # 上面两者的「群聊场景」版本（v6）：只有好友等级会显式配，群聊等级恒为 inherit
+        self._level_eff_group: dict[int, str] = {}
+        self._level_cmd_eff_group: dict[int, str] = {}
 
         # M1：判定内核 / 提示冷却 / 后台任务
         self.gate = Gate(self._cfg)
@@ -324,29 +326,32 @@ class UserGatewayPlugin(Star):
             self._effect_group = await self.store.effect_map("group")
             self._effect_member = await self.store.effect_map("member")
 
-            # 等级默认权限与模型路由
+            # 等级默认权限与模型路由。
+            # 键一律是 level_id（quota_level.id 全局唯一）——不带 kind，原因见
+            # Gate._level_key 的说明：归级记录只存 id，带 kind 查表会把
+            # 「好友的群聊等级指向群聊等级」这类合法引用查空。
             levels = await self.store.list_levels()
             self._level_effect = {
-                (str(lv["kind"]), int(lv["id"])): str(lv.get("effect") or "inherit")
+                int(lv["id"]): str(lv.get("effect") or "inherit")
                 for lv in levels
             }
             # 等级的默认「指令」权限（与 LLM 权限分开配置，避免互相牵连）
             self._level_cmd_effect = {
-                (str(lv["kind"]), int(lv["id"])): str(lv.get("command_effect") or "inherit")
+                int(lv["id"]): str(lv.get("command_effect") or "inherit")
                 for lv in levels
             }
             # 上面两者的「群聊场景」版本：好友等级在群里也生效，所以能单独设一套
             # （inherit = 跟随主值，旧数据就是这样 → 行为不变）
             self._level_eff_group = {
-                (str(lv["kind"]), int(lv["id"])): str(lv.get("effect_group") or "inherit")
+                int(lv["id"]): str(lv.get("effect_group") or "inherit")
                 for lv in levels
             }
             self._level_cmd_eff_group = {
-                (str(lv["kind"]), int(lv["id"])): str(lv.get("command_effect_group") or "inherit")
+                int(lv["id"]): str(lv.get("command_effect_group") or "inherit")
                 for lv in levels
             }
             self._level_route = {
-                (str(lv["kind"]), int(lv["id"])): {
+                int(lv["id"]): {
                     "provider_id": str(lv.get("provider_id") or ""),
                     "fallback_provider_id": str(lv.get("fallback_provider_id") or ""),
                 }

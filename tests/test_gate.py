@@ -124,30 +124,30 @@ def main() -> int:
 
     print("\n[2] 等级默认权限")
     # 好友归级 → 等级 effect=deny 生效
-    rules = R(level_effect={("user", 1): "deny"}, subject_level={"user": {"10001": 1}})
+    rules = R(level_effect={1: "deny"}, subject_level={"user": {"10001": 1}})
     v = gate.evaluate(G.Subject(sender_id="10001"), rules)
     check(not v.allow and v.layer == "user_level" and v.scope_type == "level", "好友等级 deny 生效")
     # 好友专属 allow 优先于等级 deny
     v = gate.evaluate(G.Subject(sender_id="10001"), R(effect_user=u_allow, **{
-        "level_effect": {("user", 1): "deny"}, "subject_level": {"user": {"10001": 1}},
+        "level_effect": {1: "deny"}, "subject_level": {"user": {"10001": 1}},
     }))
     check(v.allow and v.layer == "user", "好友专属 allow 优先于等级 deny")
     # 等级 effect=inherit → 不截断链条，继续看群规则
     v = gate.evaluate(
         G.Subject(sender_id="10001", group_id="88888"),
-        R(effect_group=g_deny, level_effect={("user", 1): "inherit"}, subject_level={"user": {"10001": 1}}),
+        R(effect_group=g_deny, level_effect={1: "inherit"}, subject_level={"user": {"10001": 1}}),
     )
     check(not v.allow and v.layer == "group", "等级 inherit（不管权限）→ 继续看群专属")
     # 群等级
     v = gate.evaluate(
         G.Subject(sender_id="99999", group_id="88888"),
-        R(level_effect={("group", 7): "deny"}, subject_level={"group": {"88888": 7}}),
+        R(level_effect={7: "deny"}, subject_level={"group": {"88888": 7}}),
     )
     check(not v.allow and v.layer == "group_level", "群等级 deny 生效")
     # 群专属 allow 优先于群等级 deny
     v = gate.evaluate(
         G.Subject(sender_id="99999", group_id="88888"),
-        R(effect_group=g_allow, level_effect={("group", 7): "deny"}, subject_level={"group": {"88888": 7}}),
+        R(effect_group=g_allow, level_effect={7: "deny"}, subject_level={"group": {"88888": 7}}),
     )
     check(v.allow and v.layer == "group", "群专属 allow 优先于群等级 deny")
 
@@ -308,7 +308,7 @@ def main() -> int:
 
     print("\n[10] 模型路由（等级 → 主 / 备提供商）")
     rules = R(
-        level_model={("user", 1): {"provider_id": "p-a", "model": "model-x", "fallback_provider_id": "p-b"}},
+        level_model={1: {"provider_id": "p-a", "model": "model-x", "fallback_provider_id": "p-b"}},
         subject_level={"user": {"10001": 1}},
     )
     route = G.Gate.resolve_model(G.Subject(sender_id="10001"), rules)
@@ -317,8 +317,8 @@ def main() -> int:
     # 群聊只看群等级，不回落到发言人的好友等级（否则同一个群会按人切模型）
     grp = R(
         level_model={
-            ("user", 1): {"provider_id": "p-user", "model": "", "fallback_provider_id": ""},
-            ("group", 2): {"provider_id": "p-group", "model": "", "fallback_provider_id": ""},
+            1: {"provider_id": "p-user", "model": "", "fallback_provider_id": ""},
+            2: {"provider_id": "p-group", "model": "", "fallback_provider_id": ""},
         },
         subject_level={"user": {"10001": 1}, "group": {"88888": 2}},
     )
@@ -328,13 +328,13 @@ def main() -> int:
     check(G.Gate.resolve_model(G.Subject(sender_id="10001", group_id="77777"), grp) is None,
           "群没归级 → 不干预（不会回落到发言人的好友等级）")
     only_fb = R(
-        level_model={("user", 1): {"provider_id": "", "model": "", "fallback_provider_id": "p-b"}},
+        level_model={1: {"provider_id": "", "model": "", "fallback_provider_id": "p-b"}},
         subject_level={"user": {"10001": 1}},
     )
     route = G.Gate.resolve_model(G.Subject(sender_id="10001"), only_fb)
     check(bool(route), "只配了备用提供商也算配置了模型路由")
     check(G.Gate.pick_provider(route, {"p-b"})["used_fallback"] is True, "主为空 → 直接用备用")
-    empty = R(level_model={("user", 1): {"provider_id": "", "model": "", "fallback_provider_id": ""}},
+    empty = R(level_model={1: {"provider_id": "", "model": "", "fallback_provider_id": ""}},
               subject_level={"user": {"10001": 1}})
     check(G.Gate.resolve_model(G.Subject(sender_id="10001"), empty) is None, "三个字段都空 → 不干预")
 
@@ -409,7 +409,7 @@ def main() -> int:
     master = {"group": {"88888": "deny"}, "user": {"10001": "allow"}}
     m_rules = R(
         command_master=master,
-        level_command_effect={("user", 3): "deny"},
+        level_command_effect={3: "deny"},
         subject_level={"user": {"10002": 3}},
     )
     v = gate.check_command(G.Subject(sender_id="99999", group_id="88888"), "draw", m_rules)
@@ -436,7 +436,7 @@ def main() -> int:
     check(not v.allow and v.layer == "global", "对象级放行后，单条指令的全局禁止仍然生效")
     check(gate.check_command(G.Subject(sender_id="10003"), "help", allowed).allow, "其它指令不受影响")
     # 等级层不参与单条指令链：等级只管「整体能不能用指令」
-    lv_only = R(level_command_effect={("user", 1): "deny"}, subject_level={"user": {"10001": 1}},
+    lv_only = R(level_command_effect={1: "deny"}, subject_level={"user": {"10001": 1}},
                 command_policy={"draw": {"user": {"10001": "allow"}}})
     v = gate.check_command(G.Subject(sender_id="10001"), "draw", lv_only)
     check(not v.allow and v.layer == "user_level", "等级禁止指令时，单条指令的放行压不过它（需在对象级开白名单）")
@@ -472,7 +472,7 @@ def main() -> int:
     sl = R(
         subject_level={"user": {"10002": 3}, "group": {"88888": 9}},
         subject_level_user_group={"10002": 4},
-        level_effect={("user", 3): "deny", ("user", 4): "allow", ("group", 9): "allow"},
+        level_effect={3: "deny", 4: "allow", 9: "allow"},
     )
     check(not gate.check_permission(G.Subject(sender_id="10002"), sl).allow, "分场景归级：私聊走私聊等级")
     check(
@@ -481,7 +481,7 @@ def main() -> int:
     )
     sl2 = R(
         subject_level={"user": {"10002": 3}, "group": {"88888": 9}},
-        level_effect={("user", 3): "deny", ("group", 9): "allow"},
+        level_effect={3: "deny", 9: "allow"},
     )
     check(not gate.check_permission(G.Subject(sender_id="10002"), sl2).allow, "私聊仍走好友等级（deny）")
     check(
@@ -489,9 +489,23 @@ def main() -> int:
         "没配群聊专属 → 群聊【不使用】好友等级，走群等级（allow）",
     )
 
+    # 等级键是全局唯一的 level_id（**不按 kind 查表**）：好友的「群聊等级」可以指向
+    # 一个**群聊等级**（限额页里 kind=group 的那套），群聊判定必须照常生效 ——
+    # 旧的 (kind, id) 键会把这种引用整层查空，界面看着配了、实际静默不生效。
+    cross = R(
+        level_effect={4: "allow", 6: "deny"},  # 4 = 好友等级；6 = 群聊等级
+        subject_level={"user": {"10006": 4}},
+        subject_level_user_group={"10006": 6},
+    )
+    check(
+        not gate.check_permission(G.Subject(sender_id="10006", group_id="88888"), cross).allow,
+        "好友的群聊等级指向群聊等级 → 群聊按它生效（键是 level_id，与 kind 无关）",
+    )
+    check(gate.check_permission(G.Subject(sender_id="10006"), cross).allow, "私聊仍走好友等级（互不串）")
+
     # 好友等级参与群聊判定的前提：配了「群聊专属等级」；场景值没配（inherit）回落主值
     lv = R(
-        level_effect={("user", 3): "deny"},
+        level_effect={3: "deny"},
         subject_level={"user": {"10002": 3}},
         subject_level_user_group={"10002": 3},
     )
@@ -501,8 +515,8 @@ def main() -> int:
         "配了群聊专属等级 → 群聊参与判定并使用主值",
     )
     lv2 = R(
-        level_effect={("user", 3): "deny"},
-        level_effect_group={("user", 3): "allow"},
+        level_effect={3: "deny"},
+        level_effect_group={3: "allow"},
         subject_level={"user": {"10002": 3}},
         subject_level_user_group={"10002": 3},
     )
@@ -512,8 +526,8 @@ def main() -> int:
     # 真实数据形态（v1.0.0 回归）：reload 出来的「群聊专属值」是字符串 "inherit"，
     # 不是「键不存在」——回落逻辑必须把这两种形态都当作「没配」
     lv3 = R(
-        level_effect={("user", 3): "deny"},
-        level_effect_group={("user", 3): "inherit"},
+        level_effect={3: "deny"},
+        level_effect_group={3: "inherit"},
         subject_level={"user": {"10002": 3}},
         subject_level_user_group={"10002": 3},
     )
@@ -522,15 +536,15 @@ def main() -> int:
         "群聊专属值=字符串 inherit → 回落主值（此前被当没配而漏拦）",
     )
     lv4 = R(
-        level_effect={("user", 3): "allow"},
-        level_command_effect={("user", 3): "deny"},
-        level_command_effect_group={("user", 3): "inherit"},
+        level_effect={3: "allow"},
+        level_command_effect={3: "deny"},
+        level_command_effect_group={3: "inherit"},
         subject_level={"user": {"10002": 3}},
         subject_level_user_group={"10002": 3},
     )
     v = gate.check_command(G.Subject(sender_id="10002", group_id="88888"), "draw", lv4)
     check(not v.allow and v.layer == "user_level", "指令权限的群聊 inherit 同样回落主值")
-    lvg = R(level_effect={("group", 5): "deny"}, subject_level={"group": {"88888": 5}})
+    lvg = R(level_effect={5: "deny"}, subject_level={"group": {"88888": 5}})
     check(
         not gate.check_permission(G.Subject(sender_id="10001", group_id="88888"), lvg).allow,
         "群等级=禁止 → 群里被拒",
@@ -545,8 +559,8 @@ def main() -> int:
         "指令：只禁私聊 → 群里照用",
     )
     lvc = R(
-        level_command_effect={("user", 4): "deny"},
-        level_command_effect_group={("user", 4): "allow"},
+        level_command_effect={4: "deny"},
+        level_command_effect_group={4: "allow"},
         subject_level={"user": {"10003": 4}},
     )
     check(
@@ -580,7 +594,7 @@ def main() -> int:
     # 也能压过好友级与等级（成员层是最具体的一层）
     m3 = R(
         effect_user={"10001": "deny"},
-        level_effect={("user", 3): "deny"},
+        level_effect={3: "deny"},
         subject_level={"user": {"10001": 3}},
         effect_member={"88888:10001": "allow"},
     )
@@ -664,7 +678,7 @@ def main() -> int:
     m_level = R(
         subject_level={"user": {"10002": 3}},
         subject_level_user_group={"10002": 3},
-        level_command_effect={("user", 3): "deny"},
+        level_command_effect={3: "deny"},
     )
     v = gate.check_command(G.Subject(sender_id="10002", group_id="88888"), "draw", m_level)
     check(not v.allow and v.layer == "user_level", "成员/全局层之外，等级禁止照常生效")

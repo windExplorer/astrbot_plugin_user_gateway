@@ -85,24 +85,53 @@ function openDetail(uin: string) {
   drawerId.value = uin;
   drawerShow.value = true;
 }
-/** 等级 id → 名称（卡片展示用；0/null = 未分组）。 */
+// 等级分两套（都在「限额」页维护，用 kind 区分）：好友等级 → 好友的私聊；
+// 群聊等级 → 群 / 好友在群里的归级。列表里两个下拉各列各的，不再互相混。
+const checked = ref<string[]>([]);
+const levels = ref<LevelRow[]>([]); // 好友等级（私聊）
+const groupLevels = ref<LevelRow[]>([]); // 群聊等级
+const batchLevelId = ref<number | null>(null);
+
+function findLevel(rows: LevelRow[], id: number): LevelRow | undefined {
+  return rows.find((l) => l.id === id);
+}
+/** 私聊等级 id → 名称（卡片展示用；0/null = 未分组）。 */
 function levelNameOf(id: number | null | undefined): string {
   if (!id) return "未分组";
-  const lv = levels.value.find((l) => l.id === id);
+  // 兜底查群聊等级：level_id 全局唯一，历史数据里可能填的是另一套
+  const lv = findLevel(levels.value, id) || findLevel(groupLevels.value, id);
   return lv ? lv.name : String(id);
 }
-const checked = ref<string[]>([]);
-const levels = ref<LevelRow[]>([]);
-const batchLevelId = ref<number | null>(null);
+/** 群聊等级 id → 名称（同一套兜底逻辑）。 */
+function groupLevelNameOf(id: number | null | undefined): string {
+  if (!id) return "未分组";
+  const lv = findLevel(groupLevels.value, id) || findLevel(levels.value, id);
+  return lv ? lv.name : String(id);
+}
 
 // 详情抽屉
 const drawerShow = ref(false);
 const drawerId = ref("");
 
+/** 私聊等级下拉：只列好友等级（批量归级也用它，作用的就是私聊那一档）。 */
 const levelOptions = computed(() => [
   { label: "未分组", value: 0 },
   ...levels.value.map((l) => ({ label: `${l.name}（${l.members}）`, value: l.id })),
 ]);
+
+/** 群聊等级下拉：只列群聊等级。历史值若是好友等级，补一项用于回显。 */
+function groupLevelOptions(row: FriendRow) {
+  const opts = [
+    { label: "未分组（用群的档位）", value: -1 },
+    ...groupLevels.value.map((l) => ({ label: `${l.name}（${l.members}）`, value: l.id })),
+  ];
+  const cur = row.level_id_group;
+  if (cur && !opts.some((o) => o.value === cur)) {
+    const old = findLevel(levels.value, cur);
+    if (old) opts.push({ label: `${old.name}（旧：好友等级）`, value: old.id });
+  }
+  return opts;
+}
 
 // 默认按「最近回复」倒序：最关心的是「谁最近还在用」，从没回复过的自然沉底。
 const sortOptions = [
@@ -114,12 +143,17 @@ const sortOptions = [
   { label: "等级", value: "level" },
 ];
 
-// 等级筛选项：数量跟着等级变化实时刷新（等级管理里改完回来就是新的）
-const levelFilterOptions = computed(() => [
-  { label: "全部等级", value: "" },
-  { label: "未分组", value: "0" },
-  ...levels.value.map((l) => ({ label: `${l.name}（${l.members}）`, value: String(l.id) })),
-]);
+// 等级筛选项：跟着顶部「私聊 / 群聊」场景走 —— 私聊筛好友等级、群聊筛群聊等级
+// （筛的是该场景下真正生效的那一档；两套混在一起会筛出对不上的行）。
+// 数量跟着等级变化实时刷新（在等级管理里改完回来就是新的）。
+const levelFilterOptions = computed(() => {
+  const rows = scene.value === "group" ? groupLevels.value : levels.value;
+  return [
+    { label: scene.value === "group" ? "全部群聊等级" : "全部等级", value: "" },
+    { label: "未分组", value: "0" },
+    ...rows.map((l) => ({ label: `${l.name}（${l.members}）`, value: String(l.id) })),
+  ];
+});
 
 const KIND_META: Record<string, { text: string; type: "success" | "info" | "default" }> = {
   llm: { text: "LLM 回复", type: "success" },
@@ -144,8 +178,10 @@ function relTime(ts: number): string {
 
 async function loadLevels() {
   try {
-    const res = await apiLevels("user");
-    levels.value = res.items || [];
+    // 两套都要：私聊等级列用好友等级，群聊等级列 / 群聊筛选用群聊等级
+    const [users, groups] = await Promise.all([apiLevels("user"), apiLevels("group")]);
+    levels.value = users.items || [];
+    groupLevels.value = groups.items || [];
   } catch {
     /* 等级加载失败不阻塞列表 */
   }
@@ -208,6 +244,12 @@ async function refreshAvatars() {
 function search() {
   page.value = 1;
   load();
+}
+
+/** 切换「私聊 / 群聊」场景：等级筛选列表换了一套，旧值留着会筛出空列表。 */
+function onSceneChange() {
+  levelFilter.value = "";
+  search();
 }
 
 /**
@@ -368,10 +410,7 @@ const columns: DataTableColumns<FriendRow> = [
       h(NSelect, {
         size: "tiny",
         value: row.level_id_group ?? -1,
-        options: [
-          { label: "未分组（用群的档位）", value: -1 },
-          ...levelOptions.value,
-        ],
+        options: groupLevelOptions(row),
         consistentMenuWidth: false,
         onUpdateValue: (v: number) =>
           applyLevel(
@@ -542,7 +581,7 @@ onUnmounted(() => {
         筛选{{ activeFilterCount ? `（${activeFilterCount}）` : "" }}
       </n-button>
       <n-space v-else :size="8" align="center">
-        <n-radio-group v-model:value="scene" size="small" @update:value="search">
+        <n-radio-group v-model:value="scene" size="small" @update:value="onSceneChange">
           <n-radio-button value="private">私聊</n-radio-button>
           <n-radio-button value="group">群聊</n-radio-button>
         </n-radio-group>
@@ -588,7 +627,7 @@ onUnmounted(() => {
 
     <!-- 移动端筛选面板：控件纵向铺满，不挤在一行 -->
     <div v-if="isMobile && mobileFilters" class="m-filters">
-      <n-radio-group v-model:value="scene" size="small" @update:value="search">
+      <n-radio-group v-model:value="scene" size="small" @update:value="onSceneChange">
         <n-radio-button value="private">私聊</n-radio-button>
         <n-radio-button value="group">群聊</n-radio-button>
       </n-radio-group>
@@ -636,7 +675,7 @@ onUnmounted(() => {
         v-model:value="batchLevelId"
         size="small"
         style="width: 160px"
-        placeholder="批量设置等级…"
+        placeholder="批量设置私聊等级…"
         clearable
         :options="levelOptions"
       />
@@ -670,7 +709,7 @@ onUnmounted(() => {
               <div class="m-name">{{ row.display_name }}</div>
               <div class="m-sub">
                 {{ row.uin }} · 私聊 {{ levelNameOf(row.level_id_base) }}
-                <template v-if="row.level_id_group"> · 群聊 {{ levelNameOf(row.level_id_group) }}</template>
+                <template v-if="row.level_id_group"> · 群聊 {{ groupLevelNameOf(row.level_id_group) }}</template>
               </div>
             </div>
             <span class="m-arrow">›</span>

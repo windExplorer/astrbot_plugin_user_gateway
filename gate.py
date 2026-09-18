@@ -114,9 +114,9 @@ class Rules:
     Args:
         effect_user: ``{uin: {scene: allow|deny}}`` —— 好友专属权限（``''`` = 通用）。
         effect_group: ``{group_id: {scene: allow|deny}}`` —— 群专属权限（实际只有 ``''``）。
-        level_effect: ``{(kind, level_id): allow|deny|inherit}`` —— 等级默认权限（主值）。
-        level_effect_group: 同上，但只在**群聊**场景下用（仅 ``kind='user'`` 有意义；
-            ``inherit`` = 跟随主值）。
+        level_effect: ``{level_id: allow|deny|inherit}`` —— 等级默认权限（主值）。
+        level_effect_group: 同上，但只在**群聊**场景下用（只有好友等级会显式配，
+            群聊等级的该列恒为 ``inherit``；``inherit`` = 跟随主值）。
         subject_level: ``{scope_type: {scope_id: level_id}}`` —— 对象归级。
         limits: ``{scope_type: {scope_id: {period: row}}}`` —— 限额规则，
             ``scope_type`` 为 ``user`` / ``group`` / ``level`` / ``global``。
@@ -141,7 +141,7 @@ class Rules:
     limits: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     usage: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     level_model: Mapping[Any, Mapping[str, str]] = field(default_factory=dict)
-    """``{(kind, level_id): {"provider_id", "fallback_provider_id"}}`` —— 等级的模型路由。"""
+    """``{level_id: {"provider_id", "fallback_provider_id"}}`` —— 等级的模型路由。"""
     command_policy: Mapping[str, Mapping[str, Mapping[str, Mapping[str, str]]]] = field(
         default_factory=dict
     )
@@ -149,9 +149,9 @@ class Rules:
     command_master: Mapping[str, Mapping[str, Mapping[str, str]]] = field(default_factory=dict)
     """``{scope_type: {scope_id: {scene: effect}}}`` —— **对象级指令总权限**（好友 / 群 / 全局）。"""
     level_command_effect: Mapping[Any, str] = field(default_factory=dict)
-    """``{(kind, level_id): effect}`` —— 等级的默认**指令**权限（主值，与 level_effect 分开）。"""
+    """``{level_id: effect}`` —— 等级的默认**指令**权限（主值，与 level_effect 分开）。"""
     level_command_effect_group: Mapping[Any, str] = field(default_factory=dict)
-    """同上，但只在**群聊**场景下用（仅 ``kind='user'`` 有意义）。"""
+    """同上，但只在**群聊**场景下用（只有好友等级会显式配）。"""
 
     def limits_of(self, scope_type: str, scope_id: str) -> Mapping[str, Mapping[str, Any]]:
         return (self.limits.get(scope_type) or {}).get(str(scope_id)) or {}
@@ -328,10 +328,15 @@ class Gate:
     # 权限（LLM 权限与「指令总权限」共用同一条档位链）
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _level_key(ref: LayerRef) -> tuple[str, int]:
-        """等级层的键 ``(kind, level_id)``（群等级用 group，其余用 user）。"""
-        kind = "group" if ref.layer == LAYER_GROUP_LEVEL else "user"
-        return (kind, _as_int(ref.scope_id, -1))
+    def _level_key(ref: LayerRef) -> int:
+        """等级层的键 = ``level_id``（``quota_level.id`` 是全局唯一主键）。
+
+        为什么**不带 kind**：``kind`` 只是控制台的分组标签（好友等级 / 群聊等级），
+        而一个「归级」引用只存 id。若按 ``(kind, id)`` 查表，那么「好友的群聊等级
+        指向一个群聊等级」这种引用会查空 —— 该档位被静默跳过，界面看着配了却不生效。
+        按 id 查则两种 kind 都能命中，语义也更简单：id 唯一，等级就是这个等级。
+        """
+        return _as_int(ref.scope_id, -1)
 
     def _level_effect(self, rules: Rules, ref: LayerRef, which: str) -> str:
         """取等级层的默认权限。
@@ -339,15 +344,17 @@ class Gate:
         Args:
             which: ``"effect"`` 取 LLM 权限，``"command_effect"`` 取指令权限。
 
-        群聊场景下的**好友等级**先看「群聊专属值」，没配（inherit）再回落到主值
+        群聊场景下的**等级**先看「群聊专属值」，没配（inherit）再回落到主值
         —— 主值就是私聊那套，也就是 v5 之前唯一存在的那一列，所以旧数据行为不变。
+        好友等级两套场景都能配；群聊等级只列了主值，其群聊专属列恒为 ``inherit``，
+        因而始终走主值（对两种 kind 都成立，所以这里不再按 kind / layer 分支）。
         """
         key = self._level_key(ref)
         if which == "effect":
             main, group = rules.level_effect, rules.level_effect_group
         else:
             main, group = rules.level_command_effect, rules.level_command_effect_group
-        if ref.layer == LAYER_USER_LEVEL and ref.scene == SCENE_GROUP:
+        if ref.scene == SCENE_GROUP:
             g = str(group.get(key) or "").strip()
             # 群聊专属值只有显式 allow / deny 才算「配了」；"inherit"（含库里的默认值）
             # 都视为没配 → 回落到主值。之前用 `or` 链判断，"inherit" 是真值字符串，
@@ -542,7 +549,8 @@ class Gate:
         level_id = rules.level_id_of(kind, sid)
         if not level_id:
             return None
-        got = rules.level_model.get((kind, int(level_id))) or {}
+        # 等级模型同样按 level_id 查（id 全局唯一，见 Gate._level_key 的说明）
+        got = rules.level_model.get(int(level_id)) or {}
         if not (got.get("provider_id") or got.get("fallback_provider_id")):
             return None
         return {

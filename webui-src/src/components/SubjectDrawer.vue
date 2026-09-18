@@ -73,15 +73,39 @@ const cmdResolvedText = computed(() => {
   return `生效：${word}｜来源：${m.layer_label}`;
 });
 
-// 等级（v8 分场景）：levelId = 私聊；levelIdGroup = 群聊专属（-1 = 跟随私聊）
-const levels = ref<LevelRow[]>([]);
+// 等级分两套（都在「限额」页维护，kind 区分）：
+//   kind='user'  → 好友等级，用于好友的**私聊**
+//   kind='group' → 群聊等级，用于**群**的归级、以及好友的**群聊**归级
+// 两个下拉各列各的，不再互相混。levelId = 私聊等级（群抽屉 = 所属等级）；
+// levelIdGroup = 好友的群聊等级（-1 = 未分组，走群的档位）。
+const levels = ref<LevelRow[]>([]); // 当前对象类型对应的一套（群抽屉 = 群聊等级）
+const groupLevels = ref<LevelRow[]>([]); // 好友的「群聊等级」下拉用
 const levelId = ref(0);
 const levelIdGroup = ref(-1);
-const levelOptions = ref<{ label: string; value: number }[]>([{ label: "未分组", value: 0 }]);
-const groupLevelOptions = computed(() => [
-  { label: "未分组（用群的档位）", value: -1 },
-  ...levelOptions.value,
+
+function levelItems(rows: LevelRow[]) {
+  return rows.map((l) => ({ label: `${l.name}（${l.members}）`, value: l.id }));
+}
+
+const levelOptions = computed(() => [
+  { label: "未分组", value: 0 },
+  ...levelItems(levels.value),
 ]);
+
+// 好友的「群聊等级」：只列群聊等级。历史数据里可能存的是好友等级 id（v1.2.x 的语义），
+// 这时补一项把它显示出来，避免下拉回显成裸数字；换成群聊等级后该项自然消失。
+const groupLevelOptions = computed(() => {
+  const opts = [
+    { label: "未分组（用群的档位）", value: -1 },
+    ...levelItems(groupLevels.value),
+  ];
+  const cur = levelIdGroup.value;
+  if (cur > 0 && !opts.some((o) => o.value === cur)) {
+    const old = levels.value.find((l) => l.id === cur);
+    if (old) opts.push({ label: `${old.name}（旧：好友等级）`, value: old.id });
+  }
+  return opts;
+});
 // 好友专属模型（仅私聊生效；空 = 跟随等级配置）
 const subjectModel = ref("");
 const modelSaving = ref(false);
@@ -201,13 +225,13 @@ async function load() {
 
 async function loadLevels() {
   try {
-    const res = await apiLevels();
-    const mine = (res.items || []).filter((l) => l.kind === props.type);
-    levels.value = mine;
-    levelOptions.value = [
-      { label: "未分组", value: 0 },
-      ...mine.map((l) => ({ label: `${l.name}（${l.members}）`, value: l.id })),
-    ];
+    // 两套都取：好友抽屉要「好友等级（私聊）」+「群聊等级」两份；
+    // 群抽屉只需要群聊等级那一套。
+    const [users, groups] = await Promise.all([apiLevels("user"), apiLevels("group")]);
+    const userLevels = users.items || [];
+    const groupLvs = groups.items || [];
+    levels.value = props.type === "group" ? groupLvs : userLevels;
+    groupLevels.value = groupLvs;
   } catch {
     /* 等级加载失败不影响其它面板 */
   }
@@ -586,7 +610,9 @@ watch(
                 <span style="font-size: 12px; opacity: 0.6; line-height: 1.7">
                   「继承」= 该场景不写专属规则：私聊跟随等级 / 通用规则 / 全局默认，
                   群聊跟随群专属 / 群等级 / 全局默认；指令「禁止」= 用不了任何指令
-                  （不含等级与单条指令细则）；群聊等级「未分组」= 不用他的好友等级，走群的档位。
+                  （不含等级与单条指令细则）。<br />
+                  私聊等级 = 限额页的<b>好友等级</b>，群聊等级 = 限额页的<b>群聊等级</b>；
+                  群聊等级「未分组」= 他在群里按群的档位走（群专属 / 群等级 / 全局）。
                 </span>
               </template>
               <template v-else>
@@ -614,7 +640,9 @@ watch(
                   :disabled="saving"
                   @update:value="saveLevel"
                 />
-                <span style="font-size: 12px; opacity: 0.6">等级可带默认权限与额度模板</span>
+                <span style="font-size: 12px; opacity: 0.6">
+                  群只能归「群聊等级」（限额页里那套），等级可带默认权限与额度模板
+                </span>
               </n-space>
               </template>
               <span v-if="detail?.bot?.ts" style="font-size: 12px; opacity: 0.65">
