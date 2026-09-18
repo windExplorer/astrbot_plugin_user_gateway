@@ -762,10 +762,13 @@ async def h_subject(plugin) -> dict:
     from_ts_today, to_ts_today = _today_bounds()
     today = await plugin.store.subject_stats(subject_type, subject_id, from_ts_today, to_ts_today)
 
+    # 近期流水必须与上面的 stats 同口径：好友按 sender_id、群按 group_id。
+    # 群一旦漏掉过滤条件，就会把全库最近的流水都搬进来（表现为「流水和该群不符」）。
     recent = await plugin.store.query_usage(
         from_ts=from_ts,
         to_ts=to_ts,
         sender_id=subject_id if subject_type == "user" else None,
+        group_id=subject_id if subject_type == "group" else None,
         limit=50,
         offset=0,
     )

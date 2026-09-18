@@ -158,6 +158,27 @@ async def main() -> int:
         res2 = await st.query_usage(status="denied")
         check(res2["total"] == 1 and res2["rows"][0]["deny_reason"] == "quota", "按 status 过滤")
 
+        # 群维度过滤：群里的流水可能记在 scope_type='group'（命中群级规则），
+        # 也可能记在 scope_type='user'（命中该用户的对象级规则），
+        # 只有按 group_id 过滤才能一次捞全 —— 群详情的「近期流水」就靠它
+        # （漏掉过滤条件时会显示成全库最新流水，表现为「流水和该群不符」）。
+        res3 = await st.query_usage(group_id="88888")
+        check(res3["total"] == 1, f"按 group_id 过滤（实得 {res3['total']}，期望 1）")
+        # 刻意放在时间窗口之外：不影响本段后续的区间统计 / CSV 行数断言
+        await st.log_usage(
+            ts=now - 2 * 86400,
+            scope_type="user",
+            scope_id="10001",
+            sender_id="10001",
+            group_id="88888",
+            kind="llm",
+            status="ok",
+        )
+        res4 = await st.query_usage(group_id="88888")
+        check(res4["total"] == 2, f"group_id 过滤覆盖 scope_type='user' 的群内流水（实得 {res4['total']}）")
+        res5 = await st.query_usage(group_id="88888", from_ts=now - 3600, to_ts=now + 60)
+        check(res5["total"] == 1, "group_id 可与时间区间叠加")
+
         s = await st.summary(now - 3600, now + 60)
         t = s["totals"]
         check(t["calls"] == 5, f"calls = {t['calls']}（期望 5）")

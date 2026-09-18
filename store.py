@@ -1228,13 +1228,21 @@ class Store:
         scope_type: Optional[str] = None,
         scope_id: Optional[str] = None,
         sender_id: Optional[str] = None,
+        group_id: Optional[str] = None,
         status: Optional[str] = None,
         kind: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """分页查询明细，返回 ``{total, rows}``。"""
-        where, args = self._usage_where(from_ts, to_ts, scope_type, scope_id, sender_id, status, kind)
+        """分页查询明细，返回 ``{total, rows}``。
+
+        ``group_id`` 用于「按群」过滤：群里的流水既可能是 ``scope_type='group'``
+        （命中群级规则），也可能是 ``scope_type='user'``（命中对象级规则），
+        而 ``group_id`` 一律记群号，所以群的维度按它过滤才不漏（与 ``subject_stats`` 口径一致）。
+        """
+        where, args = self._usage_where(
+            from_ts, to_ts, scope_type, scope_id, sender_id, status, kind, group_id=group_id
+        )
         db = self._conn()
         async with db.execute(f"SELECT COUNT(*) AS c FROM usage_log{where}", args) as cur:
             row = await cur.fetchone()
@@ -1255,6 +1263,7 @@ class Store:
         sender_id: Optional[str],
         status: Optional[str],
         kind: Optional[str],
+        group_id: Optional[str] = None,
     ) -> tuple[str, list[Any]]:
         parts: list[str] = []
         args: list[Any] = []
@@ -1268,6 +1277,7 @@ class Store:
             ("scope_type", scope_type),
             ("scope_id", scope_id),
             ("sender_id", sender_id),
+            ("group_id", group_id),
             ("status", status),
             ("kind", kind),
         ):

@@ -2,6 +2,45 @@
 
 本文件记录各版本的改动。版本号与 `metadata.yaml` 保持一致。
 
+## v1.3.1（修复：群详情的「近期流水」显示成了全库流水）
+
+### 现象
+
+打开「群聊」列表里任意一个群的详情抽屉，底部「近期流水」列出的是**与这个群无关**的记录
+（别的群、甚至私聊），和上方「用量概览 / 曲线」的数字对不上。
+
+### 根因
+
+`webui_api.h_subject` 组装详情时，近期流水只对好友传了过滤条件：
+
+```python
+recent = await plugin.store.query_usage(
+    from_ts=from_ts,
+    to_ts=to_ts,
+    sender_id=subject_id if subject_type == "user" else None,  # 群：一个条件都没传
+    limit=50,
+    offset=0,
+)
+```
+
+而 `store.query_usage` 当时根本没有「按群过滤」的参数，群详情这条查询就退化成
+「时间区间内**全库**最新 50 条」——谁最近用过 bot 就显示谁，与群无关。
+
+### 修复
+
+- `store.query_usage` 新增 `group_id` 过滤参数（`_usage_where` 同步支持；列名仍走白名单 + 参数化，无注入面）；
+- `webui_api.h_subject` 改为按对象类型二选一：好友 `sender_id`、群 `group_id`；
+- **为什么群按 `group_id` 而不是 `scope_type='group'`**：群里的流水会落在两种作用域上——
+  命中群级规则时记 `scope_type='group'`，命中该用户的对象级规则时记 `scope_type='user'`，
+  但 `group_id` 一律是群号。只有按它过滤才能把两类一次捞全，口径也与 `subject_stats` 对齐。
+- 注意：用量明细页（统计页）的「对象 ID」筛选走的仍是 `scope_id`，按群号筛只会命中
+  前半类流水（这是独立入口，未在本次改动范围内）。
+
+### 验证
+
+`tests/test_store.py` 补 3 条断言（按 `group_id` 过滤 / 覆盖 `scope_type='user'` 的群内流水 /
+可与时间区间叠加），全量存储层自检通过。
+
 ## v1.3.0（权限展示全面平铺：私聊 / 群聊一眼分清）
 
 ### 好友详情抽屉
