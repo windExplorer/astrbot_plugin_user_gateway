@@ -356,10 +356,13 @@ async def h_ping(plugin) -> dict:
                 "routed_sessions": len(getattr(plugin, "_last_route", {}) or {}),
                 "circuit": (plugin.circuit.snapshot() if getattr(plugin, "circuit", None) else {}),
             },
-            # 用户自助切换模型（v9）：开关、开放该功能的分组数、卡片字体是否就位
+            # 用户自助切换模型（v9/v10）：总开关、放开了切换的分级数、卡片字体是否就位
             "model_switch": {
                 "enabled": bool(plugin._cfg("model_switch_enabled", True)),
                 "open_levels": len(getattr(plugin, "_level_switch", {}) or {}),
+                "switch_levels": sum(
+                    1 for v in (getattr(plugin, "_level_switch_enabled", {}) or {}).values() if v
+                ),
                 "switched_users": len(getattr(plugin, "_model_choice", {}) or {}),
                 "sessions": (
                     plugin.switcher.sessions() if getattr(plugin, "switcher", None) else 0
@@ -1278,8 +1281,10 @@ async def h_levels(plugin) -> dict:
                 "command_effect_group": str(lv.get("command_effect_group") or "inherit"),
                 "provider_id": str(lv.get("provider_id") or ""),
                 "fallback_provider_id": str(lv.get("fallback_provider_id") or ""),
-                # v9：允许该等级的用户用 /切换模型 自助挑选的模型名单（空 = 不开放）
+                # v9：允许该等级的用户用 /切换模型 自助挑选的模型名单（空 = 用兜底三项）
                 "switch_providers": parse_provider_list(lv.get("switch_providers")),
+                # v10：是否允许切换（false = 只读，能看不能切；**默认 false**）
+                "switch_enabled": bool(int(lv.get("switch_enabled") or 0)),
                 "members": int(counts.get(lid, 0)),
                 "quotas": limits.get(str(lid), {}),
             },
@@ -1328,11 +1333,12 @@ async def h_set_level(plugin) -> dict:
     """新建 / 更新等级，并可同时写入该等级的额度模板。
 
     body: ``{id?, kind, name, description?, effect?, effect_command?, sort_order?,
-    provider_id?, fallback_provider_id?, switch_providers?, quotas?: [...]}``
+    provider_id?, fallback_provider_id?, switch_enabled?, switch_providers?, quotas?: [...]}``
 
     - ``effect``：等级默认 **LLM** 权限；``effect_command``：等级默认 **指令** 权限
       （``deny`` 即该等级不能用任何指令）；
-    - ``switch_providers``：该等级的用户能用 ``/切换模型`` 自助挑选的模型名单（v9，空 = 不开放）；
+    - ``switch_enabled``（v10）：该等级**是否允许**用户用 ``/切换模型`` 自助切换（默认假 = 只读）；
+    - ``switch_providers``：可切换的模型名单（v9，空 = 展示兜底三项：当前 / 系统默认 / 备用）；
     - ``quotas`` 里 ``limit_tokens=0`` 表示「明确不限」，``null`` / ``delete=true`` 表示删掉该周期。
     """
     if not (plugin.store and plugin.store.ready):
@@ -1375,16 +1381,21 @@ async def h_set_level(plugin) -> dict:
 
     # 可切换模型（v9）：只收「双向都存在」的提供商 id —— 不存在的 id 写进去用户也切不了
     # （route_model 会因不可用而静默回落，用户只会觉得「切了没用」）。
+    old = await plugin.store.get_level(level_id) if level_id else None
     raw_switch = body.get("switch_providers")
     if raw_switch is None:
         # 兼容：字段缺省时沿用原值（避免旧前端 / 部分更新把已配的名单清空）
-        old = await plugin.store.get_level(level_id) if level_id else None
         switch_providers = parse_provider_list((old or {}).get("switch_providers"))
     else:
         known = plugin.provider_ids()
         switch_providers = [
             pid for pid in parse_provider_list(raw_switch) if not known or pid in known
         ]
+    # 是否允许切换（v10）：同样「缺省 = 沿用原值」，默认关（只读）
+    if "switch_enabled" in body:
+        switch_enabled = _as_bool(body.get("switch_enabled"), default=False)
+    else:
+        switch_enabled = bool(int((old or {}).get("switch_enabled") or 0))
 
     new_id = await plugin.store.upsert_level(
         kind,
@@ -1399,6 +1410,7 @@ async def h_set_level(plugin) -> dict:
         effect_group=eff_group,
         command_effect_group=cmd_eff_group,
         switch_providers=switch_providers,
+        switch_enabled=switch_enabled,
     )
     if not new_id:
         return err("等级写入失败")

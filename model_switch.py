@@ -2,19 +2,30 @@
 
 功能形状（与 PRD / CHANGELOG 对应）：
 
-1. 管理员在**等级**里配一份「可切换模型」名单（``quota_level.switch_providers``）；
-2. 用户发 ``/切换模型``：按他所在的分组（私聊 = 好友等级、群聊 = 群等级）列出
-   允许切换的模型，渲染成卡片图（Pillow，见 :mod:`model_card` 的说明）；
-3. 用户回一个序号即切换；序号 **0 = 恢复默认**（跟随分组配置）。
+1. 管理员在**等级**里打开「允许切换模型」开关（``quota_level.switch_enabled``，**默认关**），
+   并可另配一份「可切换模型」名单（``switch_providers``）；
+2. 用户发 ``/切换模型``：按他所在的分组（私聊 = 好友等级、群聊 = 群等级）列出候选模型，
+   渲染成卡片图（Pillow，见 :mod:`model_card` 的说明）；
+3. 开关打开时用户回一个序号即切换（**0 = 恢复默认**）；开关关闭时**只读**：
+   卡片照发、能看清自己在用什么，但切不了。
 
 几个刻意的设计（改动前请先读）：
 
+- **默认只读**：`switch_enabled` 默认关。放开自助切换是管理员显式的动作，
+  配置没读到（比如库刚升级）也只会退回只读，不会凭空放开。
+- **只读时也发卡片**：用户至少要知道「我现在用的是哪个、还有哪些可能」——
+  需求原话是「没有配置名单就展示当前模型 + 系统默认 + 备用模型」。
+  只读时**不记序号会话**，所以此时随手发的数字不会被这条指令截走。
+- **没配名单 → 兜底三项**：当前生效的、AstrBot 系统默认、等级备用模型（去重后）。
+  配了名单则以名单为准（名单是管理员划的圈）。
+- **群聊仅管理员可用**：群共用一个会话，谁都能切会把整个群的模型搅乱；
+  管理员仍然可以（他是来调试的）。**只有管理员能豁免**这一条与上面的只读。
 - **选择按「用户 + 场景」存**（``policy.feature='model_choice'``，scene = private / group）：
   群里 A 切了模型不会改 B 的模型，也不会改群的默认模型；同一个人私聊与群聊两份选择互不影响。
 - **优先级：用户自己的选择 > 好友专属模型（仅私聊）> 等级模型路由**。
   用户切了不生效等于没切，所以自己选的必须最优先；管理员的「专属模型」只是**候选之一**
   （会带「专属模型」标签），而不是锁死。
-- **候选名单不放任**：只能从「等级配置的名单 + 自己的专属模型 + 当前生效的那个模型」里选，
+- **候选名单不放任**：只能从「等级名单（或兜底三项）+ 自己的专属模型 + 当前生效的那个」里选，
   这样「让人自己挑」不会变成「谁都能挑最贵的那个」。当前生效的那个会额外列出来，
   否则卡片上就没有一行能被标成「当前使用」。
 - **序号会话有 TTL 且绑定发言人**：键是 ``umo + 发言人``，所以群里别人发的数字不会误触发，
@@ -49,7 +60,15 @@ SOURCE_CHOICE = "你自己切换的"
 SOURCE_OWN = "管理员配的专属模型"
 SOURCE_LEVEL = "分组主模型"
 SOURCE_LEVEL_FALLBACK = "分组备用模型（主模型不可用）"
-SOURCE_DEFAULT = "AstrBot 默认模型"
+SOURCE_DEFAULT = "系统默认模型"
+
+# 只读 / 不可用的原因（也直接当给用户看的文案用）
+REASON_LEVEL_OFF = "所在分组未开放模型切换"
+REASON_GROUP_ONLY_ADMIN = "群里只有管理员能切换模型"
+# 只读时的卡片底部提示
+READONLY_HINT = "只读：{reason}，请联系管理员"
+# 群聊里非管理员的一句话说清（不发卡片：需求是「群聊仅管理员能用」）
+GROUP_REFUSE = "群里只有管理员能切换模型；你可以私聊我发 /切换模型 查看或切换。"
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -99,12 +118,26 @@ class ModelSwitcher:
         if len(self._pending) > MAX_SESSIONS:  # 兜底：极端情况直接清空（会话本来就是短时的）
             self._pending.clear()
 
-    def remember(self, subject: Subject, options: list[dict[str, Any]], scene: str) -> None:
-        """记下这次列出的序号选项（用户回序号时按它换算）。"""
+    def remember(
+        self,
+        subject: Subject,
+        options: list[dict[str, Any]],
+        scene: str,
+        *,
+        can_switch: bool = True,
+        reason: str = "",
+    ) -> None:
+        """记下这次列出的序号选项（用户回序号时按它换算）。
+
+        ``can_switch=False`` 的会话不该被建立（只读时 ``handle_command`` 直接跳过这一步），
+        参数留着是为了让 :meth:`apply` 有一道显式防线，而不是靠「外面记得别调」。
+        """
         self._prune()
         self._pending[self.key_of(subject)] = {
             "options": options,
             "scene": scene,
+            "can_switch": bool(can_switch),
+            "readonly_reason": str(reason or ""),
             "expire": time.time() + self.ttl(),
         }
 
@@ -130,16 +163,20 @@ class ModelSwitcher:
     # 名单组装
     # ------------------------------------------------------------------ #
     async def describe(self, subject: Subject) -> dict[str, Any]:
-        """算出「这个人现在能切哪些模型、当前用的是哪个」。
+        """算出「这个人现在能用哪些模型、当前用的是哪个、能不能切」。
 
         Returns:
-            ``{scene, level_id, level_name, level_kind, options, current_id,
-            current_source, open}``；``options`` 每项
-            ``{index, provider_id, label, note, current, own, unavailable}``。
+            ``{scene, level_id, level_name, level_kind, options, current_id, current_source,
+            open, allowed, can_switch, readonly_reason, is_admin, group_restricted}``；
+            ``options`` 每项 ``{index, provider_id, label, note, current, own, unavailable}``。
+
+        ``open`` = 有东西可展示（只读时也是 True）；``can_switch`` = 真的能切
+        （只读 / 群聊非管理员时为 False）。
         """
         plugin = self._plugin
         scene = "group" if str(subject.group_id or "") else "private"
         uid = str(subject.sender_id or "")
+        is_admin = bool(getattr(subject, "is_admin", False))
 
         rules = plugin._rules()
         found = plugin.gate.model_level_of(subject, rules)
@@ -153,27 +190,55 @@ class ModelSwitcher:
             except Exception:
                 level_name = ""
 
-        allowed = plugin.gate.switch_options(rules, level_id) if level_id else ()
-        own = str((plugin._subject_model or {}).get(uid) or "") if scene == "private" else ""
+        allowed = [str(p or "").strip() for p in (plugin.gate.switch_options(rules, level_id) or ())]
+        allowed = [p for p in allowed if p]
+        level_on = plugin.gate.switch_enabled(rules, level_id)
+
         available = set(plugin.provider_ids())
         circuit = plugin.circuit.open_ids() if getattr(plugin, "circuit", None) else set()
-        current_id, current_source = await self.current_of(subject, scene, available - circuit)
+        usable = available - circuit
+        system_default = await self.system_default_of(subject)
+        route = plugin.gate.resolve_model(subject, rules) or {}
+        own = str((plugin._subject_model or {}).get(uid) or "") if scene == "private" else ""
+        choice = str(effect_in_scene((plugin._model_choice or {}).get(uid), scene) or "")
+        current_id, current_source = await self.current_of(
+            subject, scene, usable, system_default, route
+        )
+
+        # 能不能切：群聊只放给管理员；等级开关默认关（只读），管理员同样豁免
+        group_restricted = scene == "group"
+        if group_restricted and not is_admin:
+            can_switch, readonly_reason = False, REASON_GROUP_ONLY_ADMIN
+        elif not (level_on or is_admin):
+            can_switch, readonly_reason = False, REASON_LEVEL_OFF
+        else:
+            can_switch, readonly_reason = True, ""
 
         ordered: list[str] = []
-        for pid in allowed:
-            pid = str(pid or "").strip()
-            if pid and pid not in ordered:
-                ordered.append(pid)
-        if own and own not in ordered:
-            ordered.append(own)
+
+        def add(pid: Any) -> None:
+            text = str(pid or "").strip()
+            if text and text not in ordered:
+                ordered.append(text)
+
+        if allowed:
+            for pid in allowed:
+                add(pid)
+        else:
+            # 没配名单 → 兜底展示三项：当前生效的 / 系统默认 / 等级备用。
+            # 需求原话就是这么要求的：至少让人看清「现在走的是哪个、还能退到哪」。
+            add(current_id)
+            add(system_default)
+            add(route.get("fallback_provider_id"))
+        if own:
+            add(own)
         # 用户自己切过的那个也要列出来（哪怕它现在不可用）——否则他「切过的东西」凭空消失，
         # 只会以为是插件把配置吃掉了
-        choice = effect_in_scene((plugin._model_choice or {}).get(uid), scene)
-        if choice and choice not in ordered:
-            ordered.append(str(choice))
+        if choice:
+            add(choice)
         # 当前生效的那个也列出来：否则卡片上没有任何一行能标「当前使用」
-        if current_id and current_id not in ordered and current_source != SOURCE_DEFAULT:
-            ordered.append(current_id)
+        if current_id and current_source != SOURCE_DEFAULT:
+            add(current_id)
 
         infos = plugin.provider_map()
 
@@ -208,8 +273,13 @@ class ModelSwitcher:
             "current_id": current_id,
             "current_source": current_source,
             "open": bool(options),
-            # 名单本身（不等于 options）：用来区分「分组没开放」与「只列了当前那个」
-            "allowed": list(allowed),
+            # 名单本身（不等于 options）：用来区分「配了名单」与「走兜底三项」
+            "allowed": allowed,
+            "can_switch": can_switch,
+            "readonly_reason": readonly_reason,
+            "is_admin": is_admin,
+            "group_restricted": group_restricted,
+            "system_default": system_default,
         }
 
     def group_label(self, data: dict[str, Any]) -> str:
@@ -219,8 +289,23 @@ class ModelSwitcher:
         what = "群等级" if kind == "group" else "好友等级"
         return f"{name}（{what}）" if name else "未分组"
 
+    async def system_default_of(self, subject: Subject) -> str:
+        """AstrBot 的**系统默认**提供商 id（本会话没被插件干预时会走的那个）。"""
+        try:
+            prov = await self._plugin.context.get_using_provider_async(subject.umo)
+            if not prov:
+                return ""
+            return str((getattr(prov, "provider_config", {}) or {}).get("id") or "")
+        except Exception:
+            return ""
+
     async def current_of(
-        self, subject: Subject, scene: str, available: Optional[set[str]] = None
+        self,
+        subject: Subject,
+        scene: str,
+        available: Optional[set[str]] = None,
+        system_default: Optional[str] = None,
+        route: Optional[dict[str, Any]] = None,
     ) -> tuple[str, str]:
         """这个人**当前实际会走**哪个模型 → ``(provider_id, 来源文案)``。
 
@@ -230,6 +315,7 @@ class ModelSwitcher:
 
         Args:
             available: 当前可用的提供商集合；为 None 时自己算一遍。
+            system_default / route: 已经算好的话就传进来，省一次查询与一次解析。
         """
         plugin = self._plugin
         uid = str(subject.sender_id or "")
@@ -243,7 +329,8 @@ class ModelSwitcher:
             own = str((plugin._subject_model or {}).get(uid) or "")
             if own and own in available:
                 return own, SOURCE_OWN
-        route = plugin.gate.resolve_model(subject, plugin._rules())
+        if route is None:
+            route = plugin.gate.resolve_model(subject, plugin._rules()) or {}
         if route:
             picked = plugin.gate.pick_provider(route, available)
             if picked:
@@ -251,12 +338,9 @@ class ModelSwitcher:
                     str(picked["provider_id"]),
                     SOURCE_LEVEL_FALLBACK if picked.get("used_fallback") else SOURCE_LEVEL,
                 )
-        try:
-            prov = await plugin.context.get_using_provider_async(subject.umo)
-            pid = str(((getattr(prov, "provider_config", {}) or {}).get("id") or "")) if prov else ""
-        except Exception:
-            pid = ""
-        return pid, SOURCE_DEFAULT
+        if system_default is None:
+            system_default = await self.system_default_of(subject)
+        return str(system_default or ""), SOURCE_DEFAULT
 
     # ------------------------------------------------------------------ #
     # 渲染
@@ -283,29 +367,41 @@ class ModelSwitcher:
         subtitle = f"分组：{self.group_label(data)}"
         if current_label:
             subtitle += f"｜当前：{current_label}"
+        if data.get("is_admin") and not data.get("can_switch"):
+            # 极少见：管理员豁免也救不了的组合（理论上不存在），留一行免得以后改成「管理员也受限」时静默
+            subtitle += "｜管理员已豁免限制"
 
-        footer = f"回复序号切换 · {self.ttl()} 秒内有效 · 0 = 恢复默认"
         return model_card.render_model_card(
             title="模型切换",
             subtitle=subtitle,
             rows=data.get("options") or [],
-            footer=footer,
+            footer=self.footer_of(data),
             avatar=avatar,
             font_path=str(plugin._cfg("model_card_font", "") or ""),
         )
 
-    @staticmethod
-    def text_list(data: dict[str, Any], ttl: int) -> str:
+    def footer_of(self, data: dict[str, Any]) -> str:
+        """卡片底部提示：能切就说怎么切，只读就说为什么切不了。"""
+        if data.get("can_switch"):
+            return f"回复序号切换 · {self.ttl()} 秒内有效 · 0 = 恢复默认"
+        reason = str(data.get("readonly_reason") or REASON_LEVEL_OFF)
+        return READONLY_HINT.format(reason=reason)
+
+    def text_list(self, data: dict[str, Any], ttl: int) -> str:
         """卡片渲染不出来时的纯文本兜底（功能不能因为画不出图就没了）。"""
         lines: list[str] = []
         if data.get("current_id"):
             lines.append(f"当前使用：{data['current_id']}")
-        lines.append("可切换的模型：")
+        lines.append("可用模型：" if not data.get("can_switch") else "可切换的模型：")
         for row in data.get("options") or []:
             tail = "（当前使用）" if row.get("current") else ("（专属模型）" if row.get("own") else "")
             mark = "（暂不可用）" if row.get("unavailable") else ""
             lines.append(f"{row.get('index')}. {row.get('label')}{tail}{mark}")
-        lines.append(f"回复序号即可切换（{ttl} 秒内有效）· 回复 0 = 恢复默认")
+        if data.get("can_switch"):
+            lines.append(f"回复序号即可切换（{ttl} 秒内有效）· 回复 0 = 恢复默认")
+        else:
+            reason = str(data.get("readonly_reason") or REASON_LEVEL_OFF)
+            lines.append(READONLY_HINT.format(reason=reason))
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
@@ -321,6 +417,11 @@ class ModelSwitcher:
         item = self.peek(subject)
         if not item:
             return {"ok": False, "gone": True, "message": "选择已过期，请重新发送 /切换模型。"}
+        # 只读的会话理论上不会被建立（handle_command 里不 remember），这里是二次防线：
+        # 万一以后有人改成「只读也记会话」，也绝不会真的写库。
+        if not item.get("can_switch"):
+            reason = str(item.get("readonly_reason") or REASON_LEVEL_OFF)
+            return {"ok": False, "message": f"{reason}，这次没有切换。"}
         options = list(item.get("options") or [])
         scene = str(item.get("scene") or "private")
         uid = str(subject.sender_id or "")
@@ -366,7 +467,7 @@ class ModelSwitcher:
     # 指令入口
     # ------------------------------------------------------------------ #
     async def handle_command(self, plugin: Any, event: Any, subject: Subject, arg: str = "") -> None:
-        """``/切换模型 [序号]``：不带参数发卡片，带参数直接切。"""
+        """``/切换模型 [序号]``：不带参数发卡片（只读时也发），带参数直接切。"""
         if not self.enabled():
             return
         if not (plugin.store and plugin.store.ready):
@@ -374,12 +475,16 @@ class ModelSwitcher:
             return
 
         data = await self.describe(subject)
+        if data.get("group_restricted") and not data.get("is_admin"):
+            # 群聊仅管理员可用：不发卡片（需求就是「群里只有管理员能用」），
+            # 但要说清去哪儿用，别让用户以为是插件坏了。
+            await plugin._send(event, GROUP_REFUSE)
+            return
         if not data.get("open"):
+            # 连展示的东西都没有（没归级、也没任何候选）：说清楚而不是发一张空卡
             await plugin._send(
                 event,
-                "你所在的分组（"
-                + self.group_label(data)
-                + "）还没有开放模型切换，请联系管理员。",
+                f"当前分组（{self.group_label(data)}）没有可展示的模型信息，请联系管理员。",
             )
             return
 
@@ -390,15 +495,38 @@ class ModelSwitcher:
             except ValueError:
                 index = -1
             if index >= 0:
+                if not data.get("can_switch"):
+                    # 只读：明确说不能切，不给「沉默失败」的错觉
+                    await plugin._send(
+                        event,
+                        READONLY_HINT.format(
+                            reason=str(data.get("readonly_reason") or REASON_LEVEL_OFF)
+                        ),
+                    )
+                    return
                 # 带参数 = 直接切（不用先发卡片）：先记下序号表再套用
-                self.remember(subject, data.get("options") or [], str(data.get("scene") or "private"))
+                self.remember(
+                    subject,
+                    data.get("options") or [],
+                    str(data.get("scene") or "private"),
+                    can_switch=True,
+                    reason="",
+                )
                 res = await self.apply(subject, index)
                 await plugin._send(event, res.get("message", ""))
                 return
             await plugin._send(event, "参数要填序号（如 /切换模型 2），或直接发 /切换模型 看列表。")
             return
 
-        self.remember(subject, data.get("options") or [], str(data.get("scene") or "private"))
+        if data.get("can_switch"):
+            # 只有能切时才记序号会话：只读时随手发的数字不该被这条指令截走
+            self.remember(
+                subject,
+                data.get("options") or [],
+                str(data.get("scene") or "private"),
+                can_switch=True,
+                reason="",
+            )
         card = await self.build_card(subject, data)
         if card is not None and await plugin._send_image(event, card):
             return

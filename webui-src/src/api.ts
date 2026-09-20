@@ -345,7 +345,9 @@ export interface LevelRow {
   /** 模型路由：主提供商 id / 备用提供商 id（一项 = 一个「提供商 · 模型」） */
   provider_id: string;
   fallback_provider_id: string;
-  /** 允许该等级的用户用 /切换模型 自助挑选的模型名单（空数组 = 不开放） */
+  /** 是否允许该等级的用户用 /切换模型 自助切换（false = 只读：能看不能切） */
+  switch_enabled: boolean;
+  /** 可切换的模型名单（空数组 = 展示兜底三项：当前 / 系统默认 / 备用） */
   switch_providers: string[];
   members: number;
   quotas: Record<string, { limit_tokens: number; mode: string; reset_at: number | null }>;
@@ -364,7 +366,9 @@ export interface LevelPayload {
   sort_order?: number;
   provider_id?: string;
   fallback_provider_id?: string;
-  /** 可切换模型名单（缺省 = 沿用原值；传空数组 = 关闭该等级的自助切换） */
+  /** 是否允许自助切换（缺省 = 沿用原值；默认关 = 只读） */
+  switch_enabled?: boolean;
+  /** 可切换模型名单（缺省 = 沿用原值；传空数组 = 用兜底三项） */
   switch_providers?: string[];
   quotas?: { period: string; limit_tokens: number | null; mode?: string; delete?: boolean }[];
 }

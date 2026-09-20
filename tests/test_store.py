@@ -43,7 +43,7 @@ async def main() -> int:
         check(Path(db_path).exists(), "数据库文件已创建")
 
         print("\n[2] settings")
-        check(await st.get_setting("schema_version") == "9", "schema_version 已写入 9")
+        check(await st.get_setting("schema_version") == "10", "schema_version 已写入 10")
         check(await st.get_setting("nope", "d") == "d", "缺省值回退")
         await st.set_setting("sync_last_at", "123")
         check(await st.get_setting("sync_last_at") == "123", "写入后可读")
@@ -413,12 +413,26 @@ async def main() -> int:
             switch_providers=[],
         )
         lv = await st.get_level(lv_vip)
-        check(lv["switch_providers"] == "", "传空列表 → 存空串（= 不开放自助切换）")
+        check(lv["switch_providers"] == "", "传空列表 → 存空串（= 用兜底三项）")
+        # 允许切换的开关（v10）：默认关；只有显式打开才允许
+        check(int(lv["switch_enabled"]) == 0, "不传 switch_enabled → 默认 0（只读）")
+        await st.upsert_level(
+            "user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9,
+            switch_enabled=True,
+        )
+        check(int((await st.get_level(lv_vip))["switch_enabled"]) == 1, "开关可写可读（True → 1）")
+        # 导入路径什么都可能来：字符串 / 数字都要收口成 0/1
+        await st.upsert_level("user", "VIP改名", level_id=lv_vip, switch_enabled="false")
+        check(int((await st.get_level(lv_vip))["switch_enabled"]) == 0,
+              "字符串 \"false\" 不会被当成真值（收口在 _as_flag）")
+        await st.upsert_level("user", "VIP改名", level_id=lv_vip, switch_enabled=0)
+        check(int((await st.get_level(lv_vip))["switch_enabled"]) == 0, "数字 0 → 只读")
         await st.upsert_level(
             "user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9,
             provider_id="prov-a", fallback_provider_id="prov-b",
-            switch_providers=["prov-a", "prov-b"],
+            switch_providers=["prov-a", "prov-b"], switch_enabled=True,
         )
+        check(int((await st.get_level(lv_vip))["switch_enabled"]) == 1, "开关与名单可以一起写")
 
         # 用户自己切换的模型（feature=model_choice，v9）：与「专属模型」是两把键
         await st.set_policy("user", "10001", "prov-a", feature="model_choice", scene="private")
@@ -508,7 +522,7 @@ async def main() -> int:
 
         st3 = Store(v1_path)
         await st3.open()
-        check(await st3.get_setting("schema_version") == "9", "版本号直接升到最新（v1 → v9 连续迁移）")
+        check(await st3.get_setting("schema_version") == "10", "版本号直接升到最新（v1 → v10 连续迁移）")
         q = await st3.get_quota("user", "10001", "day")
         check(q is not None and q["limit_tokens"] == 1000 and "used_tokens" not in q,
               "限额保留、用量的列已移除")
@@ -554,14 +568,16 @@ async def main() -> int:
 
         st5 = Store(v2_path)
         await st5.open()
-        check(await st5.get_setting("schema_version") == "9", "版本号升到 9（v2 → v3 → … → v8 → v9 连续迁移）")
+        check(await st5.get_setting("schema_version") == "10", "版本号升到 10（v2 → v3 → … → v9 → v10 连续迁移）")
         lv = await st5.get_level(1)
         check(lv is not None and lv["name"] == "老等级", "v2 的等级数据保留")
         check(
             lv.get("provider_id") == "" and lv.get("fallback_provider_id") == "" and "model" not in lv,
             "模型路由两列默认为空，且 v3 临时加的 model 列已被 v4 移除",
         )
-        check(lv.get("switch_providers") == "", "v9 新增的「可切换模型」列默认为空（升级不改变既有行为）")
+        check(lv.get("switch_providers") == "", "v9 新增的「可切换模型」列默认为空")
+        check(int(lv.get("switch_enabled") or 0) == 0,
+              "v10 新增的「允许切换」开关默认为 0（只读：升级后不会凭空放开自助切换）")
         check(lv.get("command_effect") == "inherit", "v5 新增的 level.command_effect 默认为 inherit")
         await st5.upsert_level("user", "老等级", level_id=1, provider_id="p1", fallback_provider_id="p2")
         lv = await st5.get_level(1)
@@ -628,7 +644,7 @@ async def main() -> int:
 
         st8 = Store(v5_path)
         await st8.open()
-        check(await st8.get_setting("schema_version") == "9", "版本号升到 9")
+        check(await st8.get_setting("schema_version") == "10", "版本号升到 10")
         em = await st8.effect_map("user")
         check(em == {"10001": {"": "deny"}}, f"旧规则落到「通用」场景（实得 {em}）")
         check(await st8.resolve_policy("user", "10001", "llm", "group") == "deny",
@@ -650,7 +666,7 @@ async def main() -> int:
         await st8.close()
         st9 = Store(v5_path)
         await st9.open()
-        check(await st9.get_setting("schema_version") == "9", "重开不会重复迁移")
+        check(await st9.get_setting("schema_version") == "10", "重开不会重复迁移")
         check(await st9.resolve_policy("user", "10001", "llm", "private") == "allow", "重开后规则仍在")
         await st9.close()
 
@@ -766,9 +782,11 @@ async def main() -> int:
             "user", "VIP", effect="allow", command_effect="deny",
             effect_group="deny", command_effect_group="allow",
             provider_id="p1", fallback_provider_id="p2", sort_order=5,
-            switch_providers=["p1", "p2"],
+            switch_providers=["p1", "p2"], switch_enabled=True,
         )
-        big = await src.upsert_level("group", "大群", effect="deny", command_effect="inherit")
+        big = await src.upsert_level(
+            "group", "大群", effect="deny", command_effect="inherit", switch_enabled=0
+        )
         await src.set_subject_level("user", "10001", vip)
         await src.set_subject_level("group", "88888", big)
         await src.upsert_quota("level", str(vip), "day", 500000)
@@ -815,6 +833,9 @@ async def main() -> int:
               "模型路由一并导入")
         check(parse_provider_list(new_vip["switch_providers"]) == ["p1", "p2"],
               "可切换模型名单一并导入")
+        check(int(new_vip["switch_enabled"]) == 1, "「允许切换」开关一并导入（true → 1）")
+        big_row = [lv for lv in await dst.list_levels("group") if lv["name"] == "大群"][0]
+        check(int(big_row["switch_enabled"] or 0) == 0, "关着的等级导入后仍是只读（不会被带成真值）")
         check(
             await dst.effect_map("user", feature="model") == {"10001": {"": "p1"}},
             "好友专属模型（effect=提供商 id）导入后不被抹成 inherit",

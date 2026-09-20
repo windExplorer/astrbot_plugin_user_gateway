@@ -145,7 +145,12 @@ class Rules:
     level_switch: Mapping[Any, tuple[str, ...]] = field(default_factory=dict)
     """``{level_id: (提供商 id, ...)}`` —— 该等级允许用户**自助切换**的模型名单（v9）。
 
-    空元组 = 这个等级没开放自助切换（``/切换模型`` 会提示未开放）。"""
+    空元组 = 没配名单，``/切换模型`` 改为展示兜底三项（当前 / 系统默认 / 备用）；
+    能不能切由下面的 :attr:`level_switch_enabled` 说了算。"""
+    level_switch_enabled: Mapping[Any, bool] = field(default_factory=dict)
+    """``{level_id: 是否允许切换}``（v10，**默认假 = 只读**）。
+
+    只读时用户仍然能看（当前用的是哪个、有哪些候选），但回序号不生效、``/切换模型 N`` 被拒。"""
     command_policy: Mapping[str, Mapping[str, Mapping[str, Mapping[str, str]]]] = field(
         default_factory=dict
     )
@@ -558,6 +563,20 @@ class Gate:
             return tuple(rules.level_switch.get(int(level_id)) or ())
         except (TypeError, ValueError):
             return ()
+
+    @staticmethod
+    def switch_enabled(rules: Rules, level_id: Any) -> bool:
+        """该等级**是否允许**用户切换模型（v10，没归级 / 没配一律视为不允许）。
+
+        刻意是「显式打开才允许」：只读是安全的默认，配置没加载出来（比如库刚升级）
+        也只是退回只读，不会凭空放开自助切换。
+        """
+        if level_id is None:
+            return False
+        try:
+            return bool(rules.level_switch_enabled.get(int(level_id)))
+        except (TypeError, ValueError):
+            return False
 
     @staticmethod
     def resolve_model(subject: Subject, rules: Rules) -> Optional[dict[str, Any]]:

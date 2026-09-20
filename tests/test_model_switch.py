@@ -98,7 +98,13 @@ class FakeProvider:
 class FakePlugin:
     """把插件里被 model_switch 用到的部分抽出来（其余不实现，用到就会报错）。"""
 
-    def __init__(self, *, cfg: dict | None = None, providers: list[FakeProvider] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        cfg: dict | None = None,
+        providers: list[FakeProvider] | None = None,
+        default_provider: str = "",
+    ) -> None:
         self.cfg = {
             "model_switch_enabled": True,
             "model_switch_timeout_sec": 60,
@@ -107,6 +113,8 @@ class FakePlugin:
         self.cfg.update(cfg or {})
         self.store = FakeStore()
         self.providers = providers if providers is not None else []
+        # AstrBot 的「系统默认」提供商（兜底三项之一）；空 = 拿不到（离线 / 没配）
+        self.default_provider = str(default_provider or "")
         self.circuit = G.ProviderCircuit(threshold=2, cooldown_sec=300)
         self.gate = G.Gate(lambda k, d=None: self.cfg.get(k, d))
         self.context = types.SimpleNamespace(get_using_provider_async=self._no_default)
@@ -120,7 +128,12 @@ class FakePlugin:
         self._rules_obj = G.Rules()
 
     async def _no_default(self, umo: str):
-        return None
+        if not self.default_provider:
+            return None
+        for p in self.providers:
+            if p.provider_config.get("id") == self.default_provider:
+                return p
+        return FakeProvider(self.default_provider, "系统默认", "sys-default")
 
     def _cfg(self, key, default=None):
         return self.cfg.get(key, default)
@@ -175,6 +188,7 @@ def rules(**kw) -> G.Rules:
     return G.Rules(
         subject_level=kw.get("subject_level") or {},
         level_switch=kw.get("level_switch") or {},
+        level_switch_enabled=kw.get("level_switch_enabled") or {},
         level_model=kw.get("level_model") or {},
     )
 
@@ -193,6 +207,7 @@ async def main() -> int:
     plugin._rules_obj = rules(
         subject_level={"user": {"10001": 1}},
         level_switch={1: ("p-a", "p-b")},
+        level_switch_enabled={1: True},
         level_model={1: {"provider_id": "p-a", "fallback_provider_id": "p-c"}},
     )
     sw = MS.ModelSwitcher(plugin)
@@ -204,6 +219,7 @@ async def main() -> int:
     check(data["options"][0]["current"] and not data["options"][1]["current"], "只有当前那个被标记")
     check(data["scene"] == "private" and data["level_kind"] == "user", "私聊场景 + 好友等级")
     check(sw.group_label(data) == "VIP（好友等级）", "分组展示名带上等级名")
+    check(data["can_switch"] and not data["readonly_reason"], "等级开关打开 → 可切换")
 
     print("\n[2] 专属模型 / 用户已选的模型都会进名单")
     plugin._subject_model = {"10001": "p-c"}
@@ -239,20 +255,44 @@ async def main() -> int:
     row = [o for o in data["options"] if o["provider_id"] == "p-down"][0]
     check(row["unavailable"] and not row["current"], "他切过的那个仍然列出来，并标「暂不可用」")
 
-    print("\n[4] 没归级 / 没配名单 → 不开放")
+    print("\n[4] 没配名单 → 兜底三项（当前 / 系统默认 / 备用）")
+    plugin3 = FakePlugin(providers=provider_rows(), default_provider="p-c")
+    plugin3.store.levels = {1: {"id": 1, "kind": "user", "name": "VIP"}}
+    plugin3._rules_obj = rules(
+        subject_level={"user": {"10001": 1}},
+        level_switch={},
+        level_switch_enabled={1: True},
+        level_model={1: {"provider_id": "p-a", "fallback_provider_id": "p-b"}},
+    )
+    sw3 = MS.ModelSwitcher(plugin3)
+    data = await sw3.describe(subject())
+    check(
+        [o["provider_id"] for o in data["options"]] == ["p-a", "p-c", "p-b"],
+        f"兜底三项：当前生效 / 系统默认 / 备用（实得 {[o['provider_id'] for o in data['options']]}）",
+    )
+    check(data["options"][0]["current"], "第一项（当前生效）被标成「当前使用」")
+    check(data["can_switch"], "没配名单不影响「允许切换」——名单只决定能挑哪些")
+
+    # 没有任何等级模型配置时，当前就是系统默认，不应出现两条一样的
+    plugin3b = FakePlugin(providers=provider_rows(), default_provider="p-c")
+    plugin3b._rules_obj = rules(
+        subject_level={"user": {"10001": 1}}, level_switch_enabled={1: True}
+    )
+    data = await MS.ModelSwitcher(plugin3b).describe(subject())
+    check([o["provider_id"] for o in data["options"]] == ["p-c"],
+          "只有系统默认时 → 兜底去重后只剩一条（且是当前使用）")
+
+    print("\n[4.1] 没归级 / 没有任何候选 → 什么都不展示（指令会说清楚）")
     plugin2 = FakePlugin(providers=provider_rows())
     plugin2._rules_obj = rules(subject_level={}, level_switch={})
-    sw2 = MS.ModelSwitcher(plugin2)
-    data = await sw2.describe(subject())
-    check(data["open"] is False and data["options"] == [], "没归级 → 没有任何选项")
-    plugin3 = FakePlugin(providers=provider_rows())
-    plugin3._rules_obj = rules(subject_level={"user": {"10001": 1}}, level_switch={})
-    data = await MS.ModelSwitcher(plugin3).describe(subject())
-    check(data["open"] is False, "归级了但等级没配名单 → 同样不开放")
-    plugin3._subject_model = {"10001": "p-c"}
-    data = await MS.ModelSwitcher(plugin3).describe(subject())
-    check([o["provider_id"] for o in data["options"]] == ["p-c"],
-          "只配了专属模型 → 至少能列出它（用户看得到自己在用什么）")
+    data = await MS.ModelSwitcher(plugin2).describe(subject())
+    check(data["open"] is False and data["options"] == [], "没归级且没有系统默认 → 没有任何选项")
+    check(data["can_switch"] is False, "没归级 → 默认不可切换")
+    plugin3c = FakePlugin(providers=provider_rows(), default_provider="p-a")
+    plugin3c._rules_obj = rules(subject_level={}, level_switch={})
+    data = await MS.ModelSwitcher(plugin3c).describe(subject())
+    check([o["provider_id"] for o in data["options"]] == ["p-a"],
+          "没归级但有系统默认 → 至少能告诉他现在走的是哪个（只读）")
 
     print("\n[5] 群聊：按群等级取名单（与模型路由同口径）")
     plugin4 = FakePlugin(providers=provider_rows())
@@ -263,6 +303,7 @@ async def main() -> int:
     plugin4._rules_obj = rules(
         subject_level={"user": {"10001": 9}, "group": {"88888": 2}},
         level_switch={2: ("p-b",), 9: ("p-a",)},
+        level_switch_enabled={2: True, 9: True},
     )
     sw4 = MS.ModelSwitcher(plugin4)
     data = await sw4.describe(subject(group="88888"))
@@ -270,6 +311,85 @@ async def main() -> int:
     check([o["provider_id"] for o in data["options"]] == ["p-b"], "用群等级的名单，不用发言人的好友等级")
     data = await sw4.describe(subject())
     check([o["provider_id"] for o in data["options"]] == ["p-a"], "私聊仍用好友等级的名单")
+
+    print("\n[5.1] 只读：等级开关关着（默认）→ 能看不能切")
+    plugin5a = FakePlugin(providers=provider_rows(), default_provider="p-c")
+    plugin5a.store.levels = {1: {"id": 1, "kind": "user", "name": "VIP"}}
+    plugin5a._rules_obj = rules(
+        subject_level={"user": {"10001": 1}},
+        level_switch={1: ("p-a", "p-b")},  # 配了名单，但开关没开
+        level_model={1: {"provider_id": "p-a", "fallback_provider_id": "p-b"}},
+    )
+    sw5a = MS.ModelSwitcher(plugin5a)
+    data = await sw5a.describe(subject())
+    check(data["can_switch"] is False, "开关默认关 → 不可切换")
+    check(data["readonly_reason"] == MS.REASON_LEVEL_OFF, "原因文案是「所在分组未开放模型切换」")
+    check([o["provider_id"] for o in data["options"]] == ["p-a", "p-b"], "只读也要能看到候选列表")
+    check("只读" in sw5a.footer_of(data), "卡片底部写明只读原因")
+    check("只读" in sw5a.text_list(data, 60), "文本兜底同样写明只读")
+    plugin5a.sent.clear()
+    await sw5a.handle_command(plugin5a, FakeEvent("切换模型"), subject(), "")
+    check(bool(plugin5a.images), "只读时仍然发卡片（需求：没配名单也要展示当前/系统默认/备用）")
+    check(sw5a.peek(subject()) is None, "只读**不记序号会话**（此时发的数字不该被这条指令截走）")
+    check(await sw5a.handle_index(plugin5a, FakeEvent("1"), subject()) is False, "只读时回数字不拦不答")
+    plugin5a.sent.clear()
+    await sw5a.handle_command(plugin5a, FakeEvent("切换模型 2"), subject(), "2")
+    check(any("只读" in s for s in plugin5a.sent), "只读时 /切换模型 N 直接说明不能切")
+    check(not plugin5a.store.policies, "只读时不会写任何库")
+    # 开关打开后同样的配置就能切
+    plugin5a._rules_obj = rules(
+        subject_level={"user": {"10001": 1}},
+        level_switch={1: ("p-a", "p-b")},
+        level_switch_enabled={1: True},
+        level_model={1: {"provider_id": "p-a", "fallback_provider_id": "p-b"}},
+    )
+    data = await sw5a.describe(subject())
+    check(data["can_switch"] is True and not data["readonly_reason"], "开关打开 → 可切换")
+    check("回复序号" in sw5a.footer_of(data), "卡片底部改成操作说明")
+
+    print("\n[5.2] 群聊仅管理员可用")
+    plugin5b = FakePlugin(providers=provider_rows())
+    plugin5b.store.levels = {2: {"id": 2, "kind": "group", "name": "大群"}}
+    plugin5b._rules_obj = rules(
+        subject_level={"group": {"88888": 2}},
+        level_switch={2: ("p-a", "p-b")},
+        level_switch_enabled={2: True},
+    )
+    sw5b = MS.ModelSwitcher(plugin5b)
+    member = subject(group="88888")
+    data = await sw5b.describe(member)
+    check(data["group_restricted"] and data["can_switch"] is False, "群聊里普通成员不可切换")
+    check(data["readonly_reason"] == MS.REASON_GROUP_ONLY_ADMIN, "原因文案是「群里只有管理员能切换模型」")
+    plugin5b.sent.clear()
+    await sw5b.handle_command(plugin5b, FakeEvent("切换模型"), member, "")
+    check(plugin5b.sent == [MS.GROUP_REFUSE], "普通成员在群里发指令 → 一句话拒绝，不发卡片")
+    check(plugin5b.images == [], "拒绝时不发卡片（需求：群聊仅管理员能用）")
+    check(sw5b.peek(member) is None, "拒绝时不留下序号会话")
+    # 管理员：豁免「群聊仅管理员」与「等级开关」两条限制
+    admin = G.Subject(sender_id="10001", group_id="88888", umo="umo:88888", is_admin=True)
+    data = await sw5b.describe(admin)
+    check(data["can_switch"] and data["is_admin"], "管理员在群里可以切")
+    plugin5b.sent.clear()
+    await sw5b.handle_command(plugin5b, FakeEvent("切换模型"), admin, "")
+    check(bool(plugin5b.images) and plugin5b.sent == [], "管理员拿到的是可操作的卡片")
+    check(sw5b.peek(admin) is not None, "管理员的序号会话已建立")
+    res = await sw5b.apply(admin, 1)
+    check(res["ok"] and plugin5b.store.policies[-1]["scene"] == "group",
+          "管理员切换按群聊场景落库（只影响他自己在群里的请求）")
+    # 等级开关关着时，管理员照样能切（「管理员不受影响」）
+    plugin5b._rules_obj = rules(
+        subject_level={"group": {"88888": 2}}, level_switch={2: ("p-a", "p-b")}
+    )
+    check((await sw5b.describe(admin))["can_switch"] is True, "开关关着 → 管理员仍然可切")
+    check((await sw5b.describe(member))["can_switch"] is False, "开关关着 → 普通成员仍然只能看")
+    # 私聊里非管理员仍受开关约束（只读），管理员豁免
+    plugin5c = FakePlugin(providers=provider_rows())
+    plugin5c.store.levels = {1: {"id": 1, "kind": "user", "name": "VIP"}}
+    plugin5c._rules_obj = rules(subject_level={"user": {"10001": 1}}, level_switch={1: ("p-a",)})
+    sw5c = MS.ModelSwitcher(plugin5c)
+    check((await sw5c.describe(subject()))["can_switch"] is False, "私聊：非管理员只读")
+    admin_p = G.Subject(sender_id="10001", umo="umo:10001", is_admin=True)
+    check((await sw5c.describe(admin_p))["can_switch"] is True, "私聊：管理员不受开关限制")
 
     print("\n[6] 按序号切换")
     plugin5 = FakePlugin(providers=provider_rows())
@@ -334,9 +454,14 @@ async def main() -> int:
     check(plugin6.store.policies[-1]["effect"] == "p-b", "按序号切到 p-b")
     check(sw6.peek(subject()) is None, "用过即失效")
 
-    print("\n[10] 会话超时与开关")
+    print("\n[10] 会话超时与总开关")
     plugin7 = FakePlugin(providers=provider_rows(), cfg={"model_switch_timeout_sec": 10})
-    plugin7._rules_obj = rules(subject_level={"user": {"10001": 1}}, level_switch={1: ("p-a",)})
+    plugin7.store.levels = {1: {"id": 1, "kind": "user", "name": "VIP"}}
+    plugin7._rules_obj = rules(
+        subject_level={"user": {"10001": 1}},
+        level_switch={1: ("p-a",)},
+        level_switch_enabled={1: True},
+    )
     sw7 = MS.ModelSwitcher(plugin7)
     check(sw7.ttl() == 10, "TTL 取自配置")
     check(MS.ModelSwitcher(FakePlugin(cfg={"model_switch_timeout_sec": 99999})).ttl() == MS.MAX_TTL,
@@ -345,6 +470,7 @@ async def main() -> int:
           "TTL 有下限")
     await sw7.handle_command(plugin7, FakeEvent("切换模型"), subject(), "")
     item = sw7.peek(subject())
+    check(item is not None and item.get("can_switch") is True, "可切换时才建立序号会话")
     item["expire"] = 0  # 手工过期
     check(sw7.peek(subject()) is None, "过期会话自动清理")
     plugin8 = FakePlugin(providers=provider_rows(), cfg={"model_switch_enabled": False})
@@ -360,7 +486,11 @@ async def main() -> int:
           "配置了不存在的字体路径 → 回落到自带 / 系统字体")
     plugin9 = FakePlugin(providers=provider_rows())
     plugin9.store.levels = {1: {"id": 1, "kind": "user", "name": "VIP"}}
-    plugin9._rules_obj = rules(subject_level={"user": {"10001": 1}}, level_switch={1: ("p-a", "p-b")})
+    plugin9._rules_obj = rules(
+        subject_level={"user": {"10001": 1}},
+        level_switch={1: ("p-a", "p-b")},
+        level_switch_enabled={1: True},
+    )
     sw9 = MS.ModelSwitcher(plugin9)
     data = await sw9.describe(subject())
     png = await sw9.build_card(subject(), data)
@@ -430,6 +560,18 @@ async def main() -> int:
         res = await call(W.h_levels, args={"kind": "user"})
         row = res["data"]["items"][0]
         check(row["switch_providers"] == ["p-a", "p-b"], "GET /levels 回传名单（去重后）")
+        check(row["switch_enabled"] is False, "没传开关 → 默认关（只读）")
+        await call(W.h_set_level, {"id": lv_id, "kind": "user", "name": "VIP", "switch_enabled": True})
+        row = (await call(W.h_levels, args={"kind": "user"}))["data"]["items"][0]
+        check(row["switch_enabled"] is True, "开关可打开")
+        # 缺省 = 沿用原值（部分更新不能把开关/名单重置）
+        await call(W.h_set_level, {"id": lv_id, "kind": "user", "name": "VIP"})
+        row = (await call(W.h_levels, args={"kind": "user"}))["data"]["items"][0]
+        check(row["switch_enabled"] is True, "缺省 switch_enabled → 原值保留（true）")
+        check(row["switch_providers"] == ["p-a", "p-b"], "缺省 switch_providers 同样保留")
+        await call(W.h_set_level, {"id": lv_id, "kind": "user", "name": "VIP", "switch_enabled": False})
+        row = (await call(W.h_levels, args={"kind": "user"}))["data"]["items"][0]
+        check(row["switch_enabled"] is False, "可以关回去（只读）")
 
         # 不传该字段 → 沿用原值（旧前端 / 部分更新不能把名单清空）
         res = await call(
@@ -448,7 +590,7 @@ async def main() -> int:
         # 传空数组 = 明确关闭
         await call(W.h_set_level, {"id": lv_id, "kind": "user", "name": "VIP", "effect": "allow", "switch_providers": []})
         row = (await call(W.h_levels, args={"kind": "user"}))["data"]["items"][0]
-        check(row["switch_providers"] == [], "空数组 = 关闭该等级的自助切换")
+        check(row["switch_providers"] == [], "空数组 = 不配名单（改用兜底三项）")
 
         res = await call(W.h_set_subject_model_choice, {"scope_id": "10001", "provider_id": "p-b", "scene": "group"})
         check(res.get("status") == "ok", "POST /subject/model-choice 写入成功")
@@ -477,17 +619,24 @@ async def main() -> int:
     print("\n[13] 纯文本兜底")
     fake = {
         "current_id": "p-a",
+        "can_switch": True,
         "options": [
             {"index": 1, "label": "OpenAI · gpt-4o", "current": True, "own": False, "unavailable": False},
             {"index": 2, "label": "Claude · claude-3-7", "current": False, "own": True, "unavailable": True},
         ],
     }
-    text = MS.ModelSwitcher.text_list(fake, 60)
+    text = sw9.text_list(fake, 60)
     check("1. OpenAI · gpt-4o" in text and "2. Claude · claude-3-7" in text, "文本列表带序号与模型名")
     check("回复序号" in text and "60 秒" in text, "文本列表带操作提示与有效期")
     check("当前使用" in text and "专属模型" in text and "暂不可用" in text,
           "文本列表标出「当前使用 / 专属模型 / 暂不可用」")
     check(text.startswith("当前使用：p-a"), "文本列表开头先说明当前模型")
+    ro = dict(fake, can_switch=False, readonly_reason=MS.REASON_LEVEL_OFF)
+    ro_text = sw9.text_list(ro, 60)
+    check("可用模型：" in ro_text and "只读" in ro_text, "只读时文本兜底说明原因，不给操作提示")
+    check("回复序号" not in ro_text, "只读时不出现「回复序号」")
+    ro_data = dict(fake, can_switch=False, readonly_reason=MS.REASON_GROUP_ONLY_ADMIN)
+    check(MS.REASON_GROUP_ONLY_ADMIN in sw9.text_list(ro_data, 60), "群聊拒绝的原因文案可复用")
 
     print()
     if _failures:

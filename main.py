@@ -200,6 +200,8 @@ class UserGatewayPlugin(Star):
         self._level_route: dict[int, dict[str, str]] = {}
         # 等级允许用户自助切换的模型名单：{level_id: (provider_id, ...)}（v9）
         self._level_switch: dict[int, tuple[str, ...]] = {}
+        # 等级**是否允许**切换（v10，默认关 = 只读）：{level_id: bool}
+        self._level_switch_enabled: dict[int, bool] = {}
         # 限额规则：{scope_type(user|group|level|global): {scope_id: {period: row}}}
         self._limits: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
         # 用量计数：{scope_type(user|group|member): {scope_id: {period: row}}}
@@ -413,6 +415,10 @@ class UserGatewayPlugin(Star):
                 for got in [parse_provider_list(lv.get("switch_providers"))]
                 if got
             }
+            # 是否允许切换（v10）：只留打开的等级（默认关 = 只读，所以「有没有这个键」就是判据）
+            self._level_switch_enabled = {
+                int(lv["id"]): bool(int(lv.get("switch_enabled") or 0)) for lv in levels
+            }
             self._subject_level_user = await self.store.subject_level_map("user")
             self._subject_level_group = await self.store.subject_level_map("group")
             # 好友的「群聊专属」等级（v8：私聊等级与群聊等级分开配）
@@ -493,6 +499,7 @@ class UserGatewayPlugin(Star):
             },
             level_model=self._level_route,
             level_switch=self._level_switch,
+            level_switch_enabled=self._level_switch_enabled,
             command_policy=self._cmd_policy,
             command_master=self._cmd_master,
             level_command_effect=self._level_cmd_effect,

@@ -32,7 +32,7 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
     ) from e
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # policy 表的 feature 维度补充：
 #   model        → 好友专属模型（effect 存提供商 id；'' / 不存在 = 跟随等级配置）
@@ -116,6 +116,19 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_flag(value: Any) -> int:
+    """把布尔/字符串/数字规整成 SQLite 的 0/1。
+
+    入参可能是 JSON 里的 ``true``、``"1"``、``"on"``、``1``（导入路径什么都可能来），
+    统一收口在这里，避免把 ``"false"`` 这类真值字符串写进 INTEGER 列。
+    """
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 1 if int(value) else 0
+    return 1 if str(value or "").strip().lower() in ("1", "true", "yes", "on", "是", "开") else 0
 
 
 def parse_member_scope_id(scope_id: Any) -> tuple[str, str]:
@@ -250,9 +263,12 @@ CREATE INDEX IF NOT EXISTS idx_quota_scope ON llm_quota(scope_type, scope_id);
 -- provider_id / fallback_provider_id 存 AstrBot 的**提供商 id**（在 AstrBot「模型提供商」里配置的那个）。
 -- 模型选择以「提供商」为单位：AstrBot 里一个提供商就对应一个模型，
 -- 再单独存一个模型名只会让配置变含混（v0.4.0 的教训），故不设该列。
--- switch_providers（v9）→ 该等级**允许用户自助切换**的提供商 id 列表（JSON 文本，空串 = 不开放）。
+-- switch_providers（v9）→ 该等级**允许用户自助切换**的提供商 id 列表（JSON 文本，空 = 用兜底三项）。
 -- 用户发 /切换模型 时只能在这份名单（外加他自己的专属模型）里挑，
 -- 这样「让人自己选模型」不会变成「谁都能挑最贵的那个」。
+-- switch_enabled（v10）→ 该等级**是否允许切换**（0 = 只读，只能看不能切；**默认关**）。
+--   与名单分开两列是有意的：先「开不开」再「能挑哪些」；
+--   只读时名单仍然要展示（用户得知道自己现在用的是哪个），所以不能只靠名单空不空来表达。
 CREATE TABLE IF NOT EXISTS quota_level (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     kind                 TEXT    NOT NULL,
@@ -266,6 +282,7 @@ CREATE TABLE IF NOT EXISTS quota_level (
     provider_id          TEXT    NOT NULL DEFAULT '',
     fallback_provider_id TEXT    NOT NULL DEFAULT '',
     switch_providers     TEXT    NOT NULL DEFAULT '',
+    switch_enabled       INTEGER NOT NULL DEFAULT 0,
     updated_at           INTEGER NOT NULL,
     UNIQUE (kind, name)
 );
@@ -424,8 +441,25 @@ class Store:
             await cls._migrate_v7_to_v8(db)
         if old_version < 9:
             await cls._migrate_v8_to_v9(db)
+        if old_version < 10:
+            await cls._migrate_v9_to_v10(db)
         # v6 → v7 只新增了一张空表（group_member），上面的 SCHEMA_SQL 已经建好，
         # 没有数据要搬，所以不需要单独的迁移步骤 —— 这里留个说明避免以后误以为漏了。
+
+    @staticmethod
+    async def _migrate_v9_to_v10(db: aiosqlite.Connection) -> None:
+        """v9 → v10：等级新增「是否允许切换模型」开关（``switch_enabled``）。
+
+        **默认 0（关）**：v1.3.3 的语义是「名单非空 = 开放切换」，v1.3.4 起改成
+        「开关打开才允许切，名单为空时用兜底三项（当前 / 系统默认 / 备用）」。
+        旧数据升级后一律是「只读」——用户还能查看自己用的是什么模型，但切不了，
+        符合「默认不放开自助切换」的取舍（要放开就在控制台把开关打开）。
+        """
+        if "switch_enabled" in await Store._table_columns(db, "quota_level"):
+            return
+        await db.execute(
+            "ALTER TABLE quota_level ADD COLUMN switch_enabled INTEGER NOT NULL DEFAULT 0"
+        )
 
     @staticmethod
     async def _migrate_v8_to_v9(db: aiosqlite.Connection) -> None:
@@ -983,6 +1017,7 @@ class Store:
         effect_group: str = "inherit",
         command_effect_group: str = "inherit",
         switch_providers: Any = "",
+        switch_enabled: Any = False,
     ) -> int:
         """新建 / 更新等级，返回等级 id（``level_id`` 为空则按 ``(kind, name)`` 新建）。
 
@@ -992,16 +1027,18 @@ class Store:
         - ``provider_id`` / ``fallback_provider_id`` 是模型路由：属于该等级的对象
           走指定提供商，主提供商不可用（未加载 / 熔断）时用备用那个；
         - ``switch_providers``：该等级**允许用户自助切换**的提供商 id 列表
-          （v9，收 list 或 JSON 文本；空 = 不开放 ``/切换模型``）。
+          （v9，收 list 或 JSON 文本；空 = 用兜底三项：当前 / 系统默认 / 备用）；
+        - ``switch_enabled``：该等级**是否允许切换**（v10，默认假 = 只读）。
         """
         db = self._conn()
         switch_json = dump_provider_list(switch_providers)
+        switch_flag = _as_flag(switch_enabled)
         if level_id:
             await db.execute(
                 "UPDATE quota_level SET kind = ?, name = ?, description = ?, effect = ?, "
                 "command_effect = ?, effect_group = ?, command_effect_group = ?, "
                 "sort_order = ?, provider_id = ?, fallback_provider_id = ?, "
-                "switch_providers = ?, updated_at = ? WHERE id = ?",
+                "switch_providers = ?, switch_enabled = ?, updated_at = ? WHERE id = ?",
                 (
                     kind,
                     name,
@@ -1014,6 +1051,7 @@ class Store:
                     str(provider_id or ""),
                     str(fallback_provider_id or ""),
                     switch_json,
+                    switch_flag,
                     now_ts(),
                     int(level_id),
                 ),
@@ -1023,8 +1061,8 @@ class Store:
         await db.execute(
             "INSERT INTO quota_level(kind, name, description, effect, command_effect, "
             "effect_group, command_effect_group, sort_order, "
-            "provider_id, fallback_provider_id, switch_providers, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "provider_id, fallback_provider_id, switch_providers, switch_enabled, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, name) DO UPDATE SET "
             "description = excluded.description, effect = excluded.effect, "
             "command_effect = excluded.command_effect, "
@@ -1033,6 +1071,7 @@ class Store:
             "sort_order = excluded.sort_order, provider_id = excluded.provider_id, "
             "fallback_provider_id = excluded.fallback_provider_id, "
             "switch_providers = excluded.switch_providers, "
+            "switch_enabled = excluded.switch_enabled, "
             "updated_at = excluded.updated_at",
             (
                 kind,
@@ -1046,6 +1085,7 @@ class Store:
                 str(provider_id or ""),
                 str(fallback_provider_id or ""),
                 switch_json,
+                switch_flag,
                 now_ts(),
             ),
         )
@@ -1889,6 +1929,8 @@ class Store:
                     fallback_provider_id=str(lv.get("fallback_provider_id") or ""),
                     # v9：可切换模型列表（备份里是 list 或 JSON 文本，两种都收）
                     switch_providers=lv.get("switch_providers"),
+                    # v10：允许切换的开关（备份里可能是 true / "1" / 0，统一收口）
+                    switch_enabled=lv.get("switch_enabled"),
                 )
                 old_id = lv.get("id")
                 if old_id is not None:

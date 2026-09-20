@@ -17,6 +17,7 @@ import {
   NRadioGroup,
   NSelect,
   NSpace,
+  NSwitch,
   NTag,
   NTooltip,
   useMessage,
@@ -182,6 +183,7 @@ const levelForm = ref<
   sort_order: 0,
   provider_id: "",
   fallback_provider_id: "",
+  switch_enabled: false,
   switch_providers: [],
   quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
 });
@@ -200,6 +202,7 @@ const levelForm = ref<
   sort_order: row.sort_order || 0,
   provider_id: row.provider_id || "",
   fallback_provider_id: row.fallback_provider_id || "",
+  switch_enabled: !!row.switch_enabled,
   switch_providers: [...(row.switch_providers || [])],
       quotas: {
         day: row.quotas?.day ? { limit: row.quotas.day.limit_tokens, mode: row.quotas.day.mode as "enforce" | "observe" } : { limit: null, mode: "enforce" },
@@ -218,6 +221,7 @@ const levelForm = ref<
       sort_order: (levels.value.length + 1) * 10,
       provider_id: "",
       fallback_provider_id: "",
+      switch_enabled: false,
       switch_providers: [],
       quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
     };
@@ -250,6 +254,7 @@ async function saveLevel() {
       sort_order: f.sort_order,
       provider_id: f.provider_id || "",
       fallback_provider_id: f.fallback_provider_id || "",
+      switch_enabled: !!f.switch_enabled,
       switch_providers: f.switch_providers || [],
       quotas,
     });
@@ -395,31 +400,43 @@ const levelColumns: DataTableColumns<LevelRow> = [
     },
   },
   {
-    // 可切换模型（v9）：该等级的用户发 /切换模型 时能挑的范围
-    title: "可切换",
+    // 自助切换（v9/v10）：开关 + 该等级的用户发 /切换模型 时能挑的范围
+    title: "自助切换",
     key: "switch_providers",
-    minWidth: 150,
+    minWidth: 180,
     render: (row) => {
       const list = row.switch_providers || [];
-      if (!list.length) {
-        return h(NTag, { size: "small", bordered: false }, { default: () => "未开放" });
+      if (!row.switch_enabled) {
+        return h(
+          NTooltip,
+          { trigger: "hover" },
+          {
+            trigger: () =>
+              h(NTag, { size: "small", bordered: false }, { default: () => "只读（默认）" }),
+            default: () =>
+              "该等级的用户发 /切换模型 只能查看「当前使用 / 系统默认 / 备用」，不能切换",
+          },
+        );
       }
+      const names = list.length
+        ? list.map((id) => providerLabel(id))
+        : ["当前使用的模型", "系统默认模型", "备用模型"];
       return h(
         NTooltip,
         { trigger: "hover" },
         {
           trigger: () =>
             h("div", { style: "line-height:1.35;cursor:default" }, [
-              h("div", { style: "font-size:12.5px" }, `${list.length} 个模型可选`),
               h(
-                "div",
-                { style: "font-size:12px;opacity:.65" },
-                list.map((id) => providerLabel(id)).join("、"),
+                NTag,
+                { size: "small", bordered: false, type: "success" },
+                { default: () => (list.length ? `允许 · ${list.length} 个` : "允许 · 兜底三项") },
               ),
+              h("div", { style: "font-size:12px;opacity:.65" }, names.join("、")),
             ]),
           default: () =>
-            `用户发 /切换模型 时可选：\n` +
-            list.map((id, i) => `${i + 1}. ${providerLabel(id)}`).join("\n"),
+            (list.length ? "用户发 /切换模型 时可选：\n" : "未配名单，用户可在兜底三项里选：\n") +
+            names.map((n, i) => `${i + 1}. ${n}`).join("\n"),
         },
       );
     },
@@ -613,9 +630,12 @@ onMounted(load);
           （一个群只用一个模型，避免同群上下文串味）；主提供商不可用或连续失败熔断时自动走备用。
         </span>
         <span>
-          · <b>可切换模型</b>（等级里的「可切换模型」名单）：属于该等级的用户发 <b>/切换模型</b>
-          就能在名单里自助换模型——卡片会列出可选模型并标出<b>当前使用的那个</b>，回序号即切换、回
-          <b>0</b> 恢复默认。优先级：<b>用户自己的选择 &gt; 专属模型 &gt; 等级主/备用模型</b>。
+          · <b>自助切换模型</b>：等级里的「允许切换模型」开关（<b>默认关</b>）打开后，属于该等级的用户发
+          <b>/切换模型</b> 就能自助换模型——卡片列出候选并标出<b>当前使用的那个</b>，回序号即切换、回
+          <b>0</b> 恢复默认；开关关着则是<b>只读</b>（卡片照发，但切不了）。
+          候选 = 等级配的「可切换模型」名单，没配就是<b>兜底三项</b>（当前使用 / 系统默认 / 备用）。
+          <b>群聊里只有管理员能切</b>（群共用一个会话，谁都能切会把整个群搅乱），
+          <b>管理员不受开关与群聊限制</b>。优先级：<b>用户自己的选择 &gt; 专属模型 &gt; 等级主/备用模型</b>。
         </span>
       </n-space>
     </n-card>
@@ -801,6 +821,26 @@ onMounted(load);
             </span>
           </n-space>
         </n-form-item>
+        <n-form-item label="允许切换模型">
+          <n-space vertical :size="4" style="width: 100%">
+            <n-space align="center" :size="10">
+              <n-switch v-model:value="levelForm.switch_enabled" size="small" />
+              <n-tag
+                size="small"
+                :bordered="false"
+                :type="levelForm.switch_enabled ? 'success' : 'default'"
+              >
+                {{ levelForm.switch_enabled ? "用户可自助切换" : "只读（默认）：能看不能切" }}
+              </n-tag>
+            </n-space>
+            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
+              关掉时该等级的用户发 <b>/切换模型</b> 仍然能看到卡片（当前使用的模型 + 候选），
+              但<b>回序号不生效</b>：只读，避免「让人自己挑」变成「谁都能挑最贵的那个」。<br />
+              <b>管理员不受限制</b>（开关关着也能切，用于排查）；<b>群里只有管理员能切</b>，
+              普通成员在群里发这个指令会被直接拒绝（让他私聊用）。
+            </span>
+          </n-space>
+        </n-form-item>
         <n-form-item label="可切换模型">
           <n-space vertical :size="4" style="width: 100%">
             <n-select
@@ -809,16 +849,16 @@ onMounted(load);
               filterable
               size="small"
               style="width: 360px; max-width: 100%"
-              placeholder="留空 = 该等级的用户不能自己切模型"
+              :disabled="!levelForm.switch_enabled"
+              placeholder="留空 = 用兜底三项（当前 / 系统默认 / 备用）"
               :options="providerOptions"
             />
             <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
-              属于该等级的用户发 <b>/切换模型</b> 时，只能从这份名单里挑（外加他自己的专属模型），
-              所以「放开自助切换」不会变成「谁都能挑最贵的那个」。<br />
+              只有上面打开了开关才有意义。填了就<b>只能从这份名单里挑</b>（外加他自己的专属模型）；
+              <b>留空</b> = 展示并允许在这三项里选：<b>当前使用的模型 / 系统默认模型 / 等级备用模型</b>。<br />
               用户的选择存在他自己身上（私聊 / 群聊各一份），不覆盖这里的<b>主模型</b>配置：
-              这里的配置是「默认走哪个」，名单是「允许他自己换成哪些」；
+              这里配的是「默认走哪个」，名单是「允许他自己换成哪些」；
               用户随时可以发「/切换模型 0」回到这里配的主模型。
-              <b>留空 = 不开放</b>（用户会收到「该分组未开放模型切换」）。
             </span>
           </n-space>
         </n-form-item>

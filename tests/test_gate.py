@@ -85,6 +85,7 @@ def R(**kw) -> G.Rules:
         usage=kw.get("usage") or {},
         level_model=kw.get("level_model") or {},
         level_switch=kw.get("level_switch") or {},
+        level_switch_enabled=kw.get("level_switch_enabled") or {},
         command_policy=_by_cmd(kw.get("command_policy")),
         command_master=_by_scope(kw.get("command_master")),
         level_command_effect=kw.get("level_command_effect") or {},
@@ -717,8 +718,25 @@ def main() -> int:
         level_model={1: {"provider_id": "p-a", "fallback_provider_id": ""}},
         subject_level={"user": {"10001": 1}},
     )
-    check(G.Gate.switch_options(route_only, 1) == (), "只配了等级模型 → 仍未开放自助切换")
     check(bool(G.Gate.resolve_model(G.Subject(sender_id="10001"), route_only)), "等级模型路由照常解析")
+
+    print("\n[19] 「允许切换模型」开关（v10，默认关 = 只读）")
+    check(G.Gate.switch_enabled(R(), 1) is False, "没配过的等级 → 不允许（默认关）")
+    check(G.Gate.switch_enabled(R(level_switch_enabled={1: False}), 1) is False, "显式关 → 不允许")
+    check(G.Gate.switch_enabled(R(level_switch_enabled={1: True}), 1) is True, "显式开 → 允许")
+    check(G.Gate.switch_enabled(R(level_switch_enabled={1: True}), 2) is False, "开关是按等级各管各的")
+    check(G.Gate.switch_enabled(R(level_switch_enabled={1: True}), None) is False, "没归级 → 不允许")
+    check(G.Gate.switch_enabled(R(level_switch_enabled={1: True}), "什么鬼") is False, "脏 level_id → 不允许（不抛异常）")
+    # 开关与名单是两个独立的东西：开了才允许切，名单只决定「能挑哪些」
+    both = R(level_switch={1: ("p-a",)}, level_switch_enabled={1: True})
+    check(
+        G.Gate.switch_enabled(both, 1) and G.Gate.switch_options(both, 1) == ("p-a",),
+        "开关与名单互相独立（开着但没配名单 = 用兜底三项）",
+    )
+    check(
+        G.Gate.switch_enabled(R(level_switch={1: ("p-a",)}), 1) is False,
+        "只配了名单、没开开关 → 仍然只读（v1.3.3 的旧语义不再生效）",
+    )
 
     print()
     if _failures:
