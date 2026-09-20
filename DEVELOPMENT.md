@@ -118,6 +118,7 @@ astrbot_plugin_user_gateway/
 | 1.0.0 | 发布评审：两处 Critical 修复、导入原子化、批量写两遍校验 | v1.0.0 |
 | M12 | 用户自助切换模型（`/切换模型` + Pillow 卡片 + 等级可切换名单） | v1.3.3 |
 | M12+ | 等级「允许切换」开关（默认关 = 只读）、群聊仅管理员、没配名单用兜底三项 | v1.3.4 |
+| M12++ | 卡片改版：配色主题（indigo/mint/sunset）、当前模型折行显示、今日用量 | v1.3.5 |
 
 后续维护版本（v1.0.1 起）见 CHANGELOG。
 
@@ -146,3 +147,10 @@ astrbot_plugin_user_gateway/
 - **卡片渲染是「尽力而为」**：`model_card.render_model_card()` 任何失败都返回 `None`，
   调用方退化成纯文本列表；字体按「配置 → 插件自带 `assets/fonts` → 系统字体」找，
   全都没有才退化。绝不允许「一张图渲染失败」把用户的指令吃掉。
+- **卡片版面与配色**（v1.3.5 改版，别再往头部塞长文本）：
+  头部只放「标题 + 分组」；**长内容（模型名）走信息条**（`info=[{label, value}]`，
+  value 会折行，最多两行）；折行优先在 `· - / _ , :` 处断开；
+  配色集中在 `model_card.THEMES`（三套：indigo / mint / sunset，配置 `model_card_theme`），
+  改色只动那一处，别把颜色写回渲染函数里。
+- **今日用量**：`ModelSwitcher.today_of()` 复用 `store.subject_stats`（私聊按人、群聊按群），
+  取不到就返回空字典 —— 统计读不到只是卡片少一行，绝不能影响切换。

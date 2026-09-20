@@ -54,14 +54,23 @@ def check(cond: bool, label: str) -> None:
 class FakeStore:
     """只实现本测试用到的存储接口，并把写操作记下来供断言。"""
 
-    def __init__(self, levels: dict[int, dict] | None = None) -> None:
+    def __init__(
+        self, levels: dict[int, dict] | None = None, stats: dict | None = None
+    ) -> None:
         self.ready = True
         self.levels = levels or {}
         self.policies: list[dict] = []
         self.audits: list[tuple] = []
+        # 今日用量统计：None = 读不到（today_of 必须安静地退化成空）
+        self.stats = stats
 
     async def get_level(self, level_id: int) -> dict | None:
         return self.levels.get(int(level_id))
+
+    async def subject_stats(self, subject_type: str, subject_id: str, from_ts: int, to_ts: int):
+        if self.stats is None:
+            raise RuntimeError("统计不可用（模拟旧库 / 查询失败）")
+        return {"totals": dict(self.stats)}
 
     async def set_policy(self, scope_type, scope_id, effect, feature="llm", note="", scene=""):
         self.policies.append(
@@ -84,6 +93,15 @@ class FakeEvent:
 
     def get_message_str(self) -> str:
         return self._text
+
+
+class ImageFontStub:
+    """给 ``model_card._wrap`` 用的最小字体桩：每个字符固定 10px（不依赖 Pillow）。"""
+
+    size = 20
+
+    def getlength(self, text: str) -> float:
+        return 10.0 * len(str(text or ""))
 
 
 class FakeProvider:
@@ -637,6 +655,94 @@ async def main() -> int:
     check("回复序号" not in ro_text, "只读时不出现「回复序号」")
     ro_data = dict(fake, can_switch=False, readonly_reason=MS.REASON_GROUP_ONLY_ADMIN)
     check(MS.REASON_GROUP_ONLY_ADMIN in sw9.text_list(ro_data, 60), "群聊拒绝的原因文案可复用")
+
+    print("\n[14] 今日用量（信息条）")
+    sw9._plugin.store.stats = None
+    check(await sw9.today_of(subject()) == {}, "统计读不到 → 空字典（不抛异常、不影响切换）")
+    sw9._plugin.store.stats = {"tok_total": 12345, "calls": 8}
+    today = await sw9.today_of(subject())
+    check(today == {"tokens": 12345, "calls": 8}, f"今日用量（实得 {today}）")
+    sw9._plugin.store.stats = {"tok_total": 0, "calls": 0}
+    check(await sw9.today_of(subject()) == {}, "今天完全没用过 → 不显示这一行（不写「0 tokens」）")
+    sw9._plugin.store.stats = {"tok_total": "2_500_000.0", "calls": None}
+    check(await sw9.today_of(subject()) == {}, "脏值不会炸（宽松转 int 失败即视为 0）")
+    check(MS._fmt_num(999) == "999" and MS._fmt_num(1200) == "1.2K" and MS._fmt_num(2_500_000) == "2.50M",
+          "数字按控制台口径缩写")
+
+    sw9._plugin.store.stats = {"tok_total": 12345, "calls": 8}
+    data = await sw9.describe(subject())
+    check(data["today"] == {"tokens": 12345, "calls": 8}, "describe 带上今日用量")
+    text = sw9.text_list(data, 60)
+    check("今日用量：12.3K tokens · 8 次对话" in text, f"文本兜底带今日用量（实得 {text.splitlines()[1]!r}）")
+    # 群聊里统计的是「这个群」的量（与总览 / 列表页同口径）
+    grp_calls: list[tuple] = []
+
+    async def _spy(subject_type, subject_id, from_ts, to_ts):
+        grp_calls.append((subject_type, subject_id))
+        return {"totals": {"tok_total": 100, "calls": 1}}
+
+    sw9._plugin.store.subject_stats = _spy  # type: ignore[assignment]
+    await sw9.today_of(subject(group="88888"))
+    check(grp_calls and grp_calls[-1] == ("group", "88888"), "群聊按群聚合（不是按发言人）")
+    await sw9.today_of(subject())
+    check(grp_calls[-1] == ("user", "10001"), "私聊按人聚合")
+    sw9._plugin.store.stats = None
+
+    print("\n[15] 配色主题与版面（长模型名折行，不截断）")
+    rows_one = [{"index": 1, "label": "OpenAI · gpt-4o", "current": True}]
+    check(model_card.theme_colors("mint") is model_card.THEMES["mint"], "主题按名字取到")
+    check(model_card.theme_colors("不存在的主题") is model_card.THEMES[model_card.DEFAULT_THEME],
+          "主题名写错 → 回落默认（配置坏了也要能出图）")
+    check(set(model_card.THEMES) == {"indigo", "mint", "sunset"}, "内置三套主题")
+    check(model_card.theme_colors() is model_card.THEMES[model_card.DEFAULT_THEME], "空主题名 → 默认")
+    theme_pngs: dict[str, bytes] = {}
+    for name in model_card.THEMES:
+        png_t = model_card.render_model_card(
+            title="模型切换", subtitle="分组：VIP", rows=rows_one,
+            info=[{"label": "当前使用", "value": "OpenAI · gpt-4o"}], theme=name,
+        )
+        check(bool(png_t) and png_t[:8] == b"\x89PNG\r\n\x1a\n", f"主题 {name} 能出图")
+        if png_t:
+            theme_pngs[name] = png_t
+    if len(theme_pngs) >= 2:
+        check(len(set(theme_pngs.values())) == len(theme_pngs), "不同主题画出来确实不一样")
+    # 卡片真用上了配置里的主题（build_card → render_model_card 的透传）
+    plugin9.cfg["model_card_theme"] = "mint"
+    mint_png = await sw9.build_card(subject(), await sw9.describe(subject()))
+    plugin9.cfg["model_card_theme"] = "sunset"
+    sunset_png = await sw9.build_card(subject(), await sw9.describe(subject()))
+    check(bool(mint_png) and bool(sunset_png) and mint_png != sunset_png,
+          "改 model_card_theme 配置 → 卡片配色跟着变")
+
+    short = model_card.render_model_card(
+        title="模型切换", subtitle="分组：VIP", rows=rows_one,
+        info=[{"label": "当前使用", "value": "OpenAI · gpt-4o"}],
+        footer="回复序号切换",
+    )
+    long_name = "某供应商名字特别长特别长特别长 · 模型名也一样长特别长特别长特别长特别长"
+    long = model_card.render_model_card(
+        title="模型切换", subtitle="分组：VIP", rows=rows_one,
+        info=[{"label": "当前使用", "value": long_name + long_name}],
+        footer="回复序号切换",
+    )
+    if short and long:
+        from PIL import Image  # noqa: PLC0415
+
+        h_short = Image.open(__import__("io").BytesIO(short)).height
+        h_long = Image.open(__import__("io").BytesIO(long)).height
+        check(h_long > h_short, f"长名字换到第二行（高度 {h_short} → {h_long}）")
+        check(Image.open(__import__("io").BytesIO(long)).height < 900, "折行有上限，不会把卡片撑爆")
+    else:
+        print("  （当前环境没有 Pillow / 字体，跳过版面断言）")
+    check(
+        model_card._wrap("一二三四五六七八九十", ImageFontStub(), 100000, max_lines=1)
+        == ["一二三四五六七八九十"],
+        "折行工具：宽度够时不折",
+    )
+    wrapped = model_card._wrap("一二三四五六七八九十", ImageFontStub(), 40, max_lines=2)
+    check(len(wrapped) == 2 and wrapped[-1].endswith("…"),
+          f"折行工具：超出上限时末行收省略号（实得 {wrapped}）")
+    check(model_card._wrap("", ImageFontStub(), 40, max_lines=2) == [], "折行工具：空文本 → 空列表")
 
     print()
     if _failures:

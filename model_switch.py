@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -76,6 +77,16 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _fmt_num(n: Any) -> str:
+    """token 数字的紧凑写法（与控制台列表的 1.2K / 3.45M 口径一致）。"""
+    v = _as_int(n, 0)
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.1f}K"
+    return str(v)
 
 
 def _logo_bytes() -> Optional[bytes]:
@@ -280,7 +291,38 @@ class ModelSwitcher:
             "is_admin": is_admin,
             "group_restricted": group_restricted,
             "system_default": system_default,
+            # 今日用量（信息条展示；取不到就是空字典，卡片少一行而已）
+            "today": await self.today_of(subject),
         }
+
+    async def today_of(self, subject: Subject) -> dict[str, int]:
+        """今日用量：私聊 = **这个人**、群聊 = **这个群**（与总览 / 列表页同口径）。
+
+        用户看卡片时最常问的两件事是「我现在用的是哪个模型」和「今天用掉多少」，
+        所以顺手放进信息条。任何异常都返回空字典 —— 统计读不到不该影响切换。
+        """
+        try:
+            store = self._plugin.store
+            if not (store and store.ready):
+                return {}
+            kind = "group" if str(subject.group_id or "") else "user"
+            sid = str(subject.group_id or subject.sender_id or "")
+            if not sid:
+                return {}
+            now = datetime.now()
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            stats = await store.subject_stats(
+                kind, sid, int(start.timestamp()), int(now.timestamp())
+            )
+            totals = (stats or {}).get("totals") or {}
+            tokens = _as_int(totals.get("tok_total"), 0)
+            calls = _as_int(totals.get("calls"), 0)
+            if tokens <= 0 and calls <= 0:
+                return {}
+            return {"tokens": tokens, "calls": calls}
+        except Exception as e:  # 统计失败绝不冒泡（卡片少一行，功能照常）
+            logger.debug(f"[UserGateway] 读取今日用量失败（忽略）: {e}")
+            return {}
 
     def group_label(self, data: dict[str, Any]) -> str:
         """分组的中文说法（卡片副标题用）。"""
@@ -364,20 +406,31 @@ class ModelSwitcher:
                 plugin.provider_info(str(data["current_id"])).get("label")
                 or data["current_id"]
             )
+        # 头部只放「分组」这种短信息；模型名（供应商 · 模型）单独占一行并允许折行，
+        # 否则长名字必然被截断 —— 而那一行恰恰是用户最需要看全的。
         subtitle = f"分组：{self.group_label(data)}"
+        info: list[dict[str, str]] = []
         if current_label:
-            subtitle += f"｜当前：{current_label}"
-        if data.get("is_admin") and not data.get("can_switch"):
-            # 极少见：管理员豁免也救不了的组合（理论上不存在），留一行免得以后改成「管理员也受限」时静默
-            subtitle += "｜管理员已豁免限制"
+            info.append({"label": "当前使用", "value": current_label})
+        today = data.get("today") or {}
+        if today:
+            info.append(
+                {
+                    "label": "今日用量",
+                    "value": f"{_fmt_num(today.get('tokens'))} tokens · "
+                    f"{_as_int(today.get('calls'), 0)} 次对话",
+                }
+            )
 
         return model_card.render_model_card(
             title="模型切换",
             subtitle=subtitle,
             rows=data.get("options") or [],
             footer=self.footer_of(data),
+            info=info,
             avatar=avatar,
             font_path=str(plugin._cfg("model_card_font", "") or ""),
+            theme=str(plugin._cfg("model_card_theme", model_card.DEFAULT_THEME) or ""),
         )
 
     def footer_of(self, data: dict[str, Any]) -> str:
@@ -392,6 +445,12 @@ class ModelSwitcher:
         lines: list[str] = []
         if data.get("current_id"):
             lines.append(f"当前使用：{data['current_id']}")
+        today = data.get("today") or {}
+        if today:
+            lines.append(
+                f"今日用量：{_fmt_num(today.get('tokens'))} tokens · "
+                f"{_as_int(today.get('calls'), 0)} 次对话"
+            )
         lines.append("可用模型：" if not data.get("can_switch") else "可切换的模型：")
         for row in data.get("options") or []:
             tail = "（当前使用）" if row.get("current") else ("（专属模型）" if row.get("own") else "")

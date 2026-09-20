@@ -195,6 +195,13 @@
     "type": "string",
     "default": ""
   },
+  "model_card_theme": {
+    "description": "卡片配色主题",
+    "hint": "indigo = 靛蓝（默认，冷静） / mint = 青绿 / sunset = 暖橙。改完让用户重新发一次 /切换模型 就能看到。",
+    "type": "string",
+    "default": "indigo",
+    "options": ["indigo", "mint", "sunset"]
+  },
   "retention_days": {
     "description": "统计数据保留天数",
     "hint": "超过该天数的用量明细会自动清理。默认 180 天；设 0 表示永久保留（数据量大时注意磁盘占用）。",
