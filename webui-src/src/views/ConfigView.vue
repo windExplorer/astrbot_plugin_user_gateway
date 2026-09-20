@@ -189,14 +189,29 @@ function labelOf(key: string): string {
 async function load() {
   loading.value = true;
   try {
-    const res = await apiGet<ConfigPayload>("/config");
-    items.value = res.items || {};
-    schema.value = res.schema || {};
-    ping.value = await apiGet<PingInfo>("/ping").catch(() => null);
+    await runLoad();
   } catch (e: any) {
     message.error(e?.message || String(e));
   } finally {
     loading.value = false;
+  }
+}
+
+// 真拉取 + 首拉失败自动重试：第一次进页面时桥接可能还没握手完成，首拉偶发失败；
+// 自己退几次，用户就不用去手动点「获取 / 刷新连接」了。
+async function runLoad(attempt = 1) {
+  try {
+    const res = await apiGet<ConfigPayload>("/config", 6000);
+    items.value = res.items || {};
+    schema.value = res.schema || {};
+    ping.value = await apiGet<PingInfo>("/ping", 6000).catch(() => null);
+    return;
+  } catch (e: any) {
+    if (attempt < 3) {
+      await new Promise((r) => setTimeout(r, 400 * attempt));
+      return runLoad(attempt + 1);
+    }
+    throw e;
   }
 }
 

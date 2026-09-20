@@ -48,11 +48,26 @@ function fmtAxis(v: number): string {
 async function load() {
   loading.value = true;
   try {
-    data.value = await apiGet<SummaryData>(`/overview?range=${range.value}`);
+    await runLoad();
   } catch (e: any) {
     message.error(e?.message || String(e));
   } finally {
     loading.value = false;
+  }
+}
+
+// 首拉失败自动重试：第一次进总览页时桥接可能还没握手完成，自己退几次，
+// 不用用户去手动点刷新。
+async function runLoad(attempt = 1) {
+  try {
+    data.value = await apiGet<SummaryData>(`/overview?range=${range.value}`, 6000);
+    return;
+  } catch (e: any) {
+    if (attempt < 3) {
+      await new Promise((r) => setTimeout(r, 400 * attempt));
+      return runLoad(attempt + 1);
+    }
+    throw e;
   }
 }
 

@@ -5,7 +5,7 @@
 //
 // bridge 的发现/等待逻辑统一放在 ./bridge（那里同时处理 sandbox iframe 的存储限制）。
 
-import { getPageBridge } from "./bridge";
+import { whenBridgeReady } from "./bridge";
 
 const PAGE_PLUGIN_NAME = "astrbot_plugin_user_gateway";
 
@@ -57,7 +57,7 @@ function isRouteMissingError(e: any): boolean {
 }
 
 async function request(path: string, method: "GET" | "POST", body?: unknown, timeoutMs?: number): Promise<any> {
-  const br = await getPageBridge();
+  const br = await whenBridgeReady();
   const url = new URL(path, "https://astrbot-plugin-page.local/");
   const candidates = endpointCandidates(url.pathname);
   const errors: string[] = [];

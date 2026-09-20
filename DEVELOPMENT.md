@@ -174,6 +174,12 @@ astrbot_plugin_user_gateway/
 - **卡片头像**（`avatar_for`）：群里用**群头像**、私聊用对方头像；本地没有就 `ensure` 现抓一次
   （3 秒超时 + 失败后 10 分钟负缓存，指令回执不能被头像拖住），都没有才退回插件 logo。
   别再改回「永远取发言人头像」——群里那张卡片讲的是这个会话的模型，不是他的设置。
+- **WebUI 首屏空白**：第一发 `apiGet` 被 sandbox iframe 的桥接握手竞态吃掉，表现就是
+  「进页面没数据、点一下获取才有」。根因是 `onMounted(load)` 早于父页面回 `context`。
+  修法：① `bridge.whenBridgeReady()` 等到 `getContext()` 有值（握手完成）才放行，
+  结果模块级 Promise 缓存（整个会话只握一次）；② 各页 `load()` 首拉失败自动重试。
+  `request()` 改用 `whenBridgeReady()` 即可让所有页面受益，别在每个视图里手搓等待。
+
 - **临时消息自动撤回**（`recall.py`）：只有 QQ（aiocqhttp）能真撤，其它平台**只发不撤**。
   **撤回时间 = 序号有效期**（`ModelSwitcher.recall_sec()` 直接取 `ttl()`）：
   用户能回序号的时间一到卡片就该消失，两个值分开配迟早会不一致
