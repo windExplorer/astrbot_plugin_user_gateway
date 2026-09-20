@@ -196,11 +196,17 @@
     "default": ""
   },
   "model_card_theme": {
-    "description": "卡片强调色主题",
-    "hint": "卡片是浅色底 + 单一强调色，这里只换强调色：indigo = 靛蓝（默认）/ teal = 青绿 / amber = 琥珀 / rose = 玫红。改完让用户重新发一次 /切换模型 就能看到。",
+    "description": "卡片配色主题",
+    "hint": "换的是整张卡的头 / 脚配色（头部是主题色渐变，不是一层几乎看不见的淡色）：indigo = 靛蓝（默认）/ teal = 青绿 / amber = 琥珀 / rose = 玫红。改完让用户重新发一次 /切换模型 就能看到。",
     "type": "string",
     "default": "indigo",
     "options": ["indigo", "teal", "amber", "rose"]
+  },
+  "model_card_recall_sec": {
+    "description": "卡片自动撤回（秒）",
+    "hint": "卡片发出后多少秒自动撤回（默认 60，5 - 3600；填 0 = 不撤回）。撤回只在 QQ（aiocqhttp）平台有效，其它平台会自动退化成「只发不撤」，不会因为撤回失败而发不出卡片。",
+    "type": "int",
+    "default": 60
   },
   "retention_days": {
     "description": "统计数据保留天数",

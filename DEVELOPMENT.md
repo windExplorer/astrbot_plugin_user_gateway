@@ -45,6 +45,7 @@ astrbot_plugin_user_gateway/
 ├── avatar.py            # QQ / 群头像抓取与磁盘缓存
 ├── model_switch.py      # /切换模型：可选名单组装、序号会话、按场景落库（M12）
 ├── model_card.py        # 卡片渲染（Pillow，画不出来就返回 None 让调用方走文本兜底）
+├── recall.py            # 临时消息到点自动撤回（仅 QQ；抓 OneBot 的 message_id）
 ├── webui_api.py         # 控制台后端路由（AstrBot 桥接信封）
 ├── _conf_schema.json    # 配置项定义（唯一来源）
 ├── metadata.yaml        # 插件元数据（版本号唯一来源）
@@ -122,6 +123,7 @@ astrbot_plugin_user_gateway/
 | M12+++ | 卡片重画：浅色底 + 单一强调色，当前模型回到标题区 | v1.3.6 |
 | M12++++ | 群聊用群头像；今日用量不再在 0 时消失 | v1.3.7 |
 | M12+++++ | 卡片重画：参考 box 的「头 + 身体 + 脚」（渐变头、接缝直边、脚部圆角） | v1.3.8 |
+| M13 | 卡片到点自动撤回（新增 `recall.py` + 配置 `model_card_recall_sec`）；头像调大 | v1.3.9 |
 
 后续维护版本（v1.0.1 起）见 CHANGELOG。
 
@@ -171,3 +173,13 @@ astrbot_plugin_user_gateway/
 - **卡片头像**（`avatar_for`）：群里用**群头像**、私聊用对方头像；本地没有就 `ensure` 现抓一次
   （3 秒超时 + 失败后 10 分钟负缓存，指令回执不能被头像拖住），都没有才退回插件 logo。
   别再改回「永远取发言人头像」——群里那张卡片讲的是这个会话的模型，不是他的设置。
+- **临时消息自动撤回**（`recall.py`）：只有 QQ（aiocqhttp）能真撤，其它平台**只发不撤**。
+  关键约束：
+  - AstrBot 的适配器**丢掉了协议端返回的 `message_id`**，撤回又必须要它 ——
+    所以 `recall.py` 在这一次发送的前后临时包一层 bot 的实例方法把 id 捞出来，
+    发完立刻 `delattr` 还原（作用域最小；包不上就静默跳过 = 不撤）；
+  - **宁可不撤也不能撤错**：抓到 ≠1 个 id（这段窗口里还有别人在发）就不排撤回；
+  - 撤回是后台任务，异常只记 debug；插件卸载 / 热重载必须 `await recaller.close()`
+    取消全部待办（否则任务会去碰已经关掉的连接）；
+  - `CancelledError` 继承自 `BaseException`：`contextlib.suppress(Exception)` 挡不住它，
+    收任务的地方要显式带上。

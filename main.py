@@ -63,6 +63,7 @@ def _reload_sibling_modules() -> None:
         "avatar",
         "sync",
         "model_card",
+        "recall",
         "model_switch",
         "webui_api",
     ):
@@ -90,6 +91,7 @@ try:  # 包内相对导入（AstrBot 正常加载路径）
         layer_label,
     )
     from .model_switch import ModelSwitcher
+    from .recall import Recaller
     from .store import (
         COMMAND_MASTER_FEATURE,
         MODEL_CHOICE_FEATURE,
@@ -120,6 +122,7 @@ except ImportError as _rel_err:
             layer_label,
         )
         from model_switch import ModelSwitcher  # type: ignore
+        from recall import Recaller  # type: ignore
         from store import (  # type: ignore
             COMMAND_MASTER_FEATURE,
             MODEL_CHOICE_FEATURE,
@@ -135,7 +138,7 @@ except ImportError as _rel_err:
         raise ImportError(
             "萌萌权限控制台：子模块导入失败。"
             f"相对导入报错 {_rel_err!r}；平铺导入报错 {_flat_err!r}。"
-            "若报错是 No module named 'gate' / 'quota' / 'sync' / 'avatar' / 'model_switch' / 'model_card'，"
+            "若报错是 No module named 'gate' / 'quota' / 'sync' / 'avatar' / 'model_switch' / 'model_card' / 'recall'，"
             "说明**安装包少了文件**（打包脚本 build_zip.ps1 的 $includeList 未同步新增模块），"
             "请用仓库里最新的 zip 重新安装，或把缺失的 .py 补进插件目录。"
         ) from _flat_err
@@ -231,6 +234,8 @@ class UserGatewayPlugin(Star):
         self.scheduler = SyncScheduler(self)
         # M12：用户自助切换模型（/切换模型 + 回序号），状态全在内存（见 model_switch.py）
         self.switcher = ModelSwitcher(self)
+        # M13：临时消息（卡片）到点自动撤回（见 recall.py；只有 QQ 能真撤）
+        self.recaller = Recaller(self)
         # 会话 → 本次 LLM 请求的起始信息（用于估算 token 与统计延迟）
         self._inflight: dict[str, dict[str, Any]] = {}
         self._maintenance_task: Optional[asyncio.Task] = None
@@ -323,6 +328,10 @@ class UserGatewayPlugin(Star):
         try:
             if self.avatars:
                 await self.avatars.close()
+        except Exception:
+            pass
+        try:
+            await self.recaller.close()  # 待撤回任务要一并取消，别去碰已关闭的连接
         except Exception:
             pass
         try:
@@ -1639,19 +1648,26 @@ class UserGatewayPlugin(Star):
         except Exception as e:
             logger.warning(f"[UserGateway] 发送提示失败（忽略）: {e}")
 
-    @staticmethod
-    async def _send_image(event: AstrMessageEvent, png: bytes) -> bool:
+    async def _send_image(self, event: AstrMessageEvent, png: bytes, *, recall_sec: int = 0) -> bool:
         """直发一张图片（同样必须直发）。
 
         走 ``Image.fromBytes``（``base64://``）：不落盘、不需要清理临时文件；
         aiocqhttp 适配器本来也会把图片统一转成 base64 再发（见
         ``aiocqhttp_message_event._from_segment_to_dict``）。
 
+        Args:
+            recall_sec: 多少秒后自动撤回这张图（``0`` = 不撤；非 QQ 平台没有撤回接口，
+                会自动退化成「只发不撤」，见 :mod:`recall`）。
+
         Returns:
             True = 发送成功（失败时调用方可以退回文本列表，别让用户什么都收不到）。
         """
         try:
-            await event.send(MessageChain([Image.fromBytes(png)]))
+            chain = MessageChain([Image.fromBytes(png)])
+            if recall_sec > 0:
+                await self.recaller.send(event, chain, recall_sec)
+            else:
+                await event.send(chain)
             return True
         except Exception as e:
             logger.warning(f"[UserGateway] 发送图片失败（退回文本）: {e}")

@@ -43,11 +43,12 @@ from typing import Any, Optional
 from astrbot.api import logger
 
 try:  # 包内正常加载
-    from . import model_card
+    from . import model_card, recall
     from .gate import Subject, effect_in_scene
     from .store import MODEL_CHOICE_FEATURE
 except ImportError:  # pragma: no cover - 本地平铺调试
     import model_card  # type: ignore
+    import recall  # type: ignore
     from gate import Subject, effect_in_scene  # type: ignore
     from store import MODEL_CHOICE_FEATURE  # type: ignore
 
@@ -122,6 +123,10 @@ class ModelSwitcher:
     def ttl(self) -> int:
         got = _as_int(self._plugin._cfg("model_switch_timeout_sec", 60), 60)
         return max(MIN_TTL, min(MAX_TTL, got))
+
+    def recall_sec(self) -> int:
+        """卡片发出后多少秒自动撤回（``0`` = 不撤）。"""
+        return recall.clamp_delay(self._plugin._cfg("model_card_recall_sec", 60))
 
     @staticmethod
     def key_of(subject: Subject) -> str:
@@ -624,9 +629,12 @@ class ModelSwitcher:
                 reason="",
             )
         card = await self.build_card(subject, data)
-        if card is not None and await plugin._send_image(event, card):
+        if card is not None and await plugin._send_image(
+            event, card, recall_sec=self.recall_sec()
+        ):
             return
-        # 渲染不出来 / 图片发不出去 → 退化成文本列表（功能不能因为一张图就没了）
+        # 渲染不出来 / 图片发不出去 → 退化成文本列表（功能不能因为一张图就没了；
+        # 文本兜底同样不撤回：它可能带着用户唯一能看到的信息）
         await plugin._send(event, self.text_list(data, self.ttl()))
 
     async def handle_index(self, plugin: Any, event: Any, subject: Subject) -> bool:

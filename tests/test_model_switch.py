@@ -41,6 +41,7 @@ if "astrbot" not in sys.modules:
 import gate as G  # noqa: E402
 import model_card  # noqa: E402
 import model_switch as MS  # noqa: E402
+import recall as RC  # noqa: E402
 
 _failures: list[str] = []
 
@@ -131,6 +132,61 @@ class FakeAvatarCache:
         return out
 
 
+class FakeBot:
+    """假 aiocqhttp 客户端：发送返回 ``message_id``，撤回记一笔。"""
+
+    def __init__(self, mid: object = "4321", *, with_delete: bool = True) -> None:
+        self.calls: list[tuple] = []
+        self.deleted: list = []
+        self.actions: list[tuple] = []
+        self.mid = mid
+        if not with_delete:
+            return
+
+        async def delete_msg(message_id):
+            self.deleted.append(message_id)
+
+        self.delete_msg = delete_msg  # type: ignore[assignment]
+
+    async def send_group_msg(self, **kw):
+        self.calls.append(("group", kw))
+        return {"status": "ok", "retcode": 0, "data": {"message_id": self.mid}}
+
+    async def send_private_msg(self, **kw):
+        self.calls.append(("private", kw))
+        return {"retcode": 0, "data": {"message_id": self.mid}}  # 另一层包装，也要能挖出来
+
+    async def call_action(self, action, **params):
+        self.actions.append((action, params))
+        return {"status": "ok"}
+
+
+class FakeRecallEvent:
+    """事件桩：只提供 recall 用到的接口。
+
+    ``send`` 里顺手打一次 bot 的发送方法 —— 真机上这一步是适配器干的
+    （``aiocqhttp_message_event._dispatch_send``），撤回要抓的 id 就在那儿返回。
+    """
+
+    def __init__(self, bot: object = None, platform: str = "aiocqhttp", kind: str = "group") -> None:
+        self.bot = bot
+        self.platform = platform
+        self.kind = kind
+        self.sent: list = []
+
+    def get_platform_name(self) -> str:
+        return self.platform
+
+    async def send(self, chain) -> None:
+        self.sent.append(chain)
+        if self.bot is None:
+            return
+        if self.kind == "group":
+            await self.bot.send_group_msg(message=[], group_id=1)  # type: ignore[attr-defined]
+        else:
+            await self.bot.send_private_msg(message=[], user_id=1)  # type: ignore[attr-defined]
+
+
 class FakeProvider:
     def __init__(self, pid: str, name: str, model: str) -> None:
         self.provider_config = {"id": pid, "name": name}
@@ -154,6 +210,7 @@ class FakePlugin:
             "model_switch_enabled": True,
             "model_switch_timeout_sec": 60,
             "model_card_font": "",
+            "model_card_recall_sec": 60,
         }
         self.cfg.update(cfg or {})
         self.store = FakeStore()
@@ -166,6 +223,7 @@ class FakePlugin:
         self.avatars = None
         self.sent: list[str] = []
         self.images: list[bytes] = []
+        self.recall_secs: list[int] = []  # 每次发卡片带上的「多少秒后撤回」
         self.reloads = 0
         # 规则快照（由 main.reload_rules 维护，这里手工给）
         self._model_choice: dict[str, dict[str, str]] = {}
@@ -216,8 +274,9 @@ class FakePlugin:
     async def _send(self, event, text: str) -> None:
         self.sent.append(str(text))
 
-    async def _send_image(self, event, png: bytes) -> bool:
+    async def _send_image(self, event, png: bytes, *, recall_sec: int = 0) -> bool:
         self.images.append(png)
+        self.recall_secs.append(int(recall_sec))
         return True
 
 
@@ -861,6 +920,105 @@ async def main() -> int:
         check(sum(deep) < 720, f"头部背景确实上了主题色（不是「淡到看不出来」：{deep}）")
         foot_top_px = img.getpixel((sp + 1, foot_bottom - model_card.FOOTER_H + 3))
         check(sum(foot_top_px) < 740, f"脚的上沿是直角（贴边处直接是脚底色：{foot_top_px}）")
+
+    print("\n[18] 卡片自动撤回（配置 + 抓 message_id + 到点删）")
+    check(RC.clamp_delay(0) == 0 and RC.clamp_delay(-3) == 0 and RC.clamp_delay(None) == 0,
+          "0 / 负数 / 非法值 → 不撤回")
+    check(RC.clamp_delay("60") == 60, "字符串也能解析（配置面板可能给字符串）")
+    check(RC.clamp_delay(3) == RC.MIN_DELAY and RC.clamp_delay(999999) == RC.MAX_DELAY,
+          "太短 / 太长都夹到合理区间")
+    check(RC.message_id_of({"message_id": 123}) == "123", "message_id 在顶层")
+    check(RC.message_id_of({"status": "ok", "data": {"message_id": "a9"}}) == "a9",
+          "message_id 包在 data 里（不同协议端包装层级不同）")
+    check(RC.message_id_of(4321) == "" and RC.message_id_of("ok") == "",
+          "裸标量不当 id（可能是状态值，认错就会撤错消息）")
+    check(RC.message_id_of(None) == "" and RC.message_id_of({"status": "ok"}) == "",
+          "挖不到就返回空串")
+
+    # 卡片发送时带的撤回秒数：配置默认 60、配 0 = 不撤、太小会被夹到下限
+    plugin_r = FakePlugin(providers=provider_rows())
+    plugin_r.store.levels = {1: {"id": 1, "kind": "user", "name": "VIP"}}
+    plugin_r._rules_obj = rules(
+        subject_level={"user": {"10001": 1}},
+        level_switch={1: ("p-a", "p-b")},
+        level_switch_enabled={1: True},
+    )
+    sw_r = MS.ModelSwitcher(plugin_r)
+    check(sw_r.recall_sec() == 60, "默认 60 秒后撤回卡片")
+    plugin_r.cfg["model_card_recall_sec"] = 0
+    check(sw_r.recall_sec() == 0, "配 0 → 不撤")
+    plugin_r.cfg["model_card_recall_sec"] = 2
+    check(sw_r.recall_sec() == RC.MIN_DELAY, "配得太小会被夹到下限（用户还没看清就撤了很糟）")
+    plugin_r.cfg["model_card_recall_sec"] = 60
+    await sw_r.handle_command(plugin_r, FakeEvent("切换模型"), subject(), "")
+    check(plugin_r.recall_secs == [60], f"发卡片时把撤回秒数交给发送侧（实得 {plugin_r.recall_secs}）")
+
+    # 抓 message_id → 排撤回 → 到点真删
+    bot = FakeBot("4321")
+    event = FakeRecallEvent(bot, kind="group")
+    rec = RC.Recaller()
+    origin_clamp = RC.clamp_delay
+    RC.clamp_delay = lambda _v: 0.05  # type: ignore[assignment]
+    try:
+        await rec.send(event, "chain", 60)
+    finally:
+        RC.clamp_delay = origin_clamp  # type: ignore[assignment]
+    check(len(event.sent) == 1 and bot.calls[-1][0] == "group", "消息照常发出")
+    check(rec.scheduled == 1, f"排了一个撤回任务（实得 {rec.scheduled}）")
+    check("send_group_msg" not in bot.__dict__, "发送方法已还原（不长期占着补丁）")
+    await asyncio.sleep(0.2)
+    check(bot.deleted == [4321], f"到点真的撤回了（实得 {bot.deleted}）")
+    check(rec.stats()["recalled"] == 1 and rec.stats()["pending"] == 0, "计数与待办都归位")
+
+    # 私聊路径；没有 delete_msg 时退回 call_action
+    bot2 = FakeBot("777", with_delete=False)
+    event2 = FakeRecallEvent(bot2, kind="private")
+    rec2 = RC.Recaller()
+    await rec2.send(event2, "chain", 60)
+    check(rec2.scheduled == 1, "私聊发送也能抓到 id")
+    check(bot2.deleted == [], "还没到点，先不撤")
+    await rec2._recall_later(bot2, "777", 0.01)
+    check(bot2.actions and bot2.actions[-1][0] == "delete_msg", "没有 delete_msg → 退回 call_action")
+
+    # 平台不支持 / 不排撤回：照发，不排任务
+    rec3 = RC.Recaller()
+    event3 = FakeRecallEvent(FakeBot(), platform="telegram")
+    await rec3.send(event3, "chain", 60)
+    check(len(event3.sent) == 1 and rec3.scheduled == 0, "非 QQ 平台：只发不撤")
+    await rec3.send(FakeRecallEvent(None), "chain", 60)
+    check(rec3.scheduled == 0, "拿不到 bot 也不影响发送")
+    # 一段窗口里抓到多个 id（说明还有别人在发）→ 宁可不撤，也不能撤错
+    bot4 = FakeBot("1")
+    event4 = FakeRecallEvent(bot4)
+
+    async def _two_sends(c):
+        await bot4.send_group_msg(message=[], group_id=1)
+        await bot4.send_group_msg(message=[], group_id=1)
+
+    rec4 = RC.Recaller()
+    await rec4.send(event4, "chain", 60, sender=_two_sends)
+    check(rec4.scheduled == 0, "抓到 ≠1 个 id → 不撤（宁可留卡片也不撤错别人的消息）")
+    # 发送抛异常时不排撤回，也不吞掉异常（调用方要能退化成文本）
+    rec5 = RC.Recaller()
+
+    async def _boom(c):
+        raise RuntimeError("send failed")
+
+    try:
+        await rec5.send(FakeRecallEvent(FakeBot()), "chain", 60, sender=_boom)
+        ok_boom = False
+    except RuntimeError:
+        ok_boom = True
+    check(ok_boom and rec5.scheduled == 0, "发送失败照旧抛给调用方（由它退化成文本）")
+
+    # 插件卸载：待撤回任务全部取消，不会再动已经关掉的连接
+    bot6 = FakeBot("9")
+    rec6 = RC.Recaller()
+    await rec6.send(FakeRecallEvent(bot6), "chain", 60)
+    check(rec6.stats()["pending"] == 1, "有任务等着撤回")
+    await rec6.close()
+    await asyncio.sleep(0.2)
+    check(bot6.deleted == [] and rec6.stats()["pending"] == 0, "卸载后不再撤回、任务清空")
 
     print()
     if _failures:

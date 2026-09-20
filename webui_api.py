@@ -368,6 +368,11 @@ async def h_ping(plugin) -> dict:
                     plugin.switcher.sessions() if getattr(plugin, "switcher", None) else 0
                 ),
                 "card": model_card.assets_info(),
+                "recall_sec": int(plugin._cfg("model_card_recall_sec", 60) or 0),
+                # 卡片自动撤回的计数（排上 / 撤掉 / 失败、当前待撤）
+                "recall": (
+                    plugin.recaller.stats() if getattr(plugin, "recaller", None) else {}
+                ),
             },
         },
     )

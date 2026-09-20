@@ -85,8 +85,9 @@ SYSTEM_FONT_CANDIDATES: tuple[str, ...] = (
 WIDTH = 880  # 卡片本体宽度（不含下面的阴影留白）
 PAD = 40  # 卡片内左右边距
 RADIUS = 30  # 外轮廓圆角（只有最外侧四角用它）
-AVATAR = 92
-AVATAR_RING = 8  # 头像外的白圈（叠在渐变头上，像 box 那张卡）
+AVATAR = 120  # 头像直径（v1.3.9 从 92 调大：小头像在群里一眼认不出来）
+AVATAR_RING = 9  # 头像外的白圈（叠在渐变头上，像 box 那张卡）
+HEAD_PAD = 30  # 头部内容与头部上下沿的最小留白
 ROW_H = 76
 ROW_GAP = 12
 ROW_RADIUS = 20
@@ -417,14 +418,10 @@ def render_model_card(
         cur_lh = int(sum(f_cur.getmetrics()) * 1.14)
         meta_h = sum(f_meta.getmetrics())
 
-        # 头部高度与下面「一段一段往下排」的增量严格一致（否则底部留白会被吃掉）
-        head_h = 30 + label_h
-        for _line in cur_lines:
-            head_h += 14 + cur_lh
-        if meta:
-            head_h += 12 + meta_h
-        head_h += 30
-        head_h = max(head_h, AVATAR + AVATAR_RING * 2 + 44)  # 头像别顶到边
+        # 头部高度与下面「一段一段往下排」的增量严格一致（否则底部留白会被吃掉）；
+        # 正文块与头像是**各自垂直居中**的：头像比文字高时，文字不会缩在顶上。
+        content_h = label_h + len(cur_lines) * (14 + cur_lh) + (12 + meta_h if meta else 0)
+        head_h = max(content_h + HEAD_PAD * 2, AVATAR + AVATAR_RING * 2 + 48)
 
         body_h = 26 + len(items) * ROW_H + (len(items) - 1) * ROW_GAP + 26
         card_h = head_h + body_h + (FOOTER_H if footer else 0)
@@ -460,7 +457,7 @@ def render_model_card(
         draw = ImageDraw.Draw(img)
 
         # ---- 3) 头部内容：小标签 + 当前模型（主角）+ 元信息 + 头像 ----
-        y = oy + 30
+        y = oy + max(HEAD_PAD, (head_h - content_h) // 2)
         draw.text((ox + PAD, y), str(title or ""), font=f_label, fill=c["sub"] + (255,))
         y += label_h
         for line in cur_lines:

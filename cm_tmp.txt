@@ -1,0 +1,29 @@
+feat: 头像调大 + 卡片到点自动撤回（v1.3.9）
+
+用户反馈两条：卡片上的头像太小、卡片看完就没用了应该自动撤掉。
+
+头像（model_card.py）
+- 直径 92 → 120，白圈 8 → 9（群里扫一眼就能认出是谁的会话）。
+- 顺带把头部正文块也垂直居中：头像比文字高时文字不再缩在顶部（两端各自居中）。
+
+卡片自动撤回（新增 recall.py + 配置 model_card_recall_sec）
+- 新配置 model_card_recall_sec（默认 60 秒；5-3600；填 0 = 不撤回），
+  控制台「配置 → 模型路由」里可改。
+- 只有 QQ（aiocqhttp）能真撤回（OneBot 的 delete_msg），其它平台自动退化成「只发不撤」，
+  撤回这件事绝不会把卡片本身发不出去。
+- 为什么要单独一个模块：AstrBot 的适配器发出消息后把协议端返回的 message_id 扔了
+  （aiocqhttp_message_event._dispatch_send 里 await bot.send_group_msg 没接返回值），
+  而撤回必须知道它。recall.py 在这一次发送的前后临时把 bot 的发送方法包一层捞出 id，
+  发完立刻还原（实例属性，作用域最小；包不上就静默跳过 = 不撤）。
+- 宁可不撤也不能撤错：抓不到 id、或这段窗口里抓到 ≠1 个 id（说明还有别人在发消息）
+  时不排撤回。
+- 撤回是后台任务（失败只记 debug 日志）；插件卸载 / 热重载时 Recaller.close() 会全部取消，
+  不让任务去碰已经关掉的连接。
+
+验证
+- test_model_switch 新增 [18]：clamp_delay 的边界、message_id_of 的三种包装层级与裸标量、
+  发送后补丁确实还原、到点真的删、私聊路径、没有 delete_msg 时退回 call_action、
+  非 QQ 平台只发不撤、抓到多个 id 时跳过、发送异常照旧抛给调用方、close() 取消待撤回任务；
+  以及配置链路（recall_sec 默认/0/夹下限 + handle_command 把秒数交给发送侧）。
+- build_zip.ps1 的 includeList 补上 recall.py（脚本自带自检，漏了会直接报错），
+  出包 27 条、结构核对通过；三套自检全绿；前端重建（v1.3.9）。

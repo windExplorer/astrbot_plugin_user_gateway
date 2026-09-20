@@ -71,6 +71,7 @@ $includeList = @(
     "avatar.py",
     "model_switch.py",   # /switch-model command flow (v1.3.3)
     "model_card.py",     # Pillow card renderer (v1.3.3)
+    "recall.py",         # auto-recall temporary messages (v1.3.9)
     "_conf_schema.json",
     "metadata.yaml",
     "requirements.txt",
