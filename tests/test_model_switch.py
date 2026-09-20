@@ -210,7 +210,7 @@ class FakePlugin:
             "model_switch_enabled": True,
             "model_switch_timeout_sec": 60,
             "model_card_font": "",
-            "model_card_recall_sec": 60,
+            "model_card_recall": True,
         }
         self.cfg.update(cfg or {})
         self.store = FakeStore()
@@ -935,7 +935,7 @@ async def main() -> int:
     check(RC.message_id_of(None) == "" and RC.message_id_of({"status": "ok"}) == "",
           "挖不到就返回空串")
 
-    # 卡片发送时带的撤回秒数：配置默认 60、配 0 = 不撤、太小会被夹到下限
+    # 撤回时间与「序号有效期」必须是同一个数字（分开配迟早对不上）
     plugin_r = FakePlugin(providers=provider_rows())
     plugin_r.store.levels = {1: {"id": 1, "kind": "user", "name": "VIP"}}
     plugin_r._rules_obj = rules(
@@ -944,12 +944,19 @@ async def main() -> int:
         level_switch_enabled={1: True},
     )
     sw_r = MS.ModelSwitcher(plugin_r)
-    check(sw_r.recall_sec() == 60, "默认 60 秒后撤回卡片")
-    plugin_r.cfg["model_card_recall_sec"] = 0
-    check(sw_r.recall_sec() == 0, "配 0 → 不撤")
-    plugin_r.cfg["model_card_recall_sec"] = 2
-    check(sw_r.recall_sec() == RC.MIN_DELAY, "配得太小会被夹到下限（用户还没看清就撤了很糟）")
-    plugin_r.cfg["model_card_recall_sec"] = 60
+    check(sw_r.recall_sec() == sw_r.ttl() == 60, "默认：撤回时间 = 有效期 = 60")
+    plugin_r.cfg["model_switch_timeout_sec"] = 25
+    check(sw_r.ttl() == sw_r.recall_sec() == 25, "改有效期 → 撤回时间跟着变（不会一个 25 一个 60）")
+    plugin_r.cfg["model_card_recall"] = False
+    check(sw_r.recall_sec() == 0 and sw_r.ttl() == 25, "关掉开关 → 不撤回（有效期照旧 25 秒）")
+    check(sw_r.footer_of({"can_switch": True}) == "回复序号切换 · 25 秒内有效 · 0 = 恢复默认",
+          "关掉撤回时，卡片底部不会写「自动撤回」")
+    plugin_r.cfg["model_card_recall"] = True
+    check("25 秒后自动撤回" in sw_r.footer_of({"can_switch": True}),
+          f"开了撤回就把时间写在卡片上（实得 {sw_r.footer_of({'can_switch': True})}）")
+    check("只读" in sw_r.footer_of({"can_switch": False, "readonly_reason": MS.REASON_LEVEL_OFF}),
+          "只读时底部仍是「为什么不能切」，不提撤回")
+    plugin_r.cfg["model_switch_timeout_sec"] = 60
     await sw_r.handle_command(plugin_r, FakeEvent("切换模型"), subject(), "")
     check(plugin_r.recall_secs == [60], f"发卡片时把撤回秒数交给发送侧（实得 {plugin_r.recall_secs}）")
 

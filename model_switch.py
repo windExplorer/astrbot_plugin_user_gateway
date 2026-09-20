@@ -43,12 +43,11 @@ from typing import Any, Optional
 from astrbot.api import logger
 
 try:  # 包内正常加载
-    from . import model_card, recall
+    from . import model_card
     from .gate import Subject, effect_in_scene
     from .store import MODEL_CHOICE_FEATURE
 except ImportError:  # pragma: no cover - 本地平铺调试
     import model_card  # type: ignore
-    import recall  # type: ignore
     from gate import Subject, effect_in_scene  # type: ignore
     from store import MODEL_CHOICE_FEATURE  # type: ignore
 
@@ -124,9 +123,18 @@ class ModelSwitcher:
         got = _as_int(self._plugin._cfg("model_switch_timeout_sec", 60), 60)
         return max(MIN_TTL, min(MAX_TTL, got))
 
+    def recall_on(self) -> bool:
+        """到期后要不要把卡片撤回（总开关，默认开）。"""
+        return bool(self._plugin._cfg("model_card_recall", True))
+
     def recall_sec(self) -> int:
-        """卡片发出后多少秒自动撤回（``0`` = 不撤）。"""
-        return recall.clamp_delay(self._plugin._cfg("model_card_recall_sec", 60))
+        """卡片在多少秒后自动撤回（``0`` = 不撤）。
+
+        **与「序号有效期」共用同一个数字**（``model_switch_timeout_sec``）：
+        用户能回序号的时间一到，卡片就该消失。两个值分开配迟早会不一致 ——
+        卡片先没了（用户莫名其妙）、或者过期了还挂着（引着人去点一个已经无效的序号）。
+        """
+        return self.ttl() if self.recall_on() else 0
 
     @staticmethod
     def key_of(subject: Subject) -> str:
@@ -476,11 +484,18 @@ class ModelSwitcher:
         )
 
     def footer_of(self, data: dict[str, Any]) -> str:
-        """卡片底部提示：能切就说怎么切，只读就说为什么切不了。"""
-        if data.get("can_switch"):
-            return f"回复序号切换 · {self.ttl()} 秒内有效 · 0 = 恢复默认"
-        reason = str(data.get("readonly_reason") or REASON_LEVEL_OFF)
-        return READONLY_HINT.format(reason=reason)
+        """卡片底部提示：能切就说怎么切，只读就说为什么切不了。
+
+        开了自动撤回时把「多少秒后撤回」写出来（与有效期是同一个数字），
+        用户才不会以为卡片是发丢了。
+        """
+        if not data.get("can_switch"):
+            reason = str(data.get("readonly_reason") or REASON_LEVEL_OFF)
+            return READONLY_HINT.format(reason=reason)
+        ttl = self.ttl()
+        if self.recall_on():
+            return f"回复序号切换（{ttl} 秒后自动撤回）· 0 = 恢复默认"
+        return f"回复序号切换 · {ttl} 秒内有效 · 0 = 恢复默认"
 
     def text_list(self, data: dict[str, Any], ttl: int) -> str:
         """卡片渲染不出来时的纯文本兜底（功能不能因为画不出图就没了）。"""

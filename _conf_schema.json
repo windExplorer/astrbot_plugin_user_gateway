@@ -185,7 +185,7 @@
   },
   "model_switch_timeout_sec": {
     "description": "切换选择的等待时长（秒）",
-    "hint": "用户看完卡片后回序号的等待时间，超时需重新发送指令。默认 60；范围 10 - 600。",
+    "hint": "用户看完卡片后回序号的等待时间，超时需重新发送指令。默认 60；范围 10 - 600。这个数字同时也是卡片的自动撤回时间（到点即失效并撤回，两件事共用一个值，不会对不上）。",
     "type": "int",
     "default": 60
   },
@@ -202,11 +202,11 @@
     "default": "indigo",
     "options": ["indigo", "teal", "amber", "rose"]
   },
-  "model_card_recall_sec": {
-    "description": "卡片自动撤回（秒）",
-    "hint": "卡片发出后多少秒自动撤回（默认 60，5 - 3600；填 0 = 不撤回）。撤回只在 QQ（aiocqhttp）平台有效，其它平台会自动退化成「只发不撤」，不会因为撤回失败而发不出卡片。",
-    "type": "int",
-    "default": 60
+  "model_card_recall": {
+    "description": "卡片到期后自动撤回",
+    "hint": "上面的「切换选择的等待时长」一到就自动把卡片撤回（同一个数字，不另配时间）。默认开：那张卡片是一次性的，留着占地。关掉则卡片一直留在聊天里（只是过期后回序号不再生效）。撤回只在 QQ（aiocqhttp）平台有效，其它平台会自动退化成「只发不撤」，不会因为撤回失败而发不出卡片。",
+    "type": "bool",
+    "default": true
   },
   "retention_days": {
     "description": "统计数据保留天数",

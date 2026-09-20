@@ -160,7 +160,7 @@ const GROUPS: { name: string; hint: string; keys: string[] }[] = [
   { name: "额度", hint: "token 限额的计数口径与工作模式", keys: ["quota_mode", "count_cached_tokens", "warn_ratio"] },
   { name: "同步", hint: "好友 / 群列表的同步与头像", keys: ["sync_interval_min", "sync_timeout_sec", "sync_group_members", "load_avatars", "avatar_source", "avatar_cache_days", "avatar_timeout_sec"] },
   { name: "最后回复", hint: "记录 bot 在每个好友 / 群里的最后一条回复", keys: ["track_bot_messages"] },
-  { name: "模型路由", hint: "按等级给会话指定主 / 备用模型；用户也能用「/切换模型」在等级圈定的名单里自助换", keys: ["model_route_enabled", "model_route_failure_threshold", "model_route_circuit_sec", "model_switch_enabled", "model_switch_timeout_sec", "model_card_theme", "model_card_font", "model_card_recall_sec"] },
+  { name: "模型路由", hint: "按等级给会话指定主 / 备用模型；用户也能用「/切换模型」在等级圈定的名单里自助换", keys: ["model_route_enabled", "model_route_failure_threshold", "model_route_circuit_sec", "model_switch_enabled", "model_switch_timeout_sec", "model_card_recall", "model_card_theme", "model_card_font"] },
   { name: "统计", hint: "用量明细的保留策略", keys: ["retention_days"] },
   { name: "高级", hint: "排查问题时才需要改", keys: ["guard_priority", "debug_log"] },
 ];
