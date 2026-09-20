@@ -547,7 +547,8 @@ async def main() -> int:
         from PIL import Image  # noqa: PLC0415
 
         img = Image.open(__import__("io").BytesIO(png))
-        check(img.width == model_card.WIDTH and img.height > 200,
+        want_w = model_card.WIDTH + model_card.SHADOW_PAD * 2  # 画布 = 卡片本体 + 四周阴影留白
+        check(img.width == want_w and img.height > 200,
               f"卡片尺寸合理（{img.width}x{img.height}）")
         # 超长模型名不能撑破卡片（走截断）
         long_row = dict(data["options"][0])
@@ -814,6 +815,52 @@ async def main() -> int:
     png_card = await sw9.build_card(subject(group="88888"), gdata)
     check(bool(png_card) and png_card[:8] == b"\x89PNG\r\n\x1a\n", "群聊卡片能正常渲染")
     check(cache.reads[-1] == ("group", "88888"), "群聊卡片用的仍是群头像")
+
+    print("\n[17] 三段拼接：头 / 身体 / 脚，圆角只在最外侧")
+    if model_card.Image is None:
+        print("  （当前环境没有 Pillow，跳过版面断言）")
+    else:
+        from PIL import Image  # noqa: PLC0415
+
+        m_head = model_card._seg_mask((120, 120), 24, round_top=True)
+        check(m_head.getpixel((2, 2)) == 0, "头部遮罩：左上角被切掉")
+        check(m_head.getpixel((2, 117)) == 255 and m_head.getpixel((117, 117)) == 255,
+              "头部遮罩：下沿两角是直角（与身体对接处不切圆）")
+        m_foot = model_card._seg_mask((120, 120), 24, round_top=False)
+        check(m_foot.getpixel((2, 2)) == 255 and m_foot.getpixel((60, 2)) == 255,
+              "脚部遮罩：上沿是直角（与身体对接处不切圆）")
+        check(m_foot.getpixel((2, 117)) == 0, "脚部遮罩：左下角被切掉")
+
+        png_t = model_card.render_model_card(
+            title="模型切换", current="OpenAI · gpt-4o", meta="分组：VIP",
+            rows=[{"index": 1, "label": "OpenAI · gpt-4o", "current": True},
+                  {"index": 2, "label": "Claude · claude-3-7", "unavailable": True}],
+            footer="回复序号切换 · 60 秒内有效", theme="indigo",
+        )
+        check(bool(png_t), "新样板面能渲染")
+        img = Image.open(__import__("io").BytesIO(png_t)).convert("RGB")
+        sp, pad = model_card.SHADOW_PAD, model_card.PAD
+        xc = sp + pad - 10
+        col = [img.getpixel((xc, y)) for y in range(sp, img.height - sp)]
+        near_white = lambda p: min(p) > 248  # noqa: E731
+        try:
+            head_bottom = next(i for i, p in enumerate(col) if near_white(p)) + sp
+            foot_bottom = max(i for i, p in enumerate(col) if not near_white(p)) + sp
+        except ValueError:
+            head_bottom = foot_bottom = -1
+        check(head_bottom > sp and foot_bottom > head_bottom,
+              f"能找到头/身分缝与脚底（{head_bottom} / {foot_bottom}）")
+        check(min(img.getpixel((sp + 1, sp + 1))) > 240,
+              f"卡外留白是白的（透明区不落成黑块，实得 {img.getpixel((sp + 1, sp + 1))}）")
+        # 角上那一两个像素的区别太小（整套配色都很浅），圆角与否在遮罩上断言才靠谱
+        cm = model_card._card_mask((120, 120), 24)
+        check(cm.getpixel((1, 1)) == 0 and cm.getpixel((118, 118)) == 0, "外轮廓四角都是圆的")
+        seam = img.getpixel((sp + 1, max(sp + 1, head_bottom - 3)))
+        check(sum(seam) < 720, f"头的下沿是直角（贴边像素仍有色：{seam}）")
+        deep = img.getpixel((sp + model_card.RADIUS + 10, max(sp + 1, head_bottom - 14)))
+        check(sum(deep) < 720, f"头部背景确实上了主题色（不是「淡到看不出来」：{deep}）")
+        foot_top_px = img.getpixel((sp + 1, foot_bottom - model_card.FOOTER_H + 3))
+        check(sum(foot_top_px) < 740, f"脚的上沿是直角（贴边处直接是脚底色：{foot_top_px}）")
 
     print()
     if _failures:

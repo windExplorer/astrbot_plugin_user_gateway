@@ -188,10 +188,12 @@ async def main() -> int:
         check(t["tok_total"] == 541, f"tok_total = {t['tok_total']}（期望 541）")
         check(t["users"] == 2, f"活跃用户 = {t['users']}（期望 2）")
         check(t["groups"] == 1, f"活跃群 = {t['groups']}（期望 1）")
-        # 趋势按「本地小时」分桶：种子数据在 now / now-60 / …. 若正好跑在整点或午夜前后，
-        # 这些点会落在两个桶里 —— 所以按「种子的时间戳实际跨了几个小时」断言，
-        # 而不是写死 1（写死的话每天 00:00 / 每个整点跑测试都会假红一次）。
-        hours = {time.strftime("%H:00", time.localtime(now - d)) for d in range(0, 420, 60)}
+        # 趋势按「本地小时」分桶：种子数据在 now / now-60 / now-120。若正好跑在整点前后，
+        # 这些点会落在两个桶里 —— 所以按「种子时间戳实际跨了几个小时」断言，
+        # 而不是写死 1（写死的话每个整点跑测试都会假红一次）。
+        # 注意偏移量必须与上面真正写进去的那三行**一一对应**：多算几个没数据的偏移，
+        # 会在「整点后 2~6 分钟」这段窗口里把期望值抬成 2，而实际只有 1 个桶 → 假红。
+        hours = {time.strftime("%H:00", time.localtime(now - d)) for d in (0, 60, 120)}
         check(len(s["trend"]) == len(hours),
               f"短区间趋势分桶 = {len(s['trend'])}（种子的时间戳跨 {len(hours)} 个小时桶）")
         check(":" in str(s["trend"][0]["day"]), "短区间的 x 轴标签是「小时:00」（今日视图用）")
