@@ -110,17 +110,19 @@ AstrBot 插件：**按好友 / 按群细粒度管控 LLM 使用权限与 token �
 
 ```
 用户：/切换模型
-bot ：（一张卡片）
+bot ：（一张卡片，浅色底 + 单一强调色）
       ┌ 模型切换 ─────────────────────────────┐
-      │ 分组：VIP（好友等级）                    │
-      │ 当前使用  OpenAI · gpt-4o-2024-11-20…   │  ← 单独一行，长名字折行不截断
-      │ 今日用量  12.3K tokens · 8 次对话        │
-      │ ① OpenAI · gpt-4o        当前使用       │
-      │ ② Claude · claude-3-7    专属模型       │
-      │ ③ 本地 · qwen3-32b       暂不可用       │
-      │ ④ DeepSeek · deepseek-v3                │
-      │ 回复序号切换 · 60 秒内有效 · 0 = 恢复默认 │
-      └────────────────────────────────────────┘
+      │ OpenAI · gpt-4o-2024-11-20-preview-very- │  ← 当前模型在标题区，长名字折行不截断
+      │ long-name                                │
+      │ VIP（好友等级）· 今日 12.3K tokens · 8 次  │
+      ├──────────────────────────────────────────┤
+      │ 1  OpenAI · gpt-4o           [当前使用]   │
+      │ 2  Claude · claude-3-7      [专属模型]    │
+      │ 3  本地 · qwen3-32b           暂不可用     │
+      │ 4  DeepSeek · deepseek-v3                 │
+      ├──────────────────────────────────────────┤
+      │ · 回复序号切换 · 60 秒内有效 · 0 = 恢复默认 │
+      └──────────────────────────────────────────┘
 用户：2
 bot ：已切换为：Claude · claude-3-7，从下一条消息起生效。
 ```
@@ -173,7 +175,7 @@ bot ：已切换为：Claude · claude-3-7，从下一条消息起生效。
 | `command_guard_priority` | 指令拦截优先级（默认 1000；拦不住就调大） |
 | `model_route_enabled` | 是否启用等级模型路由 |
 | `model_switch_enabled` / `model_switch_timeout_sec` | 是否允许用户自查自切模型 / 等他回序号的秒数（默认 60） |
-| `model_card_theme` | 卡片配色：`indigo`（默认）/ `mint` / `sunset` |
+| `model_card_theme` | 卡片强调色：`indigo`（默认）/ `teal` / `amber` / `rose` |
 | `model_card_font` | 卡片字体文件路径（留空 = 用插件自带中文字体，再退到系统字体） |
 | `sync_group_members` | 自动同步时是否拉取群成员（默认关；量级 = 群数 × 人数） |
 | `track_bot_messages` / `track_command_usage` | 最后回复记录 / 指令触发流水（统计页数据来源） |

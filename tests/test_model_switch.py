@@ -527,12 +527,13 @@ async def main() -> int:
         long_row["label"] = "非常长的供应商名字" * 6 + " · " + "model-name" * 6
         png2 = model_card.render_model_card(
             title="模型切换",
-            subtitle="分组：超长名字测试" * 4,
+            current="当前模型名字" * 8,
+            meta="分组：超长名字测试" * 4,
             rows=[long_row, data["options"][1]],
             footer="回复序号即可切换",
         )
-        check(bool(png2) and png2[:8] == b"\x89PNG\r\n\x1a\n", "超长文案也能渲染（内部截断）")
-    check(model_card.render_model_card(title="x", subtitle="", rows=[], footer="") is None,
+        check(bool(png2) and png2[:8] == b"\x89PNG\r\n\x1a\n", "超长文案也能渲染（折行 + 截断）")
+    check(model_card.render_model_card(title="x", current="", meta="", rows=[], footer="") is None,
           "没有可选项 → 不渲染（调用方走文本兜底）")
 
     print("\n[12] 控制台接口（真实 Store 走一遍读写）")
@@ -688,18 +689,19 @@ async def main() -> int:
     check(grp_calls[-1] == ("user", "10001"), "私聊按人聚合")
     sw9._plugin.store.stats = None
 
-    print("\n[15] 配色主题与版面（长模型名折行，不截断）")
+    print("\n[15] 配色主题与版面（当前模型在标题区折行，不截断）")
     rows_one = [{"index": 1, "label": "OpenAI · gpt-4o", "current": True}]
-    check(model_card.theme_colors("mint") is model_card.THEMES["mint"], "主题按名字取到")
+    check(set(model_card.THEMES) == {"indigo", "teal", "amber", "rose"}, "内置四套主题")
+    check(model_card.theme_colors("teal") is model_card.THEMES["teal"], "主题按名字取到")
     check(model_card.theme_colors("不存在的主题") is model_card.THEMES[model_card.DEFAULT_THEME],
           "主题名写错 → 回落默认（配置坏了也要能出图）")
-    check(set(model_card.THEMES) == {"indigo", "mint", "sunset"}, "内置三套主题")
     check(model_card.theme_colors() is model_card.THEMES[model_card.DEFAULT_THEME], "空主题名 → 默认")
+    check(model_card.THEMES[model_card.DEFAULT_THEME]["accent"] is not None, "默认主题有强调色")
     theme_pngs: dict[str, bytes] = {}
     for name in model_card.THEMES:
         png_t = model_card.render_model_card(
-            title="模型切换", subtitle="分组：VIP", rows=rows_one,
-            info=[{"label": "当前使用", "value": "OpenAI · gpt-4o"}], theme=name,
+            title="模型切换", current="OpenAI · gpt-4o", meta="分组：VIP",
+            rows=rows_one, theme=name,
         )
         check(bool(png_t) and png_t[:8] == b"\x89PNG\r\n\x1a\n", f"主题 {name} 能出图")
         if png_t:
@@ -707,22 +709,21 @@ async def main() -> int:
     if len(theme_pngs) >= 2:
         check(len(set(theme_pngs.values())) == len(theme_pngs), "不同主题画出来确实不一样")
     # 卡片真用上了配置里的主题（build_card → render_model_card 的透传）
-    plugin9.cfg["model_card_theme"] = "mint"
-    mint_png = await sw9.build_card(subject(), await sw9.describe(subject()))
-    plugin9.cfg["model_card_theme"] = "sunset"
-    sunset_png = await sw9.build_card(subject(), await sw9.describe(subject()))
-    check(bool(mint_png) and bool(sunset_png) and mint_png != sunset_png,
+    plugin9.cfg["model_card_theme"] = "teal"
+    teal_png = await sw9.build_card(subject(), await sw9.describe(subject()))
+    plugin9.cfg["model_card_theme"] = "amber"
+    amber_png = await sw9.build_card(subject(), await sw9.describe(subject()))
+    check(bool(teal_png) and bool(amber_png) and teal_png != amber_png,
           "改 model_card_theme 配置 → 卡片配色跟着变")
+    plugin9.cfg.pop("model_card_theme", None)
 
     short = model_card.render_model_card(
-        title="模型切换", subtitle="分组：VIP", rows=rows_one,
-        info=[{"label": "当前使用", "value": "OpenAI · gpt-4o"}],
+        title="模型切换", current="OpenAI · gpt-4o", meta="分组：VIP", rows=rows_one,
         footer="回复序号切换",
     )
     long_name = "某供应商名字特别长特别长特别长 · 模型名也一样长特别长特别长特别长特别长"
     long = model_card.render_model_card(
-        title="模型切换", subtitle="分组：VIP", rows=rows_one,
-        info=[{"label": "当前使用", "value": long_name + long_name}],
+        title="模型切换", current=long_name + long_name, meta="分组：VIP", rows=rows_one,
         footer="回复序号切换",
     )
     if short and long:
@@ -730,7 +731,7 @@ async def main() -> int:
 
         h_short = Image.open(__import__("io").BytesIO(short)).height
         h_long = Image.open(__import__("io").BytesIO(long)).height
-        check(h_long > h_short, f"长名字换到第二行（高度 {h_short} → {h_long}）")
+        check(h_long > h_short, f"当前模型在标题区换到第二行（高度 {h_short} → {h_long}）")
         check(Image.open(__import__("io").BytesIO(long)).height < 900, "折行有上限，不会把卡片撑爆")
     else:
         print("  （当前环境没有 Pillow / 字体，跳过版面断言）")

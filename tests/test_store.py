@@ -188,9 +188,14 @@ async def main() -> int:
         check(t["tok_total"] == 541, f"tok_total = {t['tok_total']}（期望 541）")
         check(t["users"] == 2, f"活跃用户 = {t['users']}（期望 2）")
         check(t["groups"] == 1, f"活跃群 = {t['groups']}（期望 1）")
-        check(len(s["trend"]) == 1, f"短区间趋势分桶 = {len(s['trend'])} 桶（≤48h 按小时）")
+        # 趋势按「本地小时」分桶：种子数据在 now / now-60 / …. 若正好跑在整点或午夜前后，
+        # 这些点会落在两个桶里 —— 所以按「种子的时间戳实际跨了几个小时」断言，
+        # 而不是写死 1（写死的话每天 00:00 / 每个整点跑测试都会假红一次）。
+        hours = {time.strftime("%H:00", time.localtime(now - d)) for d in range(0, 420, 60)}
+        check(len(s["trend"]) == len(hours),
+              f"短区间趋势分桶 = {len(s['trend'])}（种子的时间戳跨 {len(hours)} 个小时桶）")
         check(":" in str(s["trend"][0]["day"]), "短区间的 x 轴标签是「小时:00」（今日视图用）")
-        check(s["trend"][0]["tokens"] == 541, "趋势当日 token")
+        check(sum(int(r["tokens"] or 0) for r in s["trend"]) == 541, "趋势 token 合计 = 541")
         check(any(r["reason"] == "quota" for r in s["deny_reasons"]), "拒绝原因含 quota")
         check(any(r["model"] == "gpt-4o" for r in s["by_model"]), "模型占比含 gpt-4o")
 
@@ -256,7 +261,12 @@ async def main() -> int:
         su = await st.subject_stats("user", "10001", now - 3600, now + 60)
         check(su["totals"]["calls"] == 4, f"用户统计 calls = 4（实得 {su['totals']['calls']}）")
         check(su["totals"]["tok_total"] == 540, "用户统计 tok_total = 540")
-        check(len(su["series"]) == 1, "用户统计曲线按天 1 个点")
+        # 曲线按「本地日」分桶：这个用户的种子数据散布在 now .. now-360（LLM 3 条 + 指令 7 条），
+        # 刚过午夜时靠后的几条属于「昨天」，桶数就是 2。按实际跨的天数断言（写死 1 会在
+        # 每天 00:00-00:06 假红 —— 这坑真踩过一次）。
+        days = {time.strftime("%Y-%m-%d", time.localtime(now - d)) for d in range(0, 420, 60)}
+        check(len(su["series"]) == len(days),
+              f"用户统计曲线按「本地日」分桶（实得 {len(su['series'])}，种子跨 {len(days)} 天）")
         sg = await st.subject_stats("group", "88888", now - 3600, now + 60)
         check(sg["totals"]["events"] == 1 and sg["totals"]["denied"] == 1, "群统计：1 个事件且为拒绝")
 

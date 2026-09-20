@@ -196,11 +196,11 @@
     "default": ""
   },
   "model_card_theme": {
-    "description": "卡片配色主题",
-    "hint": "indigo = 靛蓝（默认，冷静） / mint = 青绿 / sunset = 暖橙。改完让用户重新发一次 /切换模型 就能看到。",
+    "description": "卡片强调色主题",
+    "hint": "卡片是浅色底 + 单一强调色，这里只换强调色：indigo = 靛蓝（默认）/ teal = 青绿 / amber = 琥珀 / rose = 玫红。改完让用户重新发一次 /切换模型 就能看到。",
     "type": "string",
     "default": "indigo",
-    "options": ["indigo", "mint", "sunset"]
+    "options": ["indigo", "teal", "amber", "rose"]
   },
   "retention_days": {
     "description": "统计数据保留天数",

@@ -406,28 +406,22 @@ class ModelSwitcher:
                 plugin.provider_info(str(data["current_id"])).get("label")
                 or data["current_id"]
             )
-        # 头部只放「分组」这种短信息；模型名（供应商 · 模型）单独占一行并允许折行，
-        # 否则长名字必然被截断 —— 而那一行恰恰是用户最需要看全的。
-        subtitle = f"分组：{self.group_label(data)}"
-        info: list[dict[str, str]] = []
-        if current_label:
-            info.append({"label": "当前使用", "value": current_label})
+        # 当前模型放在**标题区**（字号最大、最多两行、不截断）—— 它是这张卡片的主角；
+        # 分组与今日用量合并成一行灰字，避免再开一块"信息条"把版面切碎。
+        meta_parts = [f"分组：{self.group_label(data)}"]
         today = data.get("today") or {}
         if today:
-            info.append(
-                {
-                    "label": "今日用量",
-                    "value": f"{_fmt_num(today.get('tokens'))} tokens · "
-                    f"{_as_int(today.get('calls'), 0)} 次对话",
-                }
+            meta_parts.append(
+                f"今日 {_fmt_num(today.get('tokens'))} tokens · "
+                f"{_as_int(today.get('calls'), 0)} 次对话"
             )
 
         return model_card.render_model_card(
             title="模型切换",
-            subtitle=subtitle,
+            current=current_label,
+            meta=" · ".join(meta_parts),
             rows=data.get("options") or [],
             footer=self.footer_of(data),
-            info=info,
             avatar=avatar,
             font_path=str(plugin._cfg("model_card_font", "") or ""),
             theme=str(plugin._cfg("model_card_theme", model_card.DEFAULT_THEME) or ""),
