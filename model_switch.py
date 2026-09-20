@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +56,10 @@ MAX_SESSIONS = 200
 # TTL 边界（配置值是秒）
 MIN_TTL = 10
 MAX_TTL = 600
+# 头像现抓的超时与「抓不到」的记忆时长（秒）：
+# 指令回执不能被头像拖住，离线环境也不该每次发指令都空等一遍超时。
+AVATAR_TIMEOUT = 3.0
+AVATAR_MISS_TTL = 600
 
 # 「当前使用」的来源文案
 SOURCE_CHOICE = "你自己切换的"
@@ -105,6 +110,8 @@ class ModelSwitcher:
         self._plugin = plugin
         # key = "umo|sender_id" → {"options": [...], "expire": ts, "scene": str}
         self._pending: dict[str, dict[str, Any]] = {}
+        # key = "group:88888" → 该头像「抓取失败」的到期时刻（见 avatar_for）
+        self._avatar_miss: dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # 配置 / 会话
@@ -299,7 +306,11 @@ class ModelSwitcher:
         """今日用量：私聊 = **这个人**、群聊 = **这个群**（与总览 / 列表页同口径）。
 
         用户看卡片时最常问的两件事是「我现在用的是哪个模型」和「今天用掉多少」，
-        所以顺手放进信息条。任何异常都返回空字典 —— 统计读不到不该影响切换。
+        所以顺手放进标题区那一行。
+
+        **查得到就一定有这一行，哪怕今天是 0** —— 第一版在 0 的时候把这一行藏了，
+        结果用户以为是功能没生效（"卡片上没看到今日 token 使用量"）。
+        只有**统计读不到**（旧库 / 查询失败 / 库没就绪）才返回空字典降级。
         """
         try:
             store = self._plugin.store
@@ -315,11 +326,10 @@ class ModelSwitcher:
                 kind, sid, int(start.timestamp()), int(now.timestamp())
             )
             totals = (stats or {}).get("totals") or {}
-            tokens = _as_int(totals.get("tok_total"), 0)
-            calls = _as_int(totals.get("calls"), 0)
-            if tokens <= 0 and calls <= 0:
-                return {}
-            return {"tokens": tokens, "calls": calls}
+            return {
+                "tokens": _as_int(totals.get("tok_total"), 0),
+                "calls": _as_int(totals.get("calls"), 0),
+            }
         except Exception as e:  # 统计失败绝不冒泡（卡片少一行，功能照常）
             logger.debug(f"[UserGateway] 读取今日用量失败（忽略）: {e}")
             return {}
@@ -387,18 +397,51 @@ class ModelSwitcher:
     # ------------------------------------------------------------------ #
     # 渲染
     # ------------------------------------------------------------------ #
+    async def avatar_for(self, subject: Subject) -> Optional[bytes]:
+        """卡片头像：**群里用群头像、私聊用对方头像**；取不到才退回插件 logo。
+
+        为什么群里必须用群头像：那张卡片讲的是「这个会话走哪个模型」，
+        而群聊的模型是按**群**定的（群等级）。挂发言人的头像会让人误以为
+        「这是我个人的设置」，而且群里每个人发一次指令就换个头像，很跳。
+        """
+        kind = "group" if str(subject.group_id or "") else "user"
+        tid = str(subject.group_id or subject.sender_id or "")
+        cache = getattr(self._plugin, "avatars", None)
+        if cache is None or not tid:
+            return _logo_bytes()
+        try:
+            data = cache.read_any(kind, tid)
+        except Exception:
+            data = None
+        if data:
+            return data
+
+        # 本地没缓存就现抓一次（抓完落盘，之后离线也有）。
+        # 抓取有超时、失败有短时记忆：指令回执不能因为头像把用户晾在那边，
+        # 离线环境也不该每发一次指令都空等一遍超时。
+        key = f"{kind}:{tid}"
+        now = time.time()
+        if float(self._avatar_miss.get(key, 0) or 0) > now:
+            return _logo_bytes()
+        try:
+            got = await asyncio.wait_for(cache.ensure(kind, [tid]), timeout=AVATAR_TIMEOUT)
+            data = next(iter((got or {}).values()), None)  # 只传了一个 id，取第一个值即可
+        except Exception:
+            data = None
+        if data:
+            self._avatar_miss.pop(key, None)
+            return data
+        self._avatar_miss[key] = now + AVATAR_MISS_TTL
+        if len(self._avatar_miss) > 200:  # 防御性清理，别长期攒着
+            self._avatar_miss = {
+                k: v for k, v in self._avatar_miss.items() if float(v or 0) > now
+            }
+        return _logo_bytes()
+
     async def build_card(self, subject: Subject, data: dict[str, Any]) -> Optional[bytes]:
         """渲染卡片；渲染不出来返回 None（调用方退回文本列表）。"""
         plugin = self._plugin
-        avatar = None
-        try:
-            cache = getattr(plugin, "avatars", None)
-            if cache is not None and str(subject.sender_id or ""):
-                avatar = cache.read_any("user", subject.sender_id)
-        except Exception:
-            avatar = None
-        if not avatar:
-            avatar = _logo_bytes()  # 头像是空位时用插件 logo 顶上，别留一块空白
+        avatar = await self.avatar_for(subject)
 
         current_label = ""
         if data.get("current_id"):

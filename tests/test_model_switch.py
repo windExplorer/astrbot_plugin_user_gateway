@@ -104,6 +104,33 @@ class ImageFontStub:
         return 10.0 * len(str(text or ""))
 
 
+class FakeAvatarCache:
+    """极简头像缓存桩：记录读 / 抓的调用，可配置「本地有没有」「抓不抓得到」。"""
+
+    def __init__(
+        self,
+        cached: dict[str, bytes] | None = None,
+        fetched: dict[str, bytes] | None = None,
+    ) -> None:
+        self.cached = dict(cached or {})
+        self.fetched = dict(fetched or {})
+        self.reads: list[tuple] = []
+        self.ensures: list[tuple] = []
+
+    def read_any(self, kind: str, tid: str):
+        self.reads.append((kind, tid))
+        return self.cached.get(f"{kind}:{tid}")
+
+    async def ensure(self, kind: str, ids, **_kw):
+        self.ensures.append((kind, tuple(str(i) for i in ids)))
+        out: dict[str, bytes] = {}
+        for i in ids:
+            got = self.fetched.get(f"{kind}:{i}")
+            if got:
+                out[str(i)] = got
+        return out
+
+
 class FakeProvider:
     def __init__(self, pid: str, name: str, model: str) -> None:
         self.provider_config = {"id": pid, "name": name}
@@ -657,16 +684,18 @@ async def main() -> int:
     ro_data = dict(fake, can_switch=False, readonly_reason=MS.REASON_GROUP_ONLY_ADMIN)
     check(MS.REASON_GROUP_ONLY_ADMIN in sw9.text_list(ro_data, 60), "群聊拒绝的原因文案可复用")
 
-    print("\n[14] 今日用量（信息条）")
+    print("\n[14] 今日用量")
     sw9._plugin.store.stats = None
     check(await sw9.today_of(subject()) == {}, "统计读不到 → 空字典（不抛异常、不影响切换）")
     sw9._plugin.store.stats = {"tok_total": 12345, "calls": 8}
     today = await sw9.today_of(subject())
     check(today == {"tokens": 12345, "calls": 8}, f"今日用量（实得 {today}）")
     sw9._plugin.store.stats = {"tok_total": 0, "calls": 0}
-    check(await sw9.today_of(subject()) == {}, "今天完全没用过 → 不显示这一行（不写「0 tokens」）")
+    check(await sw9.today_of(subject()) == {"tokens": 0, "calls": 0},
+          "今天没用过也要给 0（藏起来会让用户以为功能没生效）")
     sw9._plugin.store.stats = {"tok_total": "2_500_000.0", "calls": None}
-    check(await sw9.today_of(subject()) == {}, "脏值不会炸（宽松转 int 失败即视为 0）")
+    check(await sw9.today_of(subject()) == {"tokens": 0, "calls": 0},
+          "脏值不会炸（宽松转 int 失败即视为 0）")
     check(MS._fmt_num(999) == "999" and MS._fmt_num(1200) == "1.2K" and MS._fmt_num(2_500_000) == "2.50M",
           "数字按控制台口径缩写")
 
@@ -744,6 +773,47 @@ async def main() -> int:
     check(len(wrapped) == 2 and wrapped[-1].endswith("…"),
           f"折行工具：超出上限时末行收省略号（实得 {wrapped}）")
     check(model_card._wrap("", ImageFontStub(), 40, max_lines=2) == [], "折行工具：空文本 → 空列表")
+
+    print("\n[16] 卡片头像：群里用群头像、私聊用对方头像")
+    user_png = b"user-avatar-bytes"
+    group_png = b"group-avatar-bytes"
+    cache = FakeAvatarCache({"user:10001": user_png, "group:88888": group_png})
+    sw9._plugin.avatars = cache
+    check(await sw9.avatar_for(subject()) == user_png, "私聊用对方头像")
+    check(cache.reads[-1] == ("user", "10001"), "私聊读的是 user:10001")
+    check(await sw9.avatar_for(subject(group="88888")) == group_png, "群聊用**群头像**")
+    check(cache.reads[-1] == ("group", "88888"), "群聊读的是 group:88888（不是发言人的）")
+    check(cache.ensures == [], "有缓存时不发起抓取")
+
+    # 本地没缓存 → 现抓一次并落盘（ensure 会写盘），之后不再抓
+    fresh = FakeAvatarCache(fetched={"group:88888": group_png})
+    sw9._plugin.avatars = fresh
+    check(await sw9.avatar_for(subject(group="88888")) == group_png, "没缓存时现抓群头像")
+    check(fresh.ensures == [("group", ("88888",))], "抓取只针对群号")
+    # 抓不到 → 退回插件 logo（非空），且短时间内不再重试（别让指令回执空等）
+    miss = FakeAvatarCache()
+    sw9._plugin.avatars = miss
+    logo = await sw9.avatar_for(subject(group="77777"))
+    check(bool(logo) and logo != group_png, "抓不到 → 用插件 logo 顶上（不留空位）")
+    check(len(miss.ensures) == 1, "第一次抓不到会重试一次记录")
+    await sw9.avatar_for(subject(group="77777"))
+    check(len(miss.ensures) == 1, "短时间内不再重试（负缓存生效）")
+    sw9._avatar_miss.clear()
+    sw9._plugin.avatars = None
+    check(bool(await sw9.avatar_for(subject(group="88888"))), "没有头像缓存对象也能出图（退回 logo）")
+    # build_card 走的就是这条路径（真渲染一遍，确认不会因为头像抛异常）
+    sw9._plugin.avatars = cache
+    sw9._plugin.store.stats = {"tok_total": 1, "calls": 1}
+    sw9._plugin._rules_obj = rules(
+        subject_level={"user": {"10001": 1}, "group": {"88888": 2}},
+        level_switch={2: ("p-a", "p-b")},
+        level_switch_enabled={2: True},
+        level_model={2: {"provider_id": "p-a", "fallback_provider_id": "p-b"}},
+    )
+    gdata = await sw9.describe(subject(group="88888"))
+    png_card = await sw9.build_card(subject(group="88888"), gdata)
+    check(bool(png_card) and png_card[:8] == b"\x89PNG\r\n\x1a\n", "群聊卡片能正常渲染")
+    check(cache.reads[-1] == ("group", "88888"), "群聊卡片用的仍是群头像")
 
     print()
     if _failures:
