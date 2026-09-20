@@ -345,6 +345,8 @@ export interface LevelRow {
   /** 模型路由：主提供商 id / 备用提供商 id（一项 = 一个「提供商 · 模型」） */
   provider_id: string;
   fallback_provider_id: string;
+  /** 允许该等级的用户用 /切换模型 自助挑选的模型名单（空数组 = 不开放） */
+  switch_providers: string[];
   members: number;
   quotas: Record<string, { limit_tokens: number; mode: string; reset_at: number | null }>;
 }
@@ -362,6 +364,8 @@ export interface LevelPayload {
   sort_order?: number;
   provider_id?: string;
   fallback_provider_id?: string;
+  /** 可切换模型名单（缺省 = 沿用原值；传空数组 = 关闭该等级的自助切换） */
+  switch_providers?: string[];
   quotas?: { period: string; limit_tokens: number | null; mode?: string; delete?: boolean }[];
 }
 
@@ -391,6 +395,10 @@ export interface ModelRoute {
   reason?: string;
   available?: string[];
   circuit_open?: string[];
+  /** 好友**自己**用 /切换模型 选的模型（优先级最高；空 = 没切过，仅 type=user 时有意义） */
+  model_choice?: string;
+  model_choice_private?: string;
+  model_choice_group?: string;
 }
 
 export interface SubjectTotals {
@@ -574,6 +582,19 @@ export function apiSetSubjectModel(scopeId: string, providerId: string) {
     scope_id: scopeId,
     provider_id: providerId,
   });
+}
+
+/** 清空 / 指定某个好友**自己用 /切换模型 选的**模型（providerId 为空 = 清除他的选择）。
+ *  这是管理员兜底入口：用户自己钉了一个已下线的模型时，可以在这里帮他退回默认。 */
+export function apiSetSubjectModelChoice(
+  scopeId: string,
+  providerId: string,
+  scene: "private" | "group" = "private",
+) {
+  return apiPost<{ scope_id: string; scene: string; provider_id: string }>(
+    "/subject/model-choice",
+    { scope_id: scopeId, provider_id: providerId, scene },
+  );
 }
 
 /** 批量取头像（返回 data URI 映射；只请求需要的 id，失败的不出现）。 */

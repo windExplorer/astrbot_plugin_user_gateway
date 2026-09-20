@@ -27,7 +27,7 @@ from typing import Any, Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter as astr_filter
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 
 try:  # 钩子类型仅用于注解；缺失不影响运行
@@ -41,6 +41,42 @@ _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
+
+def _reload_sibling_modules() -> None:
+    """热更新时强制重载本插件的同级模块（必须在下面的 ``from .x import y`` 之前执行）。
+
+    为什么需要：AstrBot 的热更新（watchfiles）只重载插件主模块 ``main.py``，**不会**级联重载
+    依赖模块。从已装的旧版本热更上来时，``sys.modules`` 里还是上一次加载的 store / gate，
+    下面那些 ``from .store import Store`` 拿到的仍旧是旧代码，表现是「新功能静默不生效」
+    —— 最典型的就是 store 的新迁移不跑、新加的列写不进去（配置界面存了、闸门却不认）。
+
+    这里先把**已经加载过**的同级模块 reload 一遍，再让下面的 import 绑定到新代码上。
+    全新启动时这些模块还没进 ``sys.modules``，循环自然是空转，不影响冷启动。
+    """
+    import importlib
+
+    # 按依赖顺序（被依赖者在前）：gate / store 是底座，webui_api 依赖它们。
+    for name in (
+        "quota",
+        "gate",
+        "store",
+        "avatar",
+        "sync",
+        "model_card",
+        "model_switch",
+        "webui_api",
+    ):
+        full = f"{__package__}.{name}" if __package__ else name
+        if full not in sys.modules:
+            continue
+        try:
+            importlib.reload(sys.modules[full])
+        except Exception as e:
+            logger.warning(f"[UserGateway] 同级模块 {name} 强制重载失败（沿用已加载的旧代码）: {e}")
+
+
+_reload_sibling_modules()
+
 try:  # 包内相对导入（AstrBot 正常加载路径）
     from . import quota as quota_mod
     from .avatar import AvatarCache
@@ -53,12 +89,15 @@ try:  # 包内相对导入（AstrBot 正常加载路径）
         effect_in_scene,
         layer_label,
     )
+    from .model_switch import ModelSwitcher
     from .store import (
         COMMAND_MASTER_FEATURE,
+        MODEL_CHOICE_FEATURE,
         MODEL_FEATURE,
         Store,
         member_scope_id,
         parse_member_scope_id,
+        parse_provider_list,
     )
     from .sync import SyncScheduler
     from .webui_api import register_apis
@@ -80,12 +119,15 @@ except ImportError as _rel_err:
             effect_in_scene,
             layer_label,
         )
+        from model_switch import ModelSwitcher  # type: ignore
         from store import (  # type: ignore
             COMMAND_MASTER_FEATURE,
+            MODEL_CHOICE_FEATURE,
             MODEL_FEATURE,
             Store,
             member_scope_id,
             parse_member_scope_id,
+            parse_provider_list,
         )
         from sync import SyncScheduler  # type: ignore
         from webui_api import register_apis  # type: ignore
@@ -93,8 +135,8 @@ except ImportError as _rel_err:
         raise ImportError(
             "萌萌权限控制台：子模块导入失败。"
             f"相对导入报错 {_rel_err!r}；平铺导入报错 {_flat_err!r}。"
-            "若报错是 No module named 'gate' / 'quota' / 'sync' / 'avatar'，说明**安装包少了文件**"
-            "（打包脚本 build_zip.ps1 的 $includeList 未同步新增模块），"
+            "若报错是 No module named 'gate' / 'quota' / 'sync' / 'avatar' / 'model_switch' / 'model_card'，"
+            "说明**安装包少了文件**（打包脚本 build_zip.ps1 的 $includeList 未同步新增模块），"
             "请用仓库里最新的 zip 重新安装，或把缺失的 .py 补进插件目录。"
         ) from _flat_err
 
@@ -151,8 +193,13 @@ class UserGatewayPlugin(Star):
         # 好友的群聊专属等级（v8）+ 好友专属模型（feature=model，仅私聊生效）
         self._subject_level_user_group: dict[str, int] = {}
         self._subject_model: dict[str, str] = {}
+        # 用户自己用 /切换模型 选的模型：{uin: {scene: provider_id}}（v9，feature=model_choice）
+        # 优先级最高（切了不生效等于没切），高于好友专属模型与等级模型路由。
+        self._model_choice: dict[str, dict[str, str]] = {}
         # 等级模型路由：{level_id: {provider_id, fallback_provider_id}}
         self._level_route: dict[int, dict[str, str]] = {}
+        # 等级允许用户自助切换的模型名单：{level_id: (provider_id, ...)}（v9）
+        self._level_switch: dict[int, tuple[str, ...]] = {}
         # 限额规则：{scope_type(user|group|level|global): {scope_id: {period: row}}}
         self._limits: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
         # 用量计数：{scope_type(user|group|member): {scope_id: {period: row}}}
@@ -180,6 +227,8 @@ class UserGatewayPlugin(Star):
         )
         self._last_route: dict[str, dict[str, Any]] = {}
         self.scheduler = SyncScheduler(self)
+        # M12：用户自助切换模型（/切换模型 + 回序号），状态全在内存（见 model_switch.py）
+        self.switcher = ModelSwitcher(self)
         # 会话 → 本次 LLM 请求的起始信息（用于估算 token 与统计延迟）
         self._inflight: dict[str, dict[str, Any]] = {}
         self._maintenance_task: Optional[asyncio.Task] = None
@@ -357,6 +406,13 @@ class UserGatewayPlugin(Star):
                 }
                 for lv in levels
             }
+            # 等级允许用户自助切换的模型名单（v9）：只留非空的等级，省得后面每次判空
+            self._level_switch = {
+                int(lv["id"]): tuple(got)
+                for lv in levels
+                for got in [parse_provider_list(lv.get("switch_providers"))]
+                if got
+            }
             self._subject_level_user = await self.store.subject_level_map("user")
             self._subject_level_group = await self.store.subject_level_map("group")
             # 好友的「群聊专属」等级（v8：私聊等级与群聊等级分开配）
@@ -370,6 +426,10 @@ class UserGatewayPlugin(Star):
                 for pid in [next(iter(row.values()), "") if row else ""]
                 if pid
             }
+            # 用户自己切换的模型（feature=model_choice，按场景分开；群/私聊互不影响）
+            self._model_choice = await self.store.effect_map(
+                "user", feature=MODEL_CHOICE_FEATURE
+            )
 
             def _by_scope(rows: list[dict]) -> dict[str, dict[str, dict[str, Any]]]:
                 out: dict[str, dict[str, dict[str, Any]]] = {}
@@ -432,6 +492,7 @@ class UserGatewayPlugin(Star):
                 "member": self._usage_member,
             },
             level_model=self._level_route,
+            level_switch=self._level_switch,
             command_policy=self._cmd_policy,
             command_master=self._cmd_master,
             level_command_effect=self._level_cmd_effect,
@@ -442,17 +503,67 @@ class UserGatewayPlugin(Star):
     # ------------------------------------------------------------------ #
     # M3：按等级路由模型（主提供商 + 备用提供商）
     # ------------------------------------------------------------------ #
-    def provider_ids(self) -> set[str]:
-        """当前**已加载可用**的对话提供商 id 集合。"""
-        out: set[str] = set()
+    def provider_map(self) -> dict[str, dict[str, Any]]:
+        """当前**已加载**的对话提供商 ``{id: {id, name, model, label, type, modalities}}``。
+
+        展示名口径全插件统一：「供应商 · 模型」（AstrBot 里一个提供商就绑定一个模型）。
+        刻意**不用 ``type`` 退化**（``openai_chat_completion`` 这种名字对用户毫无意义）。
+        控制台下拉、/切换模型 卡片都走这一份，避免两处标签不一致。
+        """
+        out: dict[str, dict[str, Any]] = {}
         try:
             for p in self.context.get_all_providers() or []:
-                pid = str((getattr(p, "provider_config", {}) or {}).get("id") or "")
-                if pid:
-                    out.add(pid)
+                cfg = getattr(p, "provider_config", {}) or {}
+                pid = str(cfg.get("id") or "")
+                if not pid:
+                    continue
+                name = str(
+                    cfg.get("provider_source_id") or cfg.get("name") or cfg.get("provider") or pid
+                )
+                try:
+                    model = str(p.get_model() or "")
+                except Exception:
+                    model = ""
+                if not model:
+                    model = str(cfg.get("model") or cfg.get("default_model") or "")
+                if name and model and name != model:
+                    label = f"{name} · {model}"
+                else:
+                    label = name or model or pid
+                out[pid] = {
+                    "id": pid,
+                    "name": name,
+                    "model": model,
+                    "label": label,
+                    "type": str(cfg.get("type") or cfg.get("provider_type") or ""),
+                    "modalities": list(cfg.get("modalities") or []),
+                }
         except Exception as e:
             logger.debug(f"[UserGateway] 读取提供商列表失败（忽略）: {e}")
         return out
+
+    def provider_info(self, pid: str) -> dict[str, Any]:
+        """单个提供商的展示信息。
+
+        未加载的提供商退化为「id 当名字」——它可能只是暂时没加载，
+        卡片 / 列表会另外标「暂不可用」，这里不编造名字。
+        """
+        want = str(pid or "")
+        got = self.provider_map().get(want)
+        if got:
+            return got
+        return {
+            "id": want,
+            "name": want,
+            "model": "",
+            "label": want or "(未配置)",
+            "type": "",
+            "modalities": [],
+        }
+
+    def provider_ids(self) -> set[str]:
+        """当前**已加载可用**的对话提供商 id 集合。"""
+        return set(self.provider_map())
 
     def _provider_by_id(self, pid: str) -> Optional[Any]:
         """按 id 从已加载的提供商里找对象（找不到返回 None）。"""
@@ -486,28 +597,64 @@ class UserGatewayPlugin(Star):
                 return
             subject = self._subject_of(event)
             self._last_route.pop(subject.umo, None)
+            debug = self._cfg("debug_log", False)
+            # 本会话的场景：群里按群聊场景取「用户自己的选择」，与私聊那份分开
+            scene = "group" if str(subject.group_id or "") else "private"
+            sender = str(subject.sender_id or "")
+            available = self.provider_ids() - self.circuit.open_ids()
+
+            def use(
+                pid: str,
+                label: str,
+                layer: str,
+                used_fallback: bool = False,
+                **extra: Any,
+            ) -> bool:
+                """把某提供商下发给本次请求（不可用则不干预）并记下归因。"""
+                if not pid or pid not in available:
+                    return False
+                event.set_extra("selected_provider", pid)
+                if len(self._last_route) > 2000:  # 防御性清理
+                    self._last_route.clear()
+                # 把实际下发的提供商与它的模型名一起存下来：用量记录要记「真的用了谁」，
+                # 而不是 get_using_provider_async 返回的会话默认（按次下发不改会话默认）
+                prov = self._provider_by_id(pid)
+                self._last_route[subject.umo] = {
+                    **extra,
+                    "provider_id": pid,
+                    "model": str(prov.get_model() or "") if prov is not None else "",
+                    "used_fallback": bool(used_fallback),
+                    "label": label,
+                    "layer": layer,
+                }
+                if debug:
+                    logger.info(
+                        f"[UserGateway] 模型路由：{subject.umo} → {pid}"
+                        f"{'（备用）' if used_fallback else ''}｜来源 {label}"
+                    )
+                return True
+
+            # ⓪ 用户自己用 /切换模型 选的（v9）：优先级最高。
+            # 为什么不放在专属模型后面：用户刚亲手切过，再被配置按回去等于「切了没反应」；
+            # 而「专属模型」在卡片里是**候选之一**（带「专属模型」标签），随时能切回来。
+            choice = (
+                effect_in_scene(self._model_choice.get(sender), scene).strip() if sender else ""
+            )
+            if choice:
+                if use(choice, "用户切换", "model_choice"):
+                    return
+                if debug:
+                    logger.info(
+                        f"[UserGateway] 用户选的模型 {choice} 当前不可用，回落配置｜{subject.umo}"
+                    )
 
             # ① 好友专属模型（feature=model，仅私聊生效；优先级高于等级路由）
             if not str(subject.group_id or ""):
-                override = (self._subject_model.get(str(subject.sender_id or "")) or "").strip()
+                override = (self._subject_model.get(sender) or "").strip()
                 if override:
-                    available = self.provider_ids() - self.circuit.open_ids()
-                    if override in available:
-                        event.set_extra("selected_provider", override)
-                        prov = self._provider_by_id(override)
-                        self._last_route[subject.umo] = {
-                            "provider_id": override,
-                            "model": str(prov.get_model() or "") if prov is not None else "",
-                            "used_fallback": False,
-                            "label": "好友专属",
-                            "layer": "subject_model",
-                        }
-                        if self._cfg("debug_log", False):
-                            logger.info(
-                                f"[UserGateway] 模型路由：{subject.umo} → {override}（好友专属）"
-                            )
+                    if use(override, "好友专属", "subject_model"):
                         return
-                    if self._cfg("debug_log", False):
+                    if debug:
                         logger.info(
                             f"[UserGateway] 好友专属模型 {override} 当前不可用，回落等级路由｜{subject.umo}"
                         )
@@ -516,29 +663,22 @@ class UserGatewayPlugin(Star):
             route = self.gate.resolve_model(subject, self._rules())
             if not route:
                 return
-            available = self.provider_ids() - self.circuit.open_ids()
             picked = self.gate.pick_provider(route, available)
             if not picked:
-                if self._cfg("debug_log", False):
+                if debug:
                     logger.info(
                         f"[UserGateway] 模型路由：{route['label']} 配的提供商当前不可用，"
                         f"本次不干预（走 AstrBot 默认模型）｜{subject.umo}"
                     )
                 return
-            event.set_extra("selected_provider", picked["provider_id"])
-            if len(self._last_route) > 2000:  # 防御性清理
-                self._last_route.clear()
-            # 把实际下发的提供商与它的模型名一起存下来：用量记录要记「真的用了谁」，
-            # 而不是 get_using_provider_async 返回的会话默认（按次下发不改会话默认）
-            prov = self._provider_by_id(picked["provider_id"])
-            model_name = str(prov.get_model() or "") if prov is not None else ""
-            self._last_route[subject.umo] = {**route, **picked, "model": model_name}
-            if self._cfg("debug_log", False):
-                logger.info(
-                    f"[UserGateway] 模型路由：{subject.umo} → {picked['provider_id']}"
-                    f"{'（备用）' if picked['used_fallback'] else ''}"
-                    f"｜来源 {route['label']}"
-                )
+            use(
+                str(picked["provider_id"]),
+                str(route.get("label") or ""),
+                str(route.get("layer") or ""),
+                bool(picked.get("used_fallback")),
+                level_id=route.get("level_id"),
+                fallback_provider_id=route.get("fallback_provider_id"),
+            )
         except Exception:
             # 路由失败绝不能影响对话：静默放行，交给 AstrBot 自己的默认逻辑
             logger.exception("[UserGateway] 模型路由异常（忽略）")
@@ -886,6 +1026,51 @@ class UserGatewayPlugin(Star):
             )
 
     # ------------------------------------------------------------------ #
+    # M12：用户自助切换模型（/切换模型 + 回序号）
+    # ------------------------------------------------------------------ #
+    @astr_filter.command("切换模型", alias={"模型切换"})
+    async def cmd_switch_model(self, event: AstrMessageEvent, index: str = "") -> None:
+        """列出（或直接切换）**我自己**能用的模型。
+
+        - 不带参数：卡片列出「所在分组开放的模型 + 我的专属模型 + 当前生效的那个」，回序号即切换；
+        - 带序号（``/切换模型 2``）：直接切；``0`` = 恢复默认（跟随分组配置）。
+
+        为什么这是**用户向**指令、与「管控入口只有控制台」那条红线不冲突：
+        它只能改「自己用哪个模型」，动不了任何人的权限与额度；而且可选范围是管理员
+        在等级里圈定的名单（``switch_providers``），所以「放开自助切换」不等于「谁都能挑最贵的」。
+        """
+        try:
+            subject = self._subject_of(event)
+            await self.switcher.handle_command(self, event, subject, index)
+        except Exception:
+            logger.exception("[UserGateway] /切换模型 处理异常（忽略）")
+            await self._send(event, "切换模型失败，请稍后再试。")
+
+    @astr_filter.regex(r"^\s*\d{1,2}\s*$")
+    async def on_switch_index(self, event: AstrMessageEvent) -> None:
+        """把「纯数字」消息当作模型切换的序号。
+
+        为什么要单独一个正则处理器：用户看完卡片**只会回一个数字**，这条消息既没有唤醒前缀
+        也不是指令，只能靠正则接住。它做得很克制：
+
+        - 该会话**没有**待选列表 → 直接返回，不拦不答（正常的数字聊天完全不受影响）；
+        - 有 → 切换、回执、``stop_event()``（否则那个数字还会被送进 LLM，用户会看到两段回复）。
+
+        注意：正则过滤器不受唤醒前缀约束（``RegexFilter``），所以群里任何人发数字都会进来一次；
+        但会话键带了发言人 + TTL，别人发的数字不会误触发、也不会顶掉你的选择。
+        """
+        try:
+            if not self.switcher.enabled():
+                return
+            if not (self.store and self.store.ready):
+                return
+            subject = self._subject_of(event)
+            if await self.switcher.handle_index(self, event, subject):
+                event.stop_event()
+        except Exception:
+            logger.exception("[UserGateway] 模型切换序号处理异常（忽略）")
+
+    # ------------------------------------------------------------------ #
     # 闸门辅助
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -1133,6 +1318,12 @@ class UserGatewayPlugin(Star):
             out["subject_model"] = (
                 (self._subject_model.get(str(scope_id)) or "") if scope_type == "user" else ""
             )
+            # 用户自己用 /切换模型 选的（v9）：**优先级高于上面两个**，
+            # 控制台要能看见它，否则会出现「界面上写等级模型、实际走另一个」的悬案。
+            choices = (self._model_choice.get(str(scope_id)) or {}) if scope_type == "user" else {}
+            out["model_choice_private"] = str(choices.get("private") or "")
+            out["model_choice_group"] = str(choices.get("group") or "")
+            out["model_choice"] = out["model_choice_private"]
             return out
         except Exception as e:
             logger.debug(f"[UserGateway] 解析模型路由失败（忽略）: {e}")
@@ -1440,6 +1631,24 @@ class UserGatewayPlugin(Star):
             await event.send(MessageChain([Plain(str(text))]))
         except Exception as e:
             logger.warning(f"[UserGateway] 发送提示失败（忽略）: {e}")
+
+    @staticmethod
+    async def _send_image(event: AstrMessageEvent, png: bytes) -> bool:
+        """直发一张图片（同样必须直发）。
+
+        走 ``Image.fromBytes``（``base64://``）：不落盘、不需要清理临时文件；
+        aiocqhttp 适配器本来也会把图片统一转成 base64 再发（见
+        ``aiocqhttp_message_event._from_segment_to_dict``）。
+
+        Returns:
+            True = 发送成功（失败时调用方可以退回文本列表，别让用户什么都收不到）。
+        """
+        try:
+            await event.send(MessageChain([Image.fromBytes(png)]))
+            return True
+        except Exception as e:
+            logger.warning(f"[UserGateway] 发送图片失败（退回文本）: {e}")
+            return False
 
     async def _notify_admins(self, text: str, platform_id: str) -> None:
         """给全局配置里的管理员发私聊通知（best-effort，失败只记日志）。

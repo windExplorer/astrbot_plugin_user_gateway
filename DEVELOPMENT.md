@@ -16,6 +16,9 @@ uv run --no-project --with aiosqlite python tests/test_store.py
 # 判定内核自检（同上）
 uv run --no-project python tests/test_gate.py
 
+# /切换模型 自检（名单组装 / 序号切换 / 卡片渲染）
+uv run --no-project --with aiosqlite --with pillow python tests/test_model_switch.py
+
 # 打包（要求 pages/permission-console/ 已构建；同名版本会拒绝覆盖，需先升版本）
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_zip.ps1
 ```
@@ -25,7 +28,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build_zip.ps1
 1. **fail-open**：本插件任何异常（判定出错 / 数据库打不开 / 配置损坏）都必须放行消息，
    绝不能把用户消息吞掉。
 2. **判定走内存**：闸门热路径只读内存缓存，写操作后统一 `reload_rules()` 重建。
-3. **不注册聊天管理指令**：管控入口只有控制台，避免「权限插件的指令自己也需要权限」的循环问题。
+3. **聊天管理指令仍然不该有**：管控入口只有控制台，避免「权限插件的指令自己也需要权限」的循环问题。
+   唯一的例外是 **`/切换模型`（M12）**：它是**用户向**的自助指令——只能改「自己用哪个模型」，
+   动不了任何人的权限与额度，且可选范围是管理员在等级里圈定的名单；
+   这类指令可以直接注册（它照常受指令权限管辖，被禁的用户用不了，语义上是对的）。
 
 ## 目录结构
 
@@ -37,9 +43,12 @@ astrbot_plugin_user_gateway/
 ├── store.py             # SQLite 持久层（规则 / 等级 / 限额 / 用量 / 缓存 / 最后消息）
 ├── sync.py              # 好友 / 群列表同步（OneBot）+ 定时调度
 ├── avatar.py            # QQ / 群头像抓取与磁盘缓存
+├── model_switch.py      # /切换模型：可选名单组装、序号会话、按场景落库（M12）
+├── model_card.py        # 卡片渲染（Pillow，画不出来就返回 None 让调用方走文本兜底）
 ├── webui_api.py         # 控制台后端路由（AstrBot 桥接信封）
 ├── _conf_schema.json    # 配置项定义（唯一来源）
 ├── metadata.yaml        # 插件元数据（版本号唯一来源）
+├── assets/fonts/        # 卡片用的中文字体（OFL 授权，随包发布）
 ├── pages/permission-console/   # 前端构建产物（进 git，打包依赖）
 ├── webui-src/           # 前端源码（Vue3 + TS + Naive UI + ECharts）
 ├── tests/               # 自检脚本（纯逻辑，不需要 AstrBot 环境）
@@ -49,11 +58,14 @@ astrbot_plugin_user_gateway/
 
 ### 新增顶层模块 / 根目录资源时
 
-必须同步做两件事，否则发布包会静默缺文件：
+必须同步做三件事，否则发布包会静默缺文件、或热更新后跑的还是旧代码：
 
 1. 加入 `build_zip.ps1` 的 `$includeList`（**不止 .py**：根目录的 `logo.png`
    这类资源也要加——v1.0.11 就漏了它，导致插件列表不显示图标）；
-2. 若该模块需要在插件热更新时生效，确认它被重新导入（见主 `main.py` 的导入区）。
+2. 加入 `main.py` 顶部 `_reload_sibling_modules()` 的模块名单（v1.3.3 起）：
+   AstrBot 热更新只重载 `main.py`，不会级联重载依赖模块，漏了的话
+   **用户那边会一直是旧代码**（最隐蔽的一种：新迁移不跑、新列写不进库）；
+3. 级别自检里加一条断言（见 `tests/`），不要只靠肉眼。
 
 ### 前端构建约束（勿改）
 
@@ -72,7 +84,11 @@ astrbot_plugin_user_gateway/
 - `usage_log` 是统计与明细的唯一事实来源：被拒的请求也写一条（`status='denied'`）；
 - **额度与用量分离**：`llm_quota` 只存限额规则，用量在 `usage_counter`（三个记账维度：
   `user` / `group` / `member`，成员维度键为 `群号:QQ`）；
-- schema 版本存在 `settings` 表，历史 v1 → v7 均有可重入迁移脚本。
+- schema 版本存在 `settings` 表（当前 **v9**），历史 v1 → v9 均有可重入迁移脚本；
+- **模型类配置分两把键**（v9，勿合并）：`policy.feature='model'` 是**管理员**给某人钉的专属模型
+  （私聊生效）；`feature='model_choice'` 是**用户自己**用 `/切换模型` 选的（按场景分开存）。
+  两者混在一把键里就无法回答「这个模型是管理员钉的还是他自己挑的」，控制台也没法分开展示；
+  导入时必须放行这两个 feature 且**不能过 `_norm_effect`**（effect 存的是提供商 id）。
 
 ## 已知边界（结构性限制）
 
@@ -100,5 +116,24 @@ astrbot_plugin_user_gateway/
 | M10 | 规则导出 / 导入（等级 id 重映射） | v0.11.0 |
 | M11 | 指令 × 对象矩阵（对象体检） | v0.12.0 |
 | 1.0.0 | 发布评审：两处 Critical 修复、导入原子化、批量写两遍校验 | v1.0.0 |
+| M12 | 用户自助切换模型（`/切换模型` + Pillow 卡片 + 等级可切换名单） | v1.3.3 |
 
 后续维护版本（v1.0.1 起）见 CHANGELOG。
+
+### M12 的几个实现要点（改动前先读）
+
+- **优先级**：用户自己的选择 > 好友专属模型（仅私聊）> 等级主 / 备用模型 > AstrBot 默认。
+  用户在 `route_model` 里是最先被检查的一层；「专属模型」在卡片里是**候选之一**（带标签），
+  不是锁——否则他切了也不生效，指令就没意义了。
+- **名单口径**：私聊按**好友等级**、群聊按**群等级**（与模型路由同源，见 `Gate.model_level_of`）；
+  候选 =「等级的可切换名单 + 他自己的专属模型 + 当前生效的那个」，序号顺序稳定（按配置顺序），
+  否则用户看到的 3 号下次就变成别的模型了。
+- **群里的选择是「按人」的**：存在 `(user, scene='group')` 上，只影响他自己发出的请求，
+  不会把整个群切走（群上下文共用同一个 umo，把群切了会波及所有人）。
+- **序号会话**：键是 `umo + 发言人`、TTL 默认 60 秒（`model_switch_timeout_sec`）。
+  正则处理器（`^\s*\d{1,2}\s*$`）**不受唤醒前缀约束**，所以群里任何数字都会进来一次——
+  没有待选会话时必须原样放行（不拦不答），有则切换并 `stop_event()`
+  （否则数字还会被当聊天内容送给模型，用户收到两段回复）。
+- **卡片渲染是「尽力而为」**：`model_card.render_model_card()` 任何失败都返回 `None`，
+  调用方退化成纯文本列表；字体按「配置 → 插件自带 `assets/fonts` → 系统字体」找，
+  全都没有才退化。绝不允许「一张图渲染失败」把用户的指令吃掉。

@@ -177,6 +177,24 @@
     "type": "int",
     "default": 300
   },
+  "model_switch_enabled": {
+    "description": "允许用户自助切换模型",
+    "hint": "开启后，用户可发「/切换模型」查看并切换自己用的模型；可选范围 = 他所在等级里配置的「可切换模型」名单（限额 → 等级管理），外加他自己的专属模型。关闭则指令静默失效。",
+    "type": "bool",
+    "default": true
+  },
+  "model_switch_timeout_sec": {
+    "description": "切换选择的等待时长（秒）",
+    "hint": "用户看完卡片后回序号的等待时间，超时需重新发送指令。默认 60；范围 10 - 600。",
+    "type": "int",
+    "default": 60
+  },
+  "model_card_font": {
+    "description": "卡片字体文件路径（可选）",
+    "hint": "留空 = 自动：优先用插件自带的中文字体（assets/fonts），找不到再找系统字体（Windows 微软雅黑 / Linux Noto CJK 等）。全都找不到时不发图片，改为纯文本列表。",
+    "type": "string",
+    "default": ""
+  },
   "retention_days": {
     "description": "统计数据保留天数",
     "hint": "超过该天数的用量明细会自动清理。默认 180 天；设 0 表示永久保留（数据量大时注意磁盘占用）。",

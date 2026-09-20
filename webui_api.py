@@ -35,14 +35,18 @@ except Exception:  # pragma: no cover - 仅本地静态检查时缺失
     request = None  # type: ignore
 
 try:  # 与 main.py 同样的双形态导入（包内正常加载 / 平铺调试）
+    from . import model_card
     from .gate import effect_in_scene
-    from .store import MODEL_FEATURE, SCHEMA_VERSION as STORE_SCHEMA_VERSION
-    from .store import member_scope_id, parse_member_scope_id
+    from .store import MODEL_CHOICE_FEATURE, MODEL_FEATURE
+    from .store import SCHEMA_VERSION as STORE_SCHEMA_VERSION
+    from .store import member_scope_id, parse_member_scope_id, parse_provider_list
     from .sync import sync_group_members
 except ImportError:  # pragma: no cover - 本地平铺调试
+    import model_card  # type: ignore
     from gate import effect_in_scene  # type: ignore
-    from store import MODEL_FEATURE, SCHEMA_VERSION as STORE_SCHEMA_VERSION  # type: ignore
-    from store import member_scope_id, parse_member_scope_id  # type: ignore
+    from store import MODEL_CHOICE_FEATURE, MODEL_FEATURE  # type: ignore
+    from store import SCHEMA_VERSION as STORE_SCHEMA_VERSION  # type: ignore
+    from store import member_scope_id, parse_member_scope_id, parse_provider_list  # type: ignore
     from sync import sync_group_members  # type: ignore
 
 ROUTE_PREFIX = "/astrbot_plugin_user_gateway"
@@ -351,6 +355,16 @@ async def h_ping(plugin) -> dict:
                 "levels": len(getattr(plugin, "_level_route", {}) or {}),
                 "routed_sessions": len(getattr(plugin, "_last_route", {}) or {}),
                 "circuit": (plugin.circuit.snapshot() if getattr(plugin, "circuit", None) else {}),
+            },
+            # 用户自助切换模型（v9）：开关、开放该功能的分组数、卡片字体是否就位
+            "model_switch": {
+                "enabled": bool(plugin._cfg("model_switch_enabled", True)),
+                "open_levels": len(getattr(plugin, "_level_switch", {}) or {}),
+                "switched_users": len(getattr(plugin, "_model_choice", {}) or {}),
+                "sessions": (
+                    plugin.switcher.sessions() if getattr(plugin, "switcher", None) else 0
+                ),
+                "card": model_card.assets_info(),
             },
         },
     )
@@ -1264,6 +1278,8 @@ async def h_levels(plugin) -> dict:
                 "command_effect_group": str(lv.get("command_effect_group") or "inherit"),
                 "provider_id": str(lv.get("provider_id") or ""),
                 "fallback_provider_id": str(lv.get("fallback_provider_id") or ""),
+                # v9：允许该等级的用户用 /切换模型 自助挑选的模型名单（空 = 不开放）
+                "switch_providers": parse_provider_list(lv.get("switch_providers")),
                 "members": int(counts.get(lid, 0)),
                 "quotas": limits.get(str(lid), {}),
             },
@@ -1286,40 +1302,15 @@ async def h_providers(plugin) -> dict:
     except Exception:
         default_id = ""
 
-    items: list[dict] = []
+    # 展示名口径与 /切换模型 卡片共用 plugin.provider_map()（一处定义，避免两边标签不一致）
     try:
-        for p in plugin.context.get_all_providers() or []:
-            cfg = getattr(p, "provider_config", {}) or {}
-            pid = str(cfg.get("id") or "")
-            if not pid:
-                continue
-            # 供应商名取自提供商源/名称，**不能**退化成 type（openai_chat_completion 这类）
-            name = str(
-                cfg.get("provider_source_id") or cfg.get("name") or cfg.get("provider") or pid
-            )
-            try:
-                model = str(p.get_model() or "")
-            except Exception:
-                model = ""
-            if not model:
-                model = str(cfg.get("model") or cfg.get("default_model") or "")
-            if name and model and name != model:
-                label = f"{name} · {model}"
-            else:
-                label = name or model or pid
-            items.append(
-                {
-                    "id": pid,
-                    "name": name,
-                    "model": model,
-                    "label": label,
-                    "type": str(cfg.get("type") or cfg.get("provider_type") or ""),
-                    "modalities": list(cfg.get("modalities") or []),
-                    "is_default": bool(default_id and pid == default_id),
-                },
-            )
+        items = [
+            {**info, "is_default": bool(default_id and info["id"] == default_id)}
+            for info in plugin.provider_map().values()
+        ]
     except Exception as e:
         logger.warning(f"[UserGateway] 读取提供商列表失败: {e}")
+        items = []
 
     items.sort(key=lambda it: (not it["is_default"], it["label"]))
     circuit = getattr(plugin, "circuit", None)
@@ -1337,10 +1328,11 @@ async def h_set_level(plugin) -> dict:
     """新建 / 更新等级，并可同时写入该等级的额度模板。
 
     body: ``{id?, kind, name, description?, effect?, effect_command?, sort_order?,
-    provider_id?, fallback_provider_id?, quotas?: [{period, limit_tokens, mode?}]}``
+    provider_id?, fallback_provider_id?, switch_providers?, quotas?: [...]}``
 
     - ``effect``：等级默认 **LLM** 权限；``effect_command``：等级默认 **指令** 权限
       （``deny`` 即该等级不能用任何指令）；
+    - ``switch_providers``：该等级的用户能用 ``/切换模型`` 自助挑选的模型名单（v9，空 = 不开放）；
     - ``quotas`` 里 ``limit_tokens=0`` 表示「明确不限」，``null`` / ``delete=true`` 表示删掉该周期。
     """
     if not (plugin.store and plugin.store.ready):
@@ -1381,6 +1373,19 @@ async def h_set_level(plugin) -> dict:
         if not old:
             return err(f"等级 {level_id} 不存在")
 
+    # 可切换模型（v9）：只收「双向都存在」的提供商 id —— 不存在的 id 写进去用户也切不了
+    # （route_model 会因不可用而静默回落，用户只会觉得「切了没用」）。
+    raw_switch = body.get("switch_providers")
+    if raw_switch is None:
+        # 兼容：字段缺省时沿用原值（避免旧前端 / 部分更新把已配的名单清空）
+        old = await plugin.store.get_level(level_id) if level_id else None
+        switch_providers = parse_provider_list((old or {}).get("switch_providers"))
+    else:
+        known = plugin.provider_ids()
+        switch_providers = [
+            pid for pid in parse_provider_list(raw_switch) if not known or pid in known
+        ]
+
     new_id = await plugin.store.upsert_level(
         kind,
         name,
@@ -1393,6 +1398,7 @@ async def h_set_level(plugin) -> dict:
         command_effect=cmd_effect,
         effect_group=eff_group,
         command_effect_group=cmd_eff_group,
+        switch_providers=switch_providers,
     )
     if not new_id:
         return err("等级写入失败")
@@ -1549,6 +1555,45 @@ async def h_set_subject_model(plugin) -> dict:
     )
     await plugin.reload_rules()
     return ok({"scope_id": scope_id, "provider_id": provider_id})
+
+
+async def h_set_subject_model_choice(plugin) -> dict:
+    """指定 / 清空某个好友**自己切换的模型**（v9）。
+
+    body: ``{scope_id, scene?, provider_id}``；``provider_id`` 为空 = 清除他的选择。
+
+    为什么控制台要有这个入口：``/切换模型`` 是用户自助行为，管理员平时不用管；
+    但遇到「用户钉了一个已经下线的模型，自己又不知道怎么退回来」这类情况，
+    需要一个兜底开关 —— 它改的是用户自己的选择（feature=model_choice），
+    与管理员配的「专属模型」（feature=model）是两把键，互不覆盖。
+    """
+    if not (plugin.store and plugin.store.ready):
+        return err("数据库未就绪")
+    body = await _payload()
+    scope_id = str(body.get("scope_id") or "").strip()
+    provider_id = str(body.get("provider_id") or "").strip()
+    scene = str(body.get("scene") or "private").strip() or "private"
+    if not scope_id:
+        return err("scope_id 不能为空")
+    if scene not in ("private", "group"):
+        return err("scene 必须是 private 或 group")
+    if provider_id and provider_id not in plugin.provider_ids():
+        return err("该提供商未加载或不存在（先在 AstrBot「模型提供商」里启用）")
+    await plugin.store.set_policy(
+        "user",
+        scope_id,
+        provider_id or "inherit",
+        feature=MODEL_CHOICE_FEATURE,
+        note="用户自己用 /切换模型 选的",
+        scene=scene,
+    )
+    await plugin.store.log_audit(
+        "console",
+        "set_subject_model_choice",
+        json.dumps({"scope_id": scope_id, "scene": scene, "provider_id": provider_id}, ensure_ascii=False),
+    )
+    await plugin.reload_rules()
+    return ok({"scope_id": scope_id, "scene": scene, "provider_id": provider_id})
 
 
 # ---------------------------------------------------------------------- #
@@ -1753,6 +1798,7 @@ def register_apis(plugin) -> None:
         ("/levels/delete", h_delete_level, ["POST"]),
         ("/subject-level", h_set_subject_level, ["POST"]),
         ("/subject/model", h_set_subject_model, ["POST"]),
+        ("/subject/model-choice", h_set_subject_model_choice, ["POST"]),
         ("/providers", h_providers, ["GET"]),
         ("/avatars", h_avatars, ["GET"]),
         ("/avatars/refresh", h_avatars_refresh, ["POST"]),

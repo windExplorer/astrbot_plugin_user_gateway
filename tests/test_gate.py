@@ -84,6 +84,7 @@ def R(**kw) -> G.Rules:
         limits=kw.get("limits") or {},
         usage=kw.get("usage") or {},
         level_model=kw.get("level_model") or {},
+        level_switch=kw.get("level_switch") or {},
         command_policy=_by_cmd(kw.get("command_policy")),
         command_master=_by_scope(kw.get("command_master")),
         level_command_effect=kw.get("level_command_effect") or {},
@@ -694,6 +695,30 @@ def main() -> int:
     )
     check(gate.check_command(G.Subject(sender_id="10001"), "draw", g_master).allow,
           "默认策略=放行时，全局放行不改变结果")
+
+    print("\n[18] 可切换模型（/切换模型 的名单归属，v9）")
+    sw = R(
+        level_switch={1: ("p-a", "p-b"), 2: ("p-c",)},
+        subject_level={"user": {"10001": 1}, "group": {"88888": 2}},
+    )
+    found = G.Gate.model_level_of(G.Subject(sender_id="10001"), sw)
+    check(found == ("user", 1, "user_level"), f"私聊按好友等级取名单（实得 {found}）")
+    found = G.Gate.model_level_of(G.Subject(sender_id="10001", group_id="88888"), sw)
+    check(found == ("group", 2, "group_level"), "群聊按群等级取名单（与模型路由同口径，不按发言人）")
+    check(G.Gate.model_level_of(G.Subject(sender_id="10009"), sw) is None, "没归级 → 没有名单（指令会提示未开放）")
+    check(
+        G.Gate.switch_options(sw, 1) == ("p-a", "p-b"),
+        "名单按配置顺序返回（用户看到的序号要稳定，不能每次都变）",
+    )
+    check(G.Gate.switch_options(sw, 99) == (), "等级没配名单 → 空元组")
+    check(G.Gate.switch_options(sw, None) == (), "level_id 为空 / 非法 → 空元组（不抛异常）")
+    # 名单与「等级模型路由」互相独立：配了主模型不等于开放切换
+    route_only = R(
+        level_model={1: {"provider_id": "p-a", "fallback_provider_id": ""}},
+        subject_level={"user": {"10001": 1}},
+    )
+    check(G.Gate.switch_options(route_only, 1) == (), "只配了等级模型 → 仍未开放自助切换")
+    check(bool(G.Gate.resolve_model(G.Subject(sender_id="10001"), route_only)), "等级模型路由照常解析")
 
     print()
     if _failures:

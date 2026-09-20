@@ -182,6 +182,7 @@ const levelForm = ref<
   sort_order: 0,
   provider_id: "",
   fallback_provider_id: "",
+  switch_providers: [],
   quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
 });
 
@@ -199,6 +200,7 @@ const levelForm = ref<
   sort_order: row.sort_order || 0,
   provider_id: row.provider_id || "",
   fallback_provider_id: row.fallback_provider_id || "",
+  switch_providers: [...(row.switch_providers || [])],
       quotas: {
         day: row.quotas?.day ? { limit: row.quotas.day.limit_tokens, mode: row.quotas.day.mode as "enforce" | "observe" } : { limit: null, mode: "enforce" },
         month: row.quotas?.month ? { limit: row.quotas.month.limit_tokens, mode: row.quotas.month.mode as "enforce" | "observe" } : { limit: null, mode: "enforce" },
@@ -216,6 +218,7 @@ const levelForm = ref<
       sort_order: (levels.value.length + 1) * 10,
       provider_id: "",
       fallback_provider_id: "",
+      switch_providers: [],
       quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
     };
   }
@@ -247,6 +250,7 @@ async function saveLevel() {
       sort_order: f.sort_order,
       provider_id: f.provider_id || "",
       fallback_provider_id: f.fallback_provider_id || "",
+      switch_providers: f.switch_providers || [],
       quotas,
     });
     message.success("等级已保存");
@@ -386,6 +390,36 @@ const levelColumns: DataTableColumns<LevelRow> = [
               fb ? h("div", { style: "font-size:12px;opacity:.65" }, `备用：${fb}`) : null,
             ]),
           default: () => `主模型：${main}\n备用模型：${fb || "（未配置）"}`,
+        },
+      );
+    },
+  },
+  {
+    // 可切换模型（v9）：该等级的用户发 /切换模型 时能挑的范围
+    title: "可切换",
+    key: "switch_providers",
+    minWidth: 150,
+    render: (row) => {
+      const list = row.switch_providers || [];
+      if (!list.length) {
+        return h(NTag, { size: "small", bordered: false }, { default: () => "未开放" });
+      }
+      return h(
+        NTooltip,
+        { trigger: "hover" },
+        {
+          trigger: () =>
+            h("div", { style: "line-height:1.35;cursor:default" }, [
+              h("div", { style: "font-size:12.5px" }, `${list.length} 个模型可选`),
+              h(
+                "div",
+                { style: "font-size:12px;opacity:.65" },
+                list.map((id) => providerLabel(id)).join("、"),
+              ),
+            ]),
+          default: () =>
+            `用户发 /切换模型 时可选：\n` +
+            list.map((id, i) => `${i + 1}. ${providerLabel(id)}`).join("\n"),
         },
       );
     },
@@ -578,6 +612,11 @@ onMounted(load);
           · <b>模型路由</b>：等级可指定「主模型 + 备用模型」。<b>私聊看好友等级、群聊看群等级</b>
           （一个群只用一个模型，避免同群上下文串味）；主提供商不可用或连续失败熔断时自动走备用。
         </span>
+        <span>
+          · <b>可切换模型</b>（等级里的「可切换模型」名单）：属于该等级的用户发 <b>/切换模型</b>
+          就能在名单里自助换模型——卡片会列出可选模型并标出<b>当前使用的那个</b>，回序号即切换、回
+          <b>0</b> 恢复默认。优先级：<b>用户自己的选择 &gt; 专属模型 &gt; 等级主/备用模型</b>。
+        </span>
       </n-space>
     </n-card>
 
@@ -649,7 +688,7 @@ onMounted(load);
         :description="levels.length ? '该类型下还没有等级' : '还没有等级 —— 可以先建「普通 / VIP」两档试试'"
         style="padding: 30px 0"
       />
-      <n-data-table v-else :columns="levelColumns" :data="filteredLevels" :loading="loading" :bordered="false" size="small" :scroll-x="720" />
+      <n-data-table v-else :columns="levelColumns" :data="filteredLevels" :loading="loading" :bordered="false" size="small" :scroll-x="1000" />
     </n-card>
 
     <!-- 对象专属额度 -->
@@ -759,6 +798,27 @@ onMounted(load);
               选项就是「供应商 · 模型」（一项对应 AstrBot 里的一个模型提供商）。<br />
               私聊按「好友等级」、群聊按「群等级」决定模型（一个群一个模型，避免同群上下文串味）；
               主模型未加载或连续失败（熔断）时自动落到备用。
+            </span>
+          </n-space>
+        </n-form-item>
+        <n-form-item label="可切换模型">
+          <n-space vertical :size="4" style="width: 100%">
+            <n-select
+              v-model:value="levelForm.switch_providers"
+              multiple
+              filterable
+              size="small"
+              style="width: 360px; max-width: 100%"
+              placeholder="留空 = 该等级的用户不能自己切模型"
+              :options="providerOptions"
+            />
+            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
+              属于该等级的用户发 <b>/切换模型</b> 时，只能从这份名单里挑（外加他自己的专属模型），
+              所以「放开自助切换」不会变成「谁都能挑最贵的那个」。<br />
+              用户的选择存在他自己身上（私聊 / 群聊各一份），不覆盖这里的<b>主模型</b>配置：
+              这里的配置是「默认走哪个」，名单是「允许他自己换成哪些」；
+              用户随时可以发「/切换模型 0」回到这里配的主模型。
+              <b>留空 = 不开放</b>（用户会收到「该分组未开放模型切换」）。
             </span>
           </n-space>
         </n-form-item>

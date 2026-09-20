@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from store import Store  # noqa: E402
+from store import Store, parse_provider_list  # noqa: E402
 
 _failures: list[str] = []
 
@@ -43,7 +43,7 @@ async def main() -> int:
         check(Path(db_path).exists(), "数据库文件已创建")
 
         print("\n[2] settings")
-        check(await st.get_setting("schema_version") == "8", "schema_version 已写入 8")
+        check(await st.get_setting("schema_version") == "9", "schema_version 已写入 9")
         check(await st.get_setting("nope", "d") == "d", "缺省值回退")
         await st.set_setting("sync_last_at", "123")
         check(await st.get_setting("sync_last_at") == "123", "写入后可读")
@@ -397,6 +397,44 @@ async def main() -> int:
             provider_id="prov-a", fallback_provider_id="prov-b",
         )
 
+        # 可切换模型名单（v9）：/切换模型 的可选范围，存 JSON 文本
+        await st.upsert_level(
+            "user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9,
+            switch_providers=["prov-a", "prov-b", "prov-a", ""],
+        )
+        lv = await st.get_level(lv_vip)
+        check(lv["switch_providers"] == '["prov-a", "prov-b"]',
+              f"名单去空去重后存 JSON（实得 {lv['switch_providers']!r}）")
+        check(parse_provider_list(lv["switch_providers"]) == ["prov-a", "prov-b"], "读取时解析回列表")
+        check(parse_provider_list("") == [] and parse_provider_list(None) == [], "空串 / None → 空列表")
+        check(parse_provider_list("prov-x") == ["prov-x"], "容错：库里是裸 id（不是 JSON）也能读出来")
+        await st.upsert_level(
+            "user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9,
+            switch_providers=[],
+        )
+        lv = await st.get_level(lv_vip)
+        check(lv["switch_providers"] == "", "传空列表 → 存空串（= 不开放自助切换）")
+        await st.upsert_level(
+            "user", "VIP改名", level_id=lv_vip, effect="deny", sort_order=9,
+            provider_id="prov-a", fallback_provider_id="prov-b",
+            switch_providers=["prov-a", "prov-b"],
+        )
+
+        # 用户自己切换的模型（feature=model_choice，v9）：与「专属模型」是两把键
+        await st.set_policy("user", "10001", "prov-a", feature="model_choice", scene="private")
+        await st.set_policy("user", "10001", "prov-b", feature="model_choice", scene="group")
+        mc = await st.effect_map("user", feature="model_choice")
+        check(mc == {"10001": {"private": "prov-a", "group": "prov-b"}},
+              f"用户的切换按场景分开存（实得 {mc}）")
+        await st.set_policy("user", "10001", "prov-a", feature="model", scene="")
+        check(await st.effect_map("user", feature="model") == {"10001": {"": "prov-a"}},
+              "专属模型（feature=model）不受影响，两把键互不覆盖")
+        await st.set_policy("user", "10001", "inherit", feature="model_choice", scene="private")
+        check((await st.effect_map("user", feature="model_choice"))["10001"].get("private") is None,
+              "恢复默认 = 只删该场景的切换记录")
+        await st.set_policy("user", "10001", "inherit", feature="model_choice", scene="group")
+        await st.set_policy("user", "10001", "inherit", feature="model", scene="")
+
         await st.set_subject_level("group", "88888", lv_group)
         await st.delete_level(lv_group)
         check(await st.get_level(lv_group) is None, "删除等级")
@@ -470,7 +508,7 @@ async def main() -> int:
 
         st3 = Store(v1_path)
         await st3.open()
-        check(await st3.get_setting("schema_version") == "8", "版本号直接升到最新（v1 → v8 连续迁移）")
+        check(await st3.get_setting("schema_version") == "9", "版本号直接升到最新（v1 → v9 连续迁移）")
         q = await st3.get_quota("user", "10001", "day")
         check(q is not None and q["limit_tokens"] == 1000 and "used_tokens" not in q,
               "限额保留、用量的列已移除")
@@ -516,13 +554,14 @@ async def main() -> int:
 
         st5 = Store(v2_path)
         await st5.open()
-        check(await st5.get_setting("schema_version") == "8", "版本号升到 8（v2 → v3 → v4 → v5 → v6 → v7 → v8 连续迁移）")
+        check(await st5.get_setting("schema_version") == "9", "版本号升到 9（v2 → v3 → … → v8 → v9 连续迁移）")
         lv = await st5.get_level(1)
         check(lv is not None and lv["name"] == "老等级", "v2 的等级数据保留")
         check(
             lv.get("provider_id") == "" and lv.get("fallback_provider_id") == "" and "model" not in lv,
             "模型路由两列默认为空，且 v3 临时加的 model 列已被 v4 移除",
         )
+        check(lv.get("switch_providers") == "", "v9 新增的「可切换模型」列默认为空（升级不改变既有行为）")
         check(lv.get("command_effect") == "inherit", "v5 新增的 level.command_effect 默认为 inherit")
         await st5.upsert_level("user", "老等级", level_id=1, provider_id="p1", fallback_provider_id="p2")
         lv = await st5.get_level(1)
@@ -589,7 +628,7 @@ async def main() -> int:
 
         st8 = Store(v5_path)
         await st8.open()
-        check(await st8.get_setting("schema_version") == "8", "版本号升到 8")
+        check(await st8.get_setting("schema_version") == "9", "版本号升到 9")
         em = await st8.effect_map("user")
         check(em == {"10001": {"": "deny"}}, f"旧规则落到「通用」场景（实得 {em}）")
         check(await st8.resolve_policy("user", "10001", "llm", "group") == "deny",
@@ -611,7 +650,7 @@ async def main() -> int:
         await st8.close()
         st9 = Store(v5_path)
         await st9.open()
-        check(await st9.get_setting("schema_version") == "8", "重开不会重复迁移")
+        check(await st9.get_setting("schema_version") == "9", "重开不会重复迁移")
         check(await st9.resolve_policy("user", "10001", "llm", "private") == "allow", "重开后规则仍在")
         await st9.close()
 
@@ -727,6 +766,7 @@ async def main() -> int:
             "user", "VIP", effect="allow", command_effect="deny",
             effect_group="deny", command_effect_group="allow",
             provider_id="p1", fallback_provider_id="p2", sort_order=5,
+            switch_providers=["p1", "p2"],
         )
         big = await src.upsert_level("group", "大群", effect="deny", command_effect="inherit")
         await src.set_subject_level("user", "10001", vip)
@@ -740,9 +780,12 @@ async def main() -> int:
         await src.set_policy("group", "88888", "deny", feature="command:help")
         await src.set_policy("member", "88888:10001", "allow", feature="command")
         await src.set_policy("member", "88888:10001", "deny")  # LLM 维度的成员规则
+        # 模型类规则（v9）：这两个 feature 的 effect 存的是**提供商 id**，导入时不能被规整掉
+        await src.set_policy("user", "10001", "p1", feature="model", scene="")
+        await src.set_policy("user", "10001", "p2", feature="model_choice", scene="private")
         dump = await src.export_rules()
         check(
-            len(dump["levels"]) == 2 and len(dump["quotas"]) == 4 and len(dump["policies"]) == 5,
+            len(dump["levels"]) == 2 and len(dump["quotas"]) == 4 and len(dump["policies"]) == 7,
             f"导出各表行数（levels={len(dump['levels'])} quotas={len(dump['quotas'])} policies={len(dump['policies'])}）",
         )
         check(len(dump["subject_levels"]) == 2, "归级一并导出")
@@ -754,7 +797,7 @@ async def main() -> int:
         await dst.upsert_level("user", "别的等级")
         stats = await dst.import_rules(dump, mode="merge")
         check(
-            stats["levels"] == 2 and stats["policies"] == 5 and stats["quotas"] == 4 and stats["skipped"] == 0,
+            stats["levels"] == 2 and stats["policies"] == 7 and stats["quotas"] == 4 and stats["skipped"] == 0,
             f"导入统计正确（实得 {stats}）",
         )
         lv_list = await dst.list_levels("user")
@@ -770,6 +813,15 @@ async def main() -> int:
         )
         check(new_vip["provider_id"] == "p1" and new_vip["fallback_provider_id"] == "p2",
               "模型路由一并导入")
+        check(parse_provider_list(new_vip["switch_providers"]) == ["p1", "p2"],
+              "可切换模型名单一并导入")
+        check(
+            await dst.effect_map("user", feature="model") == {"10001": {"": "p1"}},
+            "好友专属模型（effect=提供商 id）导入后不被抹成 inherit",
+        )
+        mch = await dst.effect_map("user", feature="model_choice")
+        check(mch == {"10001": {"private": "p2"}},
+              f"用户自己切换的模型按场景导入（实得 {mch}）")
         check(await dst.get_effect("user", "10001", "llm", "private") == "deny", "私聊场景规则导入")
         check(await dst.get_effect("user", "10001", "llm", "group") == "allow", "群聊场景规则导入")
         cp = await dst.command_policies()
@@ -798,11 +850,15 @@ async def main() -> int:
                 {"scope_type": "global", "scope_id": "*", "feature": "llm", "effect": "deny"},
                 {"scope_type": "user", "scope_id": "10002", "feature": "command:", "effect": "deny"},
                 {"scope_type": "user", "scope_id": "10002", "feature": "什么鬼", "effect": "deny"},
+                # v9：模型类规则只挂「好友」层，且 effect（提供商 id）不能为空
+                {"scope_type": "group", "scope_id": "88888", "feature": "model", "effect": "p1"},
+                {"scope_type": "user", "scope_id": "10002", "feature": "model_choice", "effect": ""},
             ],
         }
         st2 = await dst.import_rules(bad, mode="merge")
         # 跳过 = 非法 period / scene / member 格式 / global+llm / 空 command 名 / 未知 feature
-        check(st2["skipped"] == 6, f"各类坏行被跳过（实得 skipped={st2['skipped']}）")
+        #        / 模型类规则挂错层 / 模型类规则 effect 为空
+        check(st2["skipped"] == 8, f"各类坏行被跳过（实得 skipped={st2['skipped']}）")
         check(await dst.get_effect("user", "10002", "llm", "") == "deny", "同批里的合法行照常导入")
         q = await dst.list_quotas_of("user", "10002")
         day = [x for x in q if x["period"] == "day"]

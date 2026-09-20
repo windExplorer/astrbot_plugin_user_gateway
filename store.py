@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import time
 from typing import Any, Iterable, Mapping, Optional
 
@@ -31,11 +32,23 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
     ) from e
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # policy 表的 feature 维度补充：
-#   model → 好友专属模型（effect 存提供商 id；'' / 不存在 = 跟随等级配置）
+#   model        → 好友专属模型（effect 存提供商 id；'' / 不存在 = 跟随等级配置）
+#   model_choice → **用户自己**用 /切换模型 选的模型（effect 存提供商 id，按场景分开存）
+#
+# 为什么「专属模型」与「用户切换」要分成两个 feature：
+#   model 是**管理员**给某个人钉死的模型（私聊生效，优先级高于等级路由）；
+#   model_choice 是**用户自己**的选择，会覆盖前两者（切了不生效等于没切）。
+#   两者混在一个 feature 里就无法回答「这个模型是管理员钉的，还是他自己挑的」，
+#   控制台也没法分开展示，所以分两把键。
 MODEL_FEATURE = "model"
+MODEL_CHOICE_FEATURE = "model_choice"
+
+# policy 表里「effect 存的是提供商 id 而不是 allow/deny」的 feature 集合。
+# 导入 / 读取时要区别对待：这些行不能过 _norm_effect（否则 provider id 会被抹成 inherit）。
+PROVIDER_FEATURES: tuple[str, ...] = (MODEL_FEATURE, MODEL_CHOICE_FEATURE)
 
 # set_user_level_scene 的哨兵：UNSET = 不动该场景（区别于 None = 取消）
 _LEVEL_UNSET = object()
@@ -49,6 +62,37 @@ MEMBER_SCOPE_SEP = ":"
 def member_scope_id(group_id: Any, user_id: Any) -> str:
     """拼出群成员规则的 ``scope_id``（``群号:QQ``）。"""
     return f"{str(group_id or '').strip()}{MEMBER_SCOPE_SEP}{str(user_id or '').strip()}"
+
+
+def parse_provider_list(raw: Any) -> list[str]:
+    """把「等级的可用模型列表」解析成提供商 id 列表（去空、去重、保序）。
+
+    库里存的是 JSON 文本（如 ``["pid_a","pid_b"]``，空列表存空串）；同时兼容：
+    直接传 list（API / 导入路径）、以及手工填进去的一串裸 id（JSON 解析失败时按单个 id 处理）。
+    """
+    if isinstance(raw, (list, tuple)):
+        items: list[Any] = list(raw)
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        try:
+            got = json.loads(text)
+        except Exception:
+            return [text]
+        items = list(got) if isinstance(got, (list, tuple)) else [got]
+    out: list[str] = []
+    for it in items:
+        pid = str(it or "").strip()
+        if pid and pid not in out:
+            out.append(pid)
+    return out
+
+
+def dump_provider_list(value: Any) -> str:
+    """把提供商 id 列表规整成存库用的 JSON 文本（空列表存空串，保持旧库的紧凑形态）。"""
+    items = parse_provider_list(value)
+    return json.dumps(items, ensure_ascii=False) if items else ""
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -206,6 +250,9 @@ CREATE INDEX IF NOT EXISTS idx_quota_scope ON llm_quota(scope_type, scope_id);
 -- provider_id / fallback_provider_id 存 AstrBot 的**提供商 id**（在 AstrBot「模型提供商」里配置的那个）。
 -- 模型选择以「提供商」为单位：AstrBot 里一个提供商就对应一个模型，
 -- 再单独存一个模型名只会让配置变含混（v0.4.0 的教训），故不设该列。
+-- switch_providers（v9）→ 该等级**允许用户自助切换**的提供商 id 列表（JSON 文本，空串 = 不开放）。
+-- 用户发 /切换模型 时只能在这份名单（外加他自己的专属模型）里挑，
+-- 这样「让人自己选模型」不会变成「谁都能挑最贵的那个」。
 CREATE TABLE IF NOT EXISTS quota_level (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     kind                 TEXT    NOT NULL,
@@ -218,6 +265,7 @@ CREATE TABLE IF NOT EXISTS quota_level (
     sort_order           INTEGER NOT NULL DEFAULT 0,
     provider_id          TEXT    NOT NULL DEFAULT '',
     fallback_provider_id TEXT    NOT NULL DEFAULT '',
+    switch_providers     TEXT    NOT NULL DEFAULT '',
     updated_at           INTEGER NOT NULL,
     UNIQUE (kind, name)
 );
@@ -374,8 +422,23 @@ class Store:
             await cls._migrate_v5_to_v6(db)
         if old_version < 8:
             await cls._migrate_v7_to_v8(db)
+        if old_version < 9:
+            await cls._migrate_v8_to_v9(db)
         # v6 → v7 只新增了一张空表（group_member），上面的 SCHEMA_SQL 已经建好，
         # 没有数据要搬，所以不需要单独的迁移步骤 —— 这里留个说明避免以后误以为漏了。
+
+    @staticmethod
+    async def _migrate_v8_to_v9(db: aiosqlite.Connection) -> None:
+        """v8 → v9：等级新增「可切换模型」列（``switch_providers``）。
+
+        只在 ``quota_level`` 上加一列，默认空串 = 该等级不开放自助切换（新功能默认不改变
+        任何既有行为）。按列是否存在判断，可重入。
+        """
+        if "switch_providers" in await Store._table_columns(db, "quota_level"):
+            return
+        await db.execute(
+            "ALTER TABLE quota_level ADD COLUMN switch_providers TEXT NOT NULL DEFAULT ''"
+        )
 
     @staticmethod
     async def _migrate_v7_to_v8(db: aiosqlite.Connection) -> None:
@@ -919,6 +982,7 @@ class Store:
         command_effect: str = "inherit",
         effect_group: str = "inherit",
         command_effect_group: str = "inherit",
+        switch_providers: Any = "",
     ) -> int:
         """新建 / 更新等级，返回等级 id（``level_id`` 为空则按 ``(kind, name)`` 新建）。
 
@@ -926,15 +990,18 @@ class Store:
         - ``effect_group`` / ``command_effect_group``：**群聊场景**下的那一套，
           只对 ``kind='user'`` 有意义；``inherit`` = 跟随主值（旧数据的语义）；
         - ``provider_id`` / ``fallback_provider_id`` 是模型路由：属于该等级的对象
-          走指定提供商，主提供商不可用（未加载 / 熔断）时用备用那个。
+          走指定提供商，主提供商不可用（未加载 / 熔断）时用备用那个；
+        - ``switch_providers``：该等级**允许用户自助切换**的提供商 id 列表
+          （v9，收 list 或 JSON 文本；空 = 不开放 ``/切换模型``）。
         """
         db = self._conn()
+        switch_json = dump_provider_list(switch_providers)
         if level_id:
             await db.execute(
                 "UPDATE quota_level SET kind = ?, name = ?, description = ?, effect = ?, "
                 "command_effect = ?, effect_group = ?, command_effect_group = ?, "
                 "sort_order = ?, provider_id = ?, fallback_provider_id = ?, "
-                "updated_at = ? WHERE id = ?",
+                "switch_providers = ?, updated_at = ? WHERE id = ?",
                 (
                     kind,
                     name,
@@ -946,6 +1013,7 @@ class Store:
                     int(sort_order),
                     str(provider_id or ""),
                     str(fallback_provider_id or ""),
+                    switch_json,
                     now_ts(),
                     int(level_id),
                 ),
@@ -955,8 +1023,8 @@ class Store:
         await db.execute(
             "INSERT INTO quota_level(kind, name, description, effect, command_effect, "
             "effect_group, command_effect_group, sort_order, "
-            "provider_id, fallback_provider_id, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "provider_id, fallback_provider_id, switch_providers, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, name) DO UPDATE SET "
             "description = excluded.description, effect = excluded.effect, "
             "command_effect = excluded.command_effect, "
@@ -964,6 +1032,7 @@ class Store:
             "command_effect_group = excluded.command_effect_group, "
             "sort_order = excluded.sort_order, provider_id = excluded.provider_id, "
             "fallback_provider_id = excluded.fallback_provider_id, "
+            "switch_providers = excluded.switch_providers, "
             "updated_at = excluded.updated_at",
             (
                 kind,
@@ -976,6 +1045,7 @@ class Store:
                 int(sort_order),
                 str(provider_id or ""),
                 str(fallback_provider_id or ""),
+                switch_json,
                 now_ts(),
             ),
         )
@@ -1817,6 +1887,8 @@ class Store:
                     sort_order=_as_int(lv.get("sort_order"), 0),
                     provider_id=str(lv.get("provider_id") or ""),
                     fallback_provider_id=str(lv.get("fallback_provider_id") or ""),
+                    # v9：可切换模型列表（备份里是 list 或 JSON 文本，两种都收）
+                    switch_providers=lv.get("switch_providers"),
                 )
                 old_id = lv.get("id")
                 if old_id is not None:
@@ -1884,9 +1956,11 @@ class Store:
                 )
                 stats["quotas"] += 1
 
-            # 4) 权限规则（LLM / 指令 / 群成员；scene 一并带上）
+            # 4) 权限规则（LLM / 指令 / 群成员 / 模型类；scene 一并带上）
             # 校验口径与 /policy 接口对齐（v1.0.0）：feature 白名单、member 的 scope_id
             # 必须是「群号:QQ」、global 不收 LLM 规则——收下这些只会变成死数据。
+            # v9：model / model_choice 这两类 feature 的 effect 存的是**提供商 id**，
+            # 不能过 _norm_effect（会被抹成 inherit = 凭空丢掉「专属模型 / 用户选择」）。
             for row in _as_list(data.get("policies")):
                 scope_type = str(row.get("scope_type") or "").strip()
                 scope_id = str(row.get("scope_id") or "").strip()
@@ -1898,11 +1972,27 @@ class Store:
                 if feature.startswith("command:") and not feature[len("command:"):].strip():
                     stats["skipped"] += 1
                     continue
-                if feature not in ("llm", "command") and not feature.startswith("command:"):
+                if (
+                    feature not in ("llm", "command")
+                    and feature not in PROVIDER_FEATURES
+                    and not feature.startswith("command:")
+                ):
                     stats["skipped"] += 1
                     continue
                 if scope_type == "global" and feature == "llm":
                     stats["skipped"] += 1
+                    continue
+                if feature in PROVIDER_FEATURES:
+                    # 模型类规则只挂在「好友」这一层（与 /subject/model 接口一致）
+                    raw_effect = str(row.get("effect") or "").strip()
+                    if scope_type != "user" or not raw_effect or raw_effect == "inherit":
+                        stats["skipped"] += 1
+                        continue
+                    await self.set_policy(
+                        "user", scope_id, raw_effect, feature=feature,
+                        note=str(row.get("note") or ""), scene=scene,
+                    )
+                    stats["policies"] += 1
                     continue
                 if scope_type != "user":
                     scene = ""

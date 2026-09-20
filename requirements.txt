@@ -1,2 +1,8 @@
 # 权限规则 / 额度 / 用量统计的持久化存储
 aiosqlite>=0.19.0
+
+# 说明：/切换模型 的卡片用 Pillow 渲染，但**刻意不在这里声明** ——
+# Pillow 是 AstrBot 核心依赖（astrbot 的 requirements 里就有 pillow>=11.2.1），
+# 装 AstrBot 的人必然已经有它；在这里再写一遍只会让插件安装多一次 pip 解析，
+# 而且在无 wheel 的环境上可能把「装插件」直接搞失败。
+# model_card.py 对 Pillow 缺失也做了兜底：渲染不出来就退回文字列表。

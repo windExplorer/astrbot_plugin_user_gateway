@@ -69,6 +69,8 @@ $includeList = @(
     "quota.py",
     "sync.py",
     "avatar.py",
+    "model_switch.py",   # /switch-model command flow (v1.3.3)
+    "model_card.py",     # Pillow card renderer (v1.3.3)
     "_conf_schema.json",
     "metadata.yaml",
     "requirements.txt",
@@ -76,6 +78,7 @@ $includeList = @(
     "CHANGELOG.md",
     "LICENSE",
     "logo.png",   # plugin logo shown in the AstrBot plugin list (docs: root logo.png)
+    "assets",     # bundled CJK font for the switch-model card (OFL licensed)
     "pages"
 )
 

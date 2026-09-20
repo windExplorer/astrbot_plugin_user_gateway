@@ -142,6 +142,10 @@ class Rules:
     usage: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]]] = field(default_factory=dict)
     level_model: Mapping[Any, Mapping[str, str]] = field(default_factory=dict)
     """``{level_id: {"provider_id", "fallback_provider_id"}}`` —— 等级的模型路由。"""
+    level_switch: Mapping[Any, tuple[str, ...]] = field(default_factory=dict)
+    """``{level_id: (提供商 id, ...)}`` —— 该等级允许用户**自助切换**的模型名单（v9）。
+
+    空元组 = 这个等级没开放自助切换（``/切换模型`` 会提示未开放）。"""
     command_policy: Mapping[str, Mapping[str, Mapping[str, Mapping[str, str]]]] = field(
         default_factory=dict
     )
@@ -526,29 +530,47 @@ class Gate:
     # 模型路由
     # ------------------------------------------------------------------ #
     @staticmethod
-    def resolve_model(subject: Subject, rules: Rules) -> Optional[dict[str, Any]]:
-        """按会话类型解析该走哪个「等级模型」。
+    def model_level_of(subject: Subject, rules: Rules) -> Optional[tuple[str, int, str]]:
+        """「模型类配置」由哪个等级说了算 —— ``(kind, level_id, layer)``；没归级返回 ``None``。
 
         **群聊只看群等级、私聊只看好友等级** —— 有意与权限/额度的档位链不同：
         群聊的上下文与统计都属于「群」（同一个 umo），若按发言人切模型，
         同一个群会因谁说话而换模型，上下文与计费口径都会串味。
 
-        Returns:
-            ``{layer, label, level_id, provider_id, fallback_provider_id}``；
-            该等级没配提供商时返回 ``None``（表示不干预，走 AstrBot 的默认模型）。
+        模型路由（:meth:`resolve_model`）与「可切换模型名单」（:meth:`switch_options`）
+        共用这一份口径：用户在一个群里能挑的模型范围，就是他所在**群等级**开放的那份名单。
         """
-        kind = ""
-        sid = ""
-        layer = ""
         if str(subject.group_id or ""):
             kind, sid, layer = "group", str(subject.group_id), LAYER_GROUP_LEVEL
         elif str(subject.sender_id or ""):
             kind, sid, layer = "user", str(subject.sender_id), LAYER_USER_LEVEL
-        if not kind:
+        else:
             return None
         level_id = rules.level_id_of(kind, sid)
         if not level_id:
             return None
+        return kind, int(level_id), layer
+
+    @staticmethod
+    def switch_options(rules: Rules, level_id: Any) -> tuple[str, ...]:
+        """某等级允许用户自助切换的模型名单（``level_switch`` 的容错读取）。"""
+        try:
+            return tuple(rules.level_switch.get(int(level_id)) or ())
+        except (TypeError, ValueError):
+            return ()
+
+    @staticmethod
+    def resolve_model(subject: Subject, rules: Rules) -> Optional[dict[str, Any]]:
+        """按会话类型解析该走哪个「等级模型」。
+
+        Returns:
+            ``{layer, label, level_id, provider_id, fallback_provider_id}``；
+            该等级没配提供商时返回 ``None``（表示不干预，走 AstrBot 的默认模型）。
+        """
+        found = Gate.model_level_of(subject, rules)
+        if not found:
+            return None
+        _kind, level_id, layer = found
         # 等级模型同样按 level_id 查（id 全局唯一，见 Gate._level_key 的说明）
         got = rules.level_model.get(int(level_id)) or {}
         if not (got.get("provider_id") or got.get("fallback_provider_id")):
