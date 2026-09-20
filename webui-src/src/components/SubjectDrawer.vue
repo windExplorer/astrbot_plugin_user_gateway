@@ -27,7 +27,6 @@ import {
   apiPost,
   apiSetSubjectLevel,
   apiSetSubjectModel,
-  apiSetSubjectModelChoice,
   apiSubject,
   type LevelRow,
   type SubjectDetail,
@@ -107,12 +106,10 @@ const groupLevelOptions = computed(() => {
   }
   return opts;
 });
-// 好友专属模型（仅私聊生效；空 = 跟随等级配置）
+// 专属模型（v1.3.12）：好友 = 私聊生效、群 = 对全群生效；空 = 跟随等级配置。
+// /切换模型 改的也是这一份，控制台这里与指令切换互相同步。
 const subjectModel = ref("");
 const modelSaving = ref(false);
-// 他自己用 /切换模型 选的（优先级最高；这里只做展示 + 兜底清除）
-const modelChoice = ref("");
-const choiceSaving = ref(false);
 const modelOptions = computed(() => [
   { label: "跟随等级配置（默认）", value: "" },
   ...(detail.value?.model_route as any)?.available?.map((p: string) => ({ label: p, value: p })) || [],
@@ -130,17 +127,14 @@ const isUser = computed(() => props.type === "user");
 const scene = ref<"private" | "group">("private");
 const sceneLabel = computed(() => (scene.value === "group" ? "群聊" : "私聊"));
 
-// 生效模型（用户自己的选择 / 好友专属 / 等级路由）：说明「实际会走哪个提供商/模型」。
+// 生效模型（专属模型 / 等级路由）：说明「实际会走哪个提供商/模型」。
 // 顺序必须与后端 route_model 一致，否则控制台会给出与实际不符的结论。
 const modelRouteText = computed(() => {
   const r = detail.value?.model_route as any;
-  if (r?.model_choice) {
-    const ok = (r.available || []).includes(r.model_choice);
-    return `${r.model_choice}｜来源：他自己用 /切换模型 选的（优先级最高）${ok ? "" : "｜该提供商当前不可用，将回落专属 / 等级 / 默认"}`;
-  }
   if (r?.subject_model) {
     const ok = (r.available || []).includes(r.subject_model);
-    return `${r.subject_model}｜来源：好友专属（仅私聊生效）${ok ? "" : "｜该提供商当前不可用，将回落等级 / 默认"}`;
+    const src = props.type === "group" ? "群专属（对全群生效）" : "好友专属（仅私聊生效）";
+    return `${r.subject_model}｜来源：${src}${ok ? "" : "｜该提供商当前不可用，将回落等级 / 默认"}`;
   }
   if (!r || !r.layer) return "未配置（跟随 AstrBot 默认模型）";
   if (!r.provider_id) return r.reason || "配置的模型当前不可用，本次走 AstrBot 默认模型";
@@ -213,7 +207,6 @@ async function load() {
     levelIdGroup.value = d.level_id_group ?? -1;
     // 注意：subject_model 在 model_route 里（后端挂在路由结果上），不在顶层
     subjectModel.value = (d as any).model_route?.subject_model || "";
-    modelChoice.value = (d as any).model_route?.model_choice_private || "";
     // 额度的初值：优先日额度，否则月、累计
     const rows = d.quotas || [];
     const pick = rows.find((q) => q.period === "day") || rows.find((q) => q.period === "month") || rows[0];
@@ -289,27 +282,18 @@ async function saveLevelGroup(v: number) {
   }
 }
 
-/** 清除他自己用 /切换模型 选的模型（私聊场景），回到「专属模型 → 等级配置」。 */
-async function clearModelChoice() {
-  choiceSaving.value = true;
-  try {
-    await apiSetSubjectModelChoice(props.id, "", "private");
-    message.success("已清除他自己切换的模型（改回按专属 / 等级配置走）");
-    emit("changed");
-    await load();
-  } catch (e: any) {
-    message.error(e?.message || String(e));
-  } finally {
-    choiceSaving.value = false;
-  }
-}
-
-/** 好友专属模型：providerId 为空 = 恢复跟随等级配置。 */
+/** 专属模型：providerId 为空 = 恢复跟随等级配置（好友仅私聊生效、群对全群生效）。 */
 async function saveSubjectModel() {
   modelSaving.value = true;
   try {
-    await apiSetSubjectModel(props.id, subjectModel.value || "");
-    message.success(subjectModel.value ? "专属模型已保存（仅私聊生效）" : "已恢复跟随等级配置");
+    await apiSetSubjectModel(props.id, subjectModel.value || "", props.type);
+    message.success(
+      subjectModel.value
+        ? props.type === "group"
+          ? "群专属模型已保存（对全群生效）"
+          : "专属模型已保存（仅私聊生效）"
+        : "已恢复跟随等级配置",
+    );
     emit("changed");
     await load();
   } catch (e: any) {
@@ -676,8 +660,8 @@ watch(
             </n-space>
           </n-card>
 
-          <!-- 好友专属模型：优先级高于等级路由，仅私聊生效 -->
-          <n-card v-if="isUser" size="small" title="专属模型（私聊）">
+          <!-- 专属模型：好友 = 私聊生效；群 = 对全群生效。/切换模型 改的也是这一份 -->
+          <n-card size="small" :title="isUser ? '专属模型（私聊）' : '群专属模型（全群生效）'">
             <n-space vertical :size="8">
               <n-space align="center" :size="8">
                 <n-select
@@ -700,21 +684,16 @@ watch(
                   恢复默认
                 </n-button>
               </n-space>
-              <span style="font-size: 12px; opacity: 0.6; line-height: 1.7">
-                只影响该好友的<b>私聊</b>；在<b>群里</b>聊天仍然走<b>那个群的模型</b>（群等级路由），
+              <span v-if="isUser" style="font-size: 12px; opacity: 0.6; line-height: 1.7">
+                只影响该好友的<b>私聊</b>；在<b>群里</b>聊天仍然走<b>那个群的模型</b>（群等级 / 群专属），
                 不会用他的专属模型。优先级高于等级里配置的模型；留空 = 跟随等级配置。<br />
-                注意：<b>他自己发「/切换模型」挑的模型优先级更高</b>（他刚亲手切过，
-                被配置按回去会让这个指令形同失效）；在「限额 → 等级管理」的「可切换模型」里
+                他自己发「/切换模型」改的也是这份专属模型；在「限额 → 等级管理」的「可切换模型」里
                 圈定他能挑的范围即可 —— 想让他彻底不能自己切，就把那份名单清空。
               </span>
-              <n-space v-if="modelChoice" align="center" :size="8">
-                <n-tag size="small" type="info" :bordered="false">
-                  他自己切换的：{{ modelChoice }}
-                </n-tag>
-                <n-button size="tiny" :loading="choiceSaving" @click="clearModelChoice">
-                  清除（回到上面配置）
-                </n-button>
-              </n-space>
+              <span v-else style="font-size: 12px; opacity: 0.6; line-height: 1.7">
+                对<b>这个群的所有成员</b>生效，优先级高于群等级里配置的模型；留空 = 跟随等级配置。<br />
+                群管理员在群里发「/切换模型」改的也是这份群专属模型 —— 两边看到的是同一个值。
+              </span>
               <span style="font-size: 12px; opacity: 0.65">生效模型：{{ modelRouteText }}</span>
             </n-space>
           </n-card>

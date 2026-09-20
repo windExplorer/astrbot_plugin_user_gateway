@@ -13,8 +13,8 @@
 覆盖：
 - 名单 =「等级配置的名单 + 我的专属模型 + 当前生效的那个」，顺序稳定；
 - 当前使用的那个被标记（含「不在名单里但正在用」的情况）；
-- 序号切换写的是 ``feature=model_choice`` + 对应场景（群 / 私聊互不影响）；
-- 序号 0 = 恢复默认（删掉自己的选择）；
+- 序号切换写的是**专属模型**（``feature=model``：私聊 = 用户、群聊 = 群，互不影响）；
+- 序号 0 = 恢复默认（删掉专属模型）；
 - 序号会话有 TTL、且**绑定发言人**（群里别人发的数字不会误触发）；
 - 卡片能渲染出 PNG；渲染不出来时有纯文本兜底。
 """
@@ -226,8 +226,8 @@ class FakePlugin:
         self.recall_secs: list[int] = []  # 每次发卡片带上的「多少秒后撤回」
         self.reloads = 0
         # 规则快照（由 main.reload_rules 维护，这里手工给）
-        self._model_choice: dict[str, dict[str, str]] = {}
         self._subject_model: dict[str, str] = {}
+        self._subject_model_group: dict[str, str] = {}
         self._rules_obj = G.Rules()
 
     async def _no_default(self, umo: str):
@@ -336,28 +336,28 @@ async def main() -> int:
     check(data["current_id"] == "p-c" and data["current_source"] == MS.SOURCE_OWN,
           "专属模型优先于等级主模型（与 route_model 的口径一致）")
 
-    plugin._model_choice = {"10001": {"private": "p-b"}}
-    data = await sw.describe(subject())
-    check(data["current_id"] == "p-b" and data["current_source"] == MS.SOURCE_CHOICE,
-          "用户自己切换的模型优先级最高")
-    check([o for o in data["options"] if o["current"]][0]["provider_id"] == "p-b", "当前标记跟着走")
+    # 群聊场景读的是**群专属模型**（v1.3.12）——跨群不串号的关键：每个群各一份
+    plugin._subject_model_group = {"88888": "p-b"}
+    gdata = await sw.describe(subject(group="88888"))
+    check(gdata["current_id"] == "p-b" and gdata["current_source"] == MS.SOURCE_OWN,
+          "群聊场景读的是群专属模型（不是私聊那份、更不是别人的）")
+    check(gdata["scene"] == "group", "群聊场景判定正确")
 
     print("\n[3] 当前模型不在名单里也要列出来（否则卡片上没有一行能标「当前使用」）")
-    plugin._model_choice = {"10001": {"private": "p-x"}}
+    plugin._subject_model = {"10001": "p-x"}
     plugin.providers.append(FakeProvider("p-x", "临时", "temp-model"))
     data = await sw.describe(subject())
     check("p-x" in [o["provider_id"] for o in data["options"]], "当前用的那个被补进名单")
     row = [o for o in data["options"] if o["provider_id"] == "p-x"][0]
-    check(row["current"] and "你自己切换的" in row["note"], "并标注来源")
+    check(row["current"] and "专属模型" in row["note"], "并标注来源")
 
-    print("\n[3.1] 用户选的那个当前不可用 → 当前标记落到实际会走的那一层")
-    plugin._subject_model = {}
-    plugin._model_choice = {"10001": {"private": "p-down"}}  # 未加载的提供商
+    print("\n[3.1] 专属模型当前不可用 → 当前标记落到实际会走的那一层")
+    plugin._subject_model = {"10001": "p-down"}  # 未加载的提供商
     data = await sw.describe(subject())
     check(data["current_id"] == "p-a" and data["current_source"] == MS.SOURCE_LEVEL,
-          "他选的不可用 → 实际走等级主模型（卡片不能撒谎说当前用的是那个）")
+          "专属模型不可用 → 实际走等级主模型（卡片不能撒谎说当前用的是那个）")
     row = [o for o in data["options"] if o["provider_id"] == "p-down"][0]
-    check(row["unavailable"] and not row["current"], "他切过的那个仍然列出来，并标「暂不可用」")
+    check(row["unavailable"] and not row["current"], "专属模型仍然列出来，并标「暂不可用」")
 
     print("\n[4] 没配名单 → 兜底三项（当前 / 系统默认 / 备用）")
     plugin3 = FakePlugin(providers=provider_rows(), default_provider="p-c")
@@ -478,8 +478,11 @@ async def main() -> int:
     check(bool(plugin5b.images) and plugin5b.sent == [], "管理员拿到的是可操作的卡片")
     check(sw5b.peek(admin) is not None, "管理员的序号会话已建立")
     res = await sw5b.apply(admin, 1)
-    check(res["ok"] and plugin5b.store.policies[-1]["scene"] == "group",
-          "管理员切换按群聊场景落库（只影响他自己在群里的请求）")
+    gpol = plugin5b.store.policies[-1]
+    check(res["ok"] and gpol["scope_type"] == "group" and gpol["scope_id"] == "88888",
+          "管理员切换写的是**群专属模型**（只影响这个群，不再按人跨群生效）")
+    check(gpol["feature"] == "model" and gpol["effect"] == "p-a",
+          "落到 feature=model 的群维度（与控制台「群专属模型」同一份）")
     # 等级开关关着时，管理员照样能切（「管理员不受影响」）
     plugin5b._rules_obj = rules(
         subject_level={"group": {"88888": 2}}, level_switch={2: ("p-a", "p-b")}
@@ -508,10 +511,10 @@ async def main() -> int:
     check(res["ok"], "序号 2 切换成功")
     pol = plugin5.store.policies[-1]
     check(
-        pol["feature"] == "model_choice" and pol["scope_type"] == "user" and pol["scope_id"] == "10001",
-        "写到 feature=model_choice 的用户维度",
+        pol["feature"] == "model" and pol["scope_type"] == "user" and pol["scope_id"] == "10001",
+        "写到 feature=model 的用户维度（切换 = 改专属模型，与控制台同键）",
     )
-    check(pol["effect"] == "p-b" and pol["scene"] == "private", "写的是该模型的提供商 id + 当前场景")
+    check(pol["effect"] == "p-b" and pol["scene"] == "", "写的是提供商 id（专属模型本身不分场景）")
     check(plugin5.reloads == 1, "写库后立刻重建内存规则（无需重启）")
     check(sw5.peek(subject()) is None, "切换成功后待选会话被清掉")
     check("已切换为" in res["message"], "回执里带上结果")
@@ -528,7 +531,8 @@ async def main() -> int:
     sw5.remember(subject(), data["options"], "private")
     res = await sw5.apply(subject(), 0)
     check(res["ok"] and plugin5.store.policies[-1]["effect"] == "inherit",
-          "0 → 写 inherit（等价于删掉该场景的选择）")
+          "0 → 写 inherit（等价于删掉专属模型）")
+    check(plugin5.store.policies[-1]["feature"] == "model", "删的是专属模型那把键")
     check("恢复" in res["message"], "回执说明已恢复默认")
 
     print("\n[8] 越界 / 非法参数")
@@ -621,7 +625,9 @@ async def main() -> int:
         )
         check(bool(png2) and png2[:8] == b"\x89PNG\r\n\x1a\n", "超长文案也能渲染（折行 + 截断）")
     check(model_card.render_model_card(title="x", current="", meta="", rows=[], footer="") is None,
-          "没有可选项 → 不渲染（调用方走文本兜底）")
+          "什么内容都没有 → 不渲染（没有可画的）")
+    check(model_card.render_model_card(title="模型切换", current="p-a", rows=[], footer="已切换") is not None,
+          "rows 为空但有头脚 → 渲染（切换成功的回执小卡片就长这样）")
 
     print("\n[12] 控制台接口（真实 Store 走一遍读写）")
     import tempfile  # noqa: PLC0415
@@ -698,17 +704,17 @@ async def main() -> int:
         row = (await call(W.h_levels, args={"kind": "user"}))["data"]["items"][0]
         check(row["switch_providers"] == [], "空数组 = 不配名单（改用兜底三项）")
 
-        res = await call(W.h_set_subject_model_choice, {"scope_id": "10001", "provider_id": "p-b", "scene": "group"})
-        check(res.get("status") == "ok", "POST /subject/model-choice 写入成功")
-        mc = await st.effect_map("user", feature="model_choice")
-        check(mc == {"10001": {"group": "p-b"}}, f"按指定场景落库（实得 {mc}）")
-        res = await call(W.h_set_subject_model_choice, {"scope_id": "10001", "scene": "group", "provider_id": ""})
-        check(res.get("status") == "ok", "空 provider_id = 清除")
-        check(await st.effect_map("user", feature="model_choice") == {}, "清除后没有残留")
-        res = await call(W.h_set_subject_model_choice, {"scope_id": "10001", "provider_id": "p-zzz"})
+        res = await call(W.h_set_subject_model, {"type": "group", "scope_id": "88888", "provider_id": "p-b"})
+        check(res.get("status") == "ok", "POST /subject/model（群专属）写入成功")
+        gm = await st.effect_map("group", feature="model")
+        check(gm == {"88888": {"": "p-b"}}, f"群专属按群维度落库（实得 {gm}）")
+        res = await call(W.h_set_subject_model, {"type": "group", "scope_id": "88888", "provider_id": ""})
+        check(res.get("status") == "ok", "空 provider_id = 恢复跟随等级配置")
+        check(await st.effect_map("group", feature="model") == {}, "清除后没有残留")
+        res = await call(W.h_set_subject_model, {"scope_id": "10001", "provider_id": "p-zzz"})
         check(res.get("status") == "error", "未加载的提供商被拒绝（带 message 而不是 500）")
-        res = await call(W.h_set_subject_model_choice, {"scope_id": "10001", "scene": "??", "provider_id": "p-a"})
-        check(res.get("status") == "error", "非法场景被拒绝")
+        res = await call(W.h_set_subject_model, {"type": "??", "scope_id": "10001", "provider_id": "p-a"})
+        check(res.get("status") == "error", "非法 type 被拒绝")
 
         res = await call(W.h_providers)
         data = res["data"]
@@ -921,7 +927,23 @@ async def main() -> int:
         foot_top_px = img.getpixel((sp + 1, foot_bottom - model_card.FOOTER_H + 3))
         check(sum(foot_top_px) < 740, f"脚的上沿是直角（贴边处直接是脚底色：{foot_top_px}）")
 
-    print("\n[18] 卡片自动撤回（配置 + 抓 message_id + 到点删）")
+    print("\n[17.1] 切换成功的回执小卡片（只有头 + 脚，没有候选行）")
+    if model_card.Image is None:
+        print("  （当前环境没有 Pillow，跳过版面断言）")
+    else:
+        from PIL import Image as _Img  # noqa: PLC0415
+
+        png_ok = await sw9.build_success_card(subject(group="88888"), {"ok": True, "message": "已切换"})
+        check(bool(png_ok) and png_ok[:8] == b"\x89PNG\r\n\x1a\n", "成功回执渲染成 PNG")
+        im2 = _Img.open(__import__("io").BytesIO(png_ok)).convert("RGB")
+        # 行数 = 0 时卡片高度应明显小于完整卡片（没有候选身体）
+        check(im2.height < model_card.SHADOW_PAD * 2 + 400,
+              f"回执卡片是紧凑的（高 {im2.height}）")
+        # rows=[] 直接渲染也要能出图（回执卡片的底层支撑）
+        png_bare = model_card.render_model_card(title="模型切换", rows=[], current="x", footer="f")
+        check(bool(png_bare), "rows 为空也能渲染（不再直接返回 None）")
+
+    print("\n[19] 卡片自动撤回（配置 + 抓 message_id + 到点删）")
     check(RC.clamp_delay(0) == 0 and RC.clamp_delay(-3) == 0 and RC.clamp_delay(None) == 0,
           "0 / 负数 / 非法值 → 不撤回")
     check(RC.clamp_delay("60") == 60, "字符串也能解析（配置面板可能给字符串）")

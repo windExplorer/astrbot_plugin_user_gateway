@@ -94,7 +94,6 @@ try:  # 包内相对导入（AstrBot 正常加载路径）
     from .recall import Recaller
     from .store import (
         COMMAND_MASTER_FEATURE,
-        MODEL_CHOICE_FEATURE,
         MODEL_FEATURE,
         Store,
         member_scope_id,
@@ -125,7 +124,6 @@ except ImportError as _rel_err:
         from recall import Recaller  # type: ignore
         from store import (  # type: ignore
             COMMAND_MASTER_FEATURE,
-            MODEL_CHOICE_FEATURE,
             MODEL_FEATURE,
             Store,
             member_scope_id,
@@ -196,9 +194,9 @@ class UserGatewayPlugin(Star):
         # 好友的群聊专属等级（v8）+ 好友专属模型（feature=model，仅私聊生效）
         self._subject_level_user_group: dict[str, int] = {}
         self._subject_model: dict[str, str] = {}
-        # 用户自己用 /切换模型 选的模型：{uin: {scene: provider_id}}（v9，feature=model_choice）
-        # 优先级最高（切了不生效等于没切），高于好友专属模型与等级模型路由。
-        self._model_choice: dict[str, dict[str, str]] = {}
+        # 群专属模型（v1.3.12）：{群号: provider_id}，对**整个群**生效；
+        # /切换模型 与控制台改的都是这一份（旧的「按用户存群场景」会跨群串号，已废弃）。
+        self._subject_model_group: dict[str, str] = {}
         # 等级模型路由：{level_id: {provider_id, fallback_provider_id}}
         self._level_route: dict[int, dict[str, str]] = {}
         # 等级允许用户自助切换的模型名单：{level_id: (provider_id, ...)}（v9）
@@ -267,6 +265,17 @@ class UserGatewayPlugin(Star):
             logger.error(f"[UserGateway] 数据库初始化失败，插件将不拦截任何消息: {e}")
             self.store = None
             return
+
+        # v1.3.12：切换语义并入专属模型 —— 旧「用户自选（model_choice）」先迁走再加载，
+        # 否则这次 reload 读到的还是旧数据（迁移必须发生在第一次 reload_rules 之前）。
+        try:
+            moved = await self.store.migrate_model_choice()
+            if moved:
+                logger.info(
+                    f"[UserGateway] 已把 {moved} 位用户的旧「/切换模型 选择」迁移为专属模型"
+                )
+        except Exception as e:
+            logger.warning(f"[UserGateway] model_choice 迁移失败（跳过，不影响启动）: {e}")
 
         await self.reload_rules()
         await self._purge_old_usage()
@@ -441,10 +450,14 @@ class UserGatewayPlugin(Star):
                 for pid in [next(iter(row.values()), "") if row else ""]
                 if pid
             }
-            # 用户自己切换的模型（feature=model_choice，按场景分开；群/私聊互不影响）
-            self._model_choice = await self.store.effect_map(
-                "user", feature=MODEL_CHOICE_FEATURE
-            )
+            # 群专属模型（v1.3.12）：对整个群生效，/切换模型（群管理员）与控制台都写这一份
+            self._subject_model_group = {
+                gid: effect_in_scene(row, "group")
+                for gid, row in (
+                    await self.store.effect_map("group", feature=MODEL_FEATURE)
+                ).items()
+                if effect_in_scene(row, "group")
+            }
 
             def _by_scope(rows: list[dict]) -> dict[str, dict[str, dict[str, Any]]]:
                 out: dict[str, dict[str, dict[str, Any]]] = {}
@@ -650,30 +663,22 @@ class UserGatewayPlugin(Star):
                     )
                 return True
 
-            # ⓪ 用户自己用 /切换模型 选的（v9）：优先级最高。
-            # 为什么不放在专属模型后面：用户刚亲手切过，再被配置按回去等于「切了没反应」；
-            # 而「专属模型」在卡片里是**候选之一**（带「专属模型」标签），随时能切回来。
-            choice = (
-                effect_in_scene(self._model_choice.get(sender), scene).strip() if sender else ""
-            )
-            if choice:
-                if use(choice, "用户切换", "model_choice"):
+            # ① 专属模型（feature=model）：私聊 = 好友专属、群聊 = 群专属（v1.3.12 起统一起来）。
+            # /切换模型 改的就是这一份：私聊切自己的专属模型、群里（管理员）切这个群的专属模型。
+            # 优先级高于等级路由 —— 「手动钉过的模型」不该被分组配置悄悄按回去。
+            if str(subject.group_id or ""):
+                override = (self._subject_model_group.get(str(subject.group_id)) or "").strip()
+                own_label = "群专属"
+            else:
+                override = (self._subject_model.get(sender) or "").strip()
+                own_label = "好友专属"
+            if override:
+                if use(override, own_label, "subject_model"):
                     return
                 if debug:
                     logger.info(
-                        f"[UserGateway] 用户选的模型 {choice} 当前不可用，回落配置｜{subject.umo}"
+                        f"[UserGateway] {own_label}模型 {override} 当前不可用，回落等级路由｜{subject.umo}"
                     )
-
-            # ① 好友专属模型（feature=model，仅私聊生效；优先级高于等级路由）
-            if not str(subject.group_id or ""):
-                override = (self._subject_model.get(sender) or "").strip()
-                if override:
-                    if use(override, "好友专属", "subject_model"):
-                        return
-                    if debug:
-                        logger.info(
-                            f"[UserGateway] 好友专属模型 {override} 当前不可用，回落等级路由｜{subject.umo}"
-                        )
 
             # ② 等级模型路由
             route = self.gate.resolve_model(subject, self._rules())
@@ -1330,16 +1335,14 @@ class UserGatewayPlugin(Star):
                 out.update(picked)
                 if not picked:
                     out["reason"] = "配置的提供商当前不可用（未加载或已熔断），本次会走 AstrBot 默认模型"
-            # 好友专属模型：仅私聊生效，优先级高于等级配置
+            # 专属模型（v1.3.12）：好友 = 好友专属（仅私聊）、群 = 群专属（对全群生效）。
+            # /切换模型 改的也是这一份，控制台要能看见它，否则会出现
+            # 「界面上写等级模型、实际走另一个」的悬案。
             out["subject_model"] = (
-                (self._subject_model.get(str(scope_id)) or "") if scope_type == "user" else ""
+                (self._subject_model.get(str(scope_id)) or "")
+                if scope_type == "user"
+                else (self._subject_model_group.get(str(scope_id)) or "")
             )
-            # 用户自己用 /切换模型 选的（v9）：**优先级高于上面两个**，
-            # 控制台要能看见它，否则会出现「界面上写等级模型、实际走另一个」的悬案。
-            choices = (self._model_choice.get(str(scope_id)) or {}) if scope_type == "user" else {}
-            out["model_choice_private"] = str(choices.get("private") or "")
-            out["model_choice_group"] = str(choices.get("group") or "")
-            out["model_choice"] = out["model_choice_private"]
             return out
         except Exception as e:
             logger.debug(f"[UserGateway] 解析模型路由失败（忽略）: {e}")

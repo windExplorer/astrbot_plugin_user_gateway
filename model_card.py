@@ -406,7 +406,9 @@ def render_model_card(
         fonts = _Fonts(path)
 
         items = [dict(r) for r in rows]
-        if not items:
+        # items 允许为空：切换成功的回执是一张「只有头 + 脚」的小卡片（见 build_success_card）。
+        # 但**整个卡片什么内容都没有**时不画（调用方走文本兜底）。
+        if not items and not str(current or "").strip() and not str(meta or "").strip() and not str(footer or "").strip():
             return None
 
         # ---- 先算尺寸（头部高度取决于当前模型折了几行） ----
@@ -423,7 +425,11 @@ def render_model_card(
         content_h = label_h + len(cur_lines) * (14 + cur_lh) + (12 + meta_h if meta else 0)
         head_h = max(content_h + HEAD_PAD * 2, AVATAR + AVATAR_RING * 2 + 48)
 
-        body_h = 26 + len(items) * ROW_H + (len(items) - 1) * ROW_GAP + 26
+        # rows 为空 = 没有候选行（切换成功的回执小卡片）：头部直接接脚部，不画身体。
+        if items:
+            body_h = 26 + len(items) * ROW_H + (len(items) - 1) * ROW_GAP + 26
+        else:
+            body_h = 0
         card_h = head_h + body_h + (FOOTER_H if footer else 0)
         canvas_w = width + SHADOW_PAD * 2
         canvas_h = card_h + SHADOW_PAD * 2

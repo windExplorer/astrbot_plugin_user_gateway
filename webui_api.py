@@ -358,12 +358,16 @@ async def h_ping(plugin) -> dict:
             },
             # 用户自助切换模型（v9/v10）：总开关、放开了切换的分级数、卡片字体是否就位
             "model_switch": {
-                "enabled": bool(plugin._cfg("model_switch_enabled", True)),
-                "open_levels": len(getattr(plugin, "_level_switch", {}) or {}),
-                "switch_levels": sum(
-                    1 for v in (getattr(plugin, "_level_switch_enabled", {}) or {}).values() if v
-                ),
-                "switched_users": len(getattr(plugin, "_model_choice", {}) or {}),
+            "enabled": bool(plugin._cfg("model_switch_enabled", True)),
+            "open_levels": len(getattr(plugin, "_level_switch", {}) or {}),
+            "switch_levels": sum(
+                1 for v in (getattr(plugin, "_level_switch_enabled", {}) or {}).values() if v
+            ),
+            # 切换 = 改专属模型（v1.3.12）：这里统计配了专属模型的用户数 + 群数
+            "switched_users": (
+                len(getattr(plugin, "_subject_model", {}) or {})
+                + len(getattr(plugin, "_subject_model_group", {}) or {})
+            ),
                 "sessions": (
                     plugin.switcher.sessions() if getattr(plugin, "switcher", None) else 0
                 ),
@@ -1548,72 +1552,42 @@ async def h_set_subject_level(plugin) -> dict:
 
 
 async def h_set_subject_model(plugin) -> dict:
-    """好友专属模型（v1.2.0）：优先级高于等级里配置的模型，**仅私聊生效**。
+    """专属模型（v1.2.0 好友 / v1.3.12 群聊）：优先级高于等级里配置的模型。
 
-    body: ``{scope_id, provider_id}``；``provider_id`` 为空 = 恢复跟随等级配置。
+    body: ``{scope_id, provider_id, type?}``；``type`` 缺省 ``user``（好友专属，仅私聊生效），
+    ``group`` = 群专属模型（对**全群**生效）。``provider_id`` 为空 = 恢复跟随等级配置。
+
+    与 ``/切换模型`` 改的是同一把键（feature=model）：指令切换与这里的手动切换互相同步。
     """
     if not (plugin.store and plugin.store.ready):
         return err("数据库未就绪")
     body = await _payload()
     scope_id = str(body.get("scope_id") or "").strip()
     provider_id = str(body.get("provider_id") or "").strip()
+    stype = str(body.get("type") or "user").strip()
+    if stype not in ("user", "group"):
+        return err("type 必须是 user 或 group")
     if not scope_id:
         return err("scope_id 不能为空")
     if provider_id and provider_id not in plugin.provider_ids():
         return err("该提供商未加载或不存在（先在 AstrBot「模型提供商」里启用）")
     await plugin.store.set_policy(
-        "user",
+        stype,
         scope_id,
         provider_id or "inherit",
         feature=MODEL_FEATURE,
-        note="好友专属模型（仅私聊生效）",
+        note="群专属模型（对全群生效）" if stype == "group" else "好友专属模型（仅私聊生效）",
     )
     await plugin.store.log_audit(
         "console",
         "set_subject_model",
-        json.dumps({"scope_id": scope_id, "provider_id": provider_id}, ensure_ascii=False),
+        json.dumps(
+            {"type": stype, "scope_id": scope_id, "provider_id": provider_id},
+            ensure_ascii=False,
+        ),
     )
     await plugin.reload_rules()
-    return ok({"scope_id": scope_id, "provider_id": provider_id})
-
-
-async def h_set_subject_model_choice(plugin) -> dict:
-    """指定 / 清空某个好友**自己切换的模型**（v9）。
-
-    body: ``{scope_id, scene?, provider_id}``；``provider_id`` 为空 = 清除他的选择。
-
-    为什么控制台要有这个入口：``/切换模型`` 是用户自助行为，管理员平时不用管；
-    但遇到「用户钉了一个已经下线的模型，自己又不知道怎么退回来」这类情况，
-    需要一个兜底开关 —— 它改的是用户自己的选择（feature=model_choice），
-    与管理员配的「专属模型」（feature=model）是两把键，互不覆盖。
-    """
-    if not (plugin.store and plugin.store.ready):
-        return err("数据库未就绪")
-    body = await _payload()
-    scope_id = str(body.get("scope_id") or "").strip()
-    provider_id = str(body.get("provider_id") or "").strip()
-    scene = str(body.get("scene") or "private").strip() or "private"
-    if not scope_id:
-        return err("scope_id 不能为空")
-    if scene not in ("private", "group"):
-        return err("scene 必须是 private 或 group")
-    if provider_id and provider_id not in plugin.provider_ids():
-        return err("该提供商未加载或不存在（先在 AstrBot「模型提供商」里启用）")
-    await plugin.store.set_policy(
-        "user",
-        scope_id,
-        provider_id or "inherit",
-        feature=MODEL_CHOICE_FEATURE,
-        note="用户自己用 /切换模型 选的",
-        scene=scene,
-    )
-    await plugin.store.log_audit(
-        "console",
-        "set_subject_model_choice",
-        json.dumps({"scope_id": scope_id, "scene": scene, "provider_id": provider_id}, ensure_ascii=False),
-    )
-    await plugin.reload_rules()
-    return ok({"scope_id": scope_id, "scene": scene, "provider_id": provider_id})
+    return ok({"type": stype, "scope_id": scope_id, "provider_id": provider_id})
 
 
 # ---------------------------------------------------------------------- #
@@ -1818,7 +1792,6 @@ def register_apis(plugin) -> None:
         ("/levels/delete", h_delete_level, ["POST"]),
         ("/subject-level", h_set_subject_level, ["POST"]),
         ("/subject/model", h_set_subject_model, ["POST"]),
-        ("/subject/model-choice", h_set_subject_model_choice, ["POST"]),
         ("/providers", h_providers, ["GET"]),
         ("/avatars", h_avatars, ["GET"]),
         ("/avatars/refresh", h_avatars_refresh, ["POST"]),

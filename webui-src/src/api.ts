@@ -399,10 +399,6 @@ export interface ModelRoute {
   reason?: string;
   available?: string[];
   circuit_open?: string[];
-  /** 好友**自己**用 /切换模型 选的模型（优先级最高；空 = 没切过，仅 type=user 时有意义） */
-  model_choice?: string;
-  model_choice_private?: string;
-  model_choice_group?: string;
 }
 
 export interface SubjectTotals {
@@ -438,7 +434,7 @@ export interface SubjectDetail {
   quota_chain: QuotaChainItem[];
   quota: EffectiveQuota;
   model_route: ModelRoute;
-  /** 好友专属模型（provider_id；空 = 跟随等级配置，仅私聊生效） */
+  /** 专属模型（provider_id；空 = 跟随等级配置。好友仅私聊生效、群对全群生效） */
   subject_model?: string;
   /** 对象级指令权限：自己配的值 + 实际生效的层 */
   command_master: {
@@ -580,25 +576,18 @@ export function apiSetSubjectLevel(
   return apiPost<{ applied: unknown[] }>("/subject-level", { items });
 }
 
-/** 好友专属模型（仅私聊生效；provider_id 为空 = 恢复跟随等级配置）。 */
-export function apiSetSubjectModel(scopeId: string, providerId: string) {
-  return apiPost<{ scope_id: string; provider_id: string }>("/subject/model", {
+/** 专属模型：好友（type=user，仅私聊生效）/ 群（type=group，对全群生效）。
+ *  providerId 为空 = 恢复跟随等级配置。与 /切换模型 改的是同一份配置。 */
+export function apiSetSubjectModel(
+  scopeId: string,
+  providerId: string,
+  type: "user" | "group" = "user",
+) {
+  return apiPost<{ type: string; scope_id: string; provider_id: string }>("/subject/model", {
+    type,
     scope_id: scopeId,
     provider_id: providerId,
   });
-}
-
-/** 清空 / 指定某个好友**自己用 /切换模型 选的**模型（providerId 为空 = 清除他的选择）。
- *  这是管理员兜底入口：用户自己钉了一个已下线的模型时，可以在这里帮他退回默认。 */
-export function apiSetSubjectModelChoice(
-  scopeId: string,
-  providerId: string,
-  scene: "private" | "group" = "private",
-) {
-  return apiPost<{ scope_id: string; scene: string; provider_id: string }>(
-    "/subject/model-choice",
-    { scope_id: scopeId, provider_id: providerId, scene },
-  );
 }
 
 /** 批量取头像（返回 data URI 映射；只请求需要的 id，失败的不出现）。 */

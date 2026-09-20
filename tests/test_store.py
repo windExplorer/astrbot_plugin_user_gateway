@@ -446,20 +446,27 @@ async def main() -> int:
         )
         check(int((await st.get_level(lv_vip))["switch_enabled"]) == 1, "开关与名单可以一起写")
 
-        # 用户自己切换的模型（feature=model_choice，v9）：与「专属模型」是两把键
-        await st.set_policy("user", "10001", "prov-a", feature="model_choice", scene="private")
-        await st.set_policy("user", "10001", "prov-b", feature="model_choice", scene="group")
-        mc = await st.effect_map("user", feature="model_choice")
-        check(mc == {"10001": {"private": "prov-a", "group": "prov-b"}},
-              f"用户的切换按场景分开存（实得 {mc}）")
-        await st.set_policy("user", "10001", "prov-a", feature="model", scene="")
-        check(await st.effect_map("user", feature="model") == {"10001": {"": "prov-a"}},
-              "专属模型（feature=model）不受影响，两把键互不覆盖")
-        await st.set_policy("user", "10001", "inherit", feature="model_choice", scene="private")
-        check((await st.effect_map("user", feature="model_choice"))["10001"].get("private") is None,
-              "恢复默认 = 只删该场景的切换记录")
-        await st.set_policy("user", "10001", "inherit", feature="model_choice", scene="group")
-        await st.set_policy("user", "10001", "inherit", feature="model", scene="")
+        # 用户切换（model_choice，v9）已废弃：迁移进专属模型（v1.3.12）。
+        # 私聊选择 → 专属模型（没有专属的才迁）；群聊选择（旧语义跨群串号）→ 直接删。
+        await st.set_policy("user", "20001", "prov-a", feature="model_choice", scene="private")
+        await st.set_policy("user", "20001", "prov-b", feature="model_choice", scene="group")
+        await st.set_policy("user", "20002", "prov-c", feature="model_choice", scene="private")
+        await st.set_policy("user", "20002", "prov-z", feature="model", scene="")  # 已有专属 → 不覆盖
+        moved = await st.migrate_model_choice()
+        check(moved == 1, f"只有「没有专属模型的人」才迁（实得 moved={moved}）")
+        m = await st.effect_map("user", feature="model")
+        check(m.get("20001", {}).get("") == "prov-a", "20001：私聊选择 → 专属模型")
+        check(m.get("20002", {}).get("") == "prov-z", "20002：已有专属模型不被迁移覆盖")
+        check(await st.effect_map("user", feature="model_choice") == {},
+              "迁移后 model_choice 清空（旧表不留死数据）")
+        check((await st.migrate_model_choice()) == 0, "迁移幂等：再跑一遍是 no-op")
+        await st.set_policy("user", "20001", "inherit", feature="model", scene="")
+        await st.set_policy("user", "20002", "inherit", feature="model", scene="")
+        # 群专属模型（v1.3.12）：group 层同样用 feature=model，按群各一份
+        await st.set_policy("group", "88888", "prov-g", feature="model", scene="")
+        check(await st.effect_map("group", feature="model") == {"88888": {"": "prov-g"}},
+              "群专属模型按群维度落库")
+        await st.set_policy("group", "88888", "inherit", feature="model", scene="")
 
         await st.set_subject_level("group", "88888", lv_group)
         await st.delete_level(lv_group)
@@ -810,12 +817,13 @@ async def main() -> int:
         await src.set_policy("group", "88888", "deny", feature="command:help")
         await src.set_policy("member", "88888:10001", "allow", feature="command")
         await src.set_policy("member", "88888:10001", "deny")  # LLM 维度的成员规则
-        # 模型类规则（v9）：这两个 feature 的 effect 存的是**提供商 id**，导入时不能被规整掉
+        # 模型类规则（v9/v1.3.12）：这两个 feature 的 effect 存的是**提供商 id**，导入时不能被规整掉
         await src.set_policy("user", "10001", "p1", feature="model", scene="")
+        await src.set_policy("group", "88888", "p9", feature="model", scene="")
         await src.set_policy("user", "10001", "p2", feature="model_choice", scene="private")
         dump = await src.export_rules()
         check(
-            len(dump["levels"]) == 2 and len(dump["quotas"]) == 4 and len(dump["policies"]) == 7,
+            len(dump["levels"]) == 2 and len(dump["quotas"]) == 4 and len(dump["policies"]) == 8,
             f"导出各表行数（levels={len(dump['levels'])} quotas={len(dump['quotas'])} policies={len(dump['policies'])}）",
         )
         check(len(dump["subject_levels"]) == 2, "归级一并导出")
@@ -827,7 +835,7 @@ async def main() -> int:
         await dst.upsert_level("user", "别的等级")
         stats = await dst.import_rules(dump, mode="merge")
         check(
-            stats["levels"] == 2 and stats["policies"] == 7 and stats["quotas"] == 4 and stats["skipped"] == 0,
+            stats["levels"] == 2 and stats["policies"] == 8 and stats["quotas"] == 4 and stats["skipped"] == 0,
             f"导入统计正确（实得 {stats}）",
         )
         lv_list = await dst.list_levels("user")
@@ -855,6 +863,10 @@ async def main() -> int:
         mch = await dst.effect_map("user", feature="model_choice")
         check(mch == {"10001": {"private": "p2"}},
               f"用户自己切换的模型按场景导入（实得 {mch}）")
+        check(
+            await dst.effect_map("group", feature="model") == {"88888": {"": "p9"}},
+            "群专属模型（group 层，v1.3.12）一并导入",
+        )
         check(await dst.get_effect("user", "10001", "llm", "private") == "deny", "私聊场景规则导入")
         check(await dst.get_effect("user", "10001", "llm", "group") == "allow", "群聊场景规则导入")
         cp = await dst.command_policies()
@@ -883,8 +895,8 @@ async def main() -> int:
                 {"scope_type": "global", "scope_id": "*", "feature": "llm", "effect": "deny"},
                 {"scope_type": "user", "scope_id": "10002", "feature": "command:", "effect": "deny"},
                 {"scope_type": "user", "scope_id": "10002", "feature": "什么鬼", "effect": "deny"},
-                # v9：模型类规则只挂「好友」层，且 effect（提供商 id）不能为空
-                {"scope_type": "group", "scope_id": "88888", "feature": "model", "effect": "p1"},
+                # v9/v1.3.12：模型类规则只挂「好友 / 群」两层，且 effect（提供商 id）不能为空
+                {"scope_type": "member", "scope_id": "88888:10001", "feature": "model", "effect": "p1"},
                 {"scope_type": "user", "scope_id": "10002", "feature": "model_choice", "effect": ""},
             ],
         }

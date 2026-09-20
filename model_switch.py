@@ -8,6 +8,8 @@
    渲染成卡片图（Pillow，见 :mod:`model_card` 的说明）；
 3. 开关打开时用户回一个序号即切换（**0 = 恢复默认**）；开关关闭时**只读**：
    卡片照发、能看清自己在用什么，但切不了。
+4. 切换改的是**专属模型**（v1.3.12）：私聊 = 他自己的专属模型、群聊 = **这个群**的专属模型
+   （对全群生效，所以群里只有管理员能切）。
 
 几个刻意的设计（改动前请先读）：
 
@@ -18,14 +20,15 @@
   只读时**不记序号会话**，所以此时随手发的数字不会被这条指令截走。
 - **没配名单 → 兜底三项**：当前生效的、AstrBot 系统默认、等级备用模型（去重后）。
   配了名单则以名单为准（名单是管理员划的圈）。
-- **群聊仅管理员可用**：群共用一个会话，谁都能切会把整个群的模型搅乱；
-  管理员仍然可以（他是来调试的）。**只有管理员能豁免**这一条与上面的只读。
-- **选择按「用户 + 场景」存**（``policy.feature='model_choice'``，scene = private / group）：
-  群里 A 切了模型不会改 B 的模型，也不会改群的默认模型；同一个人私聊与群聊两份选择互不影响。
-- **优先级：用户自己的选择 > 好友专属模型（仅私聊）> 等级模型路由**。
-  用户切了不生效等于没切，所以自己选的必须最优先；管理员的「专属模型」只是**候选之一**
-  （会带「专属模型」标签），而不是锁死。
-- **候选名单不放任**：只能从「等级名单（或兜底三项）+ 自己的专属模型 + 当前生效的那个」里选，
+- **群聊仅管理员可用**：切换改的是**群的专属模型**（对全群生效），谁都能切会把整个群搅乱。
+- **切换 = 改专属模型**（v1.3.12 起废弃旧的 model_choice 层）：私聊写到
+  ``policy(user, feature='model')``、群聊写到 ``policy(group, feature='model')`` ——
+  与控制台「专属模型」是**同一把键**，手动切换（控制台）与指令切换互相看得见。
+  旧版按「用户」存群场景的选择，结果「在 A 群切换 → 这个人在所有群都换了」（跨群串号），
+  这就是废弃它的原因；旧数据由 ``store.migrate_model_choice`` 启动时迁走。
+- **优先级：专属模型 > 等级模型路由 > 系统默认**。切了不生效等于没切，
+  所以专属模型必须压过等级路由；等级路由里配的模型仍是**候选之一**（可切回来）。
+- **候选名单不放任**：只能从「等级名单（或兜底三项）+ 专属模型 + 当前生效的那个」里选，
   这样「让人自己挑」不会变成「谁都能挑最贵的那个」。当前生效的那个会额外列出来，
   否则卡片上就没有一行能被标成「当前使用」。
 - **序号会话有 TTL 且绑定发言人**：键是 ``umo + 发言人``，所以群里别人发的数字不会误触发，
@@ -44,12 +47,12 @@ from astrbot.api import logger
 
 try:  # 包内正常加载
     from . import model_card
-    from .gate import Subject, effect_in_scene
-    from .store import MODEL_CHOICE_FEATURE
+    from .gate import Subject
+    from .store import MODEL_FEATURE
 except ImportError:  # pragma: no cover - 本地平铺调试
     import model_card  # type: ignore
-    from gate import Subject, effect_in_scene  # type: ignore
-    from store import MODEL_CHOICE_FEATURE  # type: ignore
+    from gate import Subject  # type: ignore
+    from store import MODEL_FEATURE  # type: ignore
 
 # 序号会话上限（防御性：长期运行不涨内存；正常同时最多几十个）
 MAX_SESSIONS = 200
@@ -62,8 +65,7 @@ AVATAR_TIMEOUT = 3.0
 AVATAR_MISS_TTL = 600
 
 # 「当前使用」的来源文案
-SOURCE_CHOICE = "你自己切换的"
-SOURCE_OWN = "管理员配的专属模型"
+SOURCE_OWN = "专属模型"  # 私聊 = 他自己的；群聊 = 这个群的（卡片 note 里再区分）
 SOURCE_LEVEL = "分组主模型"
 SOURCE_LEVEL_FALLBACK = "分组备用模型（主模型不可用）"
 SOURCE_DEFAULT = "系统默认模型"
@@ -230,8 +232,8 @@ class ModelSwitcher:
         usable = available - circuit
         system_default = await self.system_default_of(subject)
         route = plugin.gate.resolve_model(subject, rules) or {}
-        own = str((plugin._subject_model or {}).get(uid) or "") if scene == "private" else ""
-        choice = str(effect_in_scene((plugin._model_choice or {}).get(uid), scene) or "")
+        # 专属模型：私聊 = 他自己的、群聊 = 这个群的（v1.3.12 起切换写的就是这一份）
+        own = self.own_model_of(subject, scene)
         current_id, current_source = await self.current_of(
             subject, scene, usable, system_default, route
         )
@@ -263,10 +265,6 @@ class ModelSwitcher:
             add(route.get("fallback_provider_id"))
         if own:
             add(own)
-        # 用户自己切过的那个也要列出来（哪怕它现在不可用）——否则他「切过的东西」凭空消失，
-        # 只会以为是插件把配置吃掉了
-        if choice:
-            add(choice)
         # 当前生效的那个也列出来：否则卡片上没有任何一行能标「当前使用」
         if current_id and current_source != SOURCE_DEFAULT:
             add(current_id)
@@ -282,7 +280,7 @@ class ModelSwitcher:
             if is_current:
                 note = f"当前使用 · {current_source}"
             elif is_own:
-                note = "管理员为你配置的专属模型"
+                note = "这个群的专属模型" if scene == "group" else "你的专属模型"
             options.append(
                 {
                     "index": i,
@@ -364,6 +362,19 @@ class ModelSwitcher:
         except Exception:
             return ""
 
+    def own_model_of(self, subject: Subject, scene: str) -> str:
+        """这个**会话主体**的专属模型：私聊 = 他的、群聊 = 这个群的；没配返回空。
+
+        与 ``main.route_model`` 的 ① 层同源（同一份内存缓存），卡片说的「专属模型」
+        必须就是路由实际会走的那一层。
+        """
+        plugin = self._plugin
+        if scene == "group":
+            gid = str(subject.group_id or "")
+            return str((getattr(plugin, "_subject_model_group", {}) or {}).get(gid) or "")
+        uid = str(subject.sender_id or "")
+        return str((getattr(plugin, "_subject_model", {}) or {}).get(uid) or "")
+
     async def current_of(
         self,
         subject: Subject,
@@ -378,22 +389,19 @@ class ModelSwitcher:
         某一层配了但提供商没加载 / 正在熔断时，实际走的是更粗的一层，
         这里若还报「当前使用 = 那个不可用的」，卡片就会撒谎。
 
+        顺序（v1.3.12）：专属模型 > 等级路由 > 系统默认（旧的「用户自选」层已废弃）。
+
         Args:
             available: 当前可用的提供商集合；为 None 时自己算一遍。
             system_default / route: 已经算好的话就传进来，省一次查询与一次解析。
         """
         plugin = self._plugin
-        uid = str(subject.sender_id or "")
         if available is None:
             available = plugin.provider_ids() - plugin.circuit.open_ids()
 
-        choice = effect_in_scene((plugin._model_choice or {}).get(uid), scene)
-        if choice and str(choice) in available:
-            return str(choice), SOURCE_CHOICE
-        if scene == "private":
-            own = str((plugin._subject_model or {}).get(uid) or "")
-            if own and own in available:
-                return own, SOURCE_OWN
+        own = self.own_model_of(subject, scene)
+        if own and own in available:
+            return own, SOURCE_OWN
         if route is None:
             route = plugin.gate.resolve_model(subject, plugin._rules()) or {}
         if route:
@@ -483,6 +491,42 @@ class ModelSwitcher:
             theme=str(plugin._cfg("model_card_theme", model_card.DEFAULT_THEME) or ""),
         )
 
+    async def build_success_card(self, subject: Subject, res: dict[str, Any]) -> Optional[bytes]:
+        """切换成功的**回执小卡片**：头（现在用的是哪个）+ 脚（结果一句话），没有候选行。
+
+        用户诉求：「切换成功也渲染当前使用的模型的图片，图片没出来就用文字兜底」。
+        渲染失败返回 None，调用方退回 ``res['message']`` 文本 —— 功能不能挂在一张图上。
+        """
+        try:
+            data = await self.describe(subject)
+            current_label = ""
+            if data.get("current_id"):
+                current_label = str(
+                    self._plugin.provider_info(str(data["current_id"])).get("label")
+                    or data["current_id"]
+                )
+            meta_parts = [f"分组：{self.group_label(data)}"]
+            today = data.get("today") or {}
+            if today:
+                meta_parts.append(
+                    f"今日 {_fmt_num(today.get('tokens'))} tokens · "
+                    f"{_as_int(today.get('calls'), 0)} 次对话"
+                )
+            return model_card.render_model_card(
+                title="模型切换",
+                current=current_label,
+                meta=" · ".join(meta_parts),
+                rows=[],  # 回执不讲候选，只讲「现在用哪个」
+                footer="已切换，从下一条消息起生效。",
+                avatar=await self.avatar_for(subject),
+                font_path=str(self._plugin._cfg("model_card_font", "") or ""),
+                theme=str(
+                    self._plugin._cfg("model_card_theme", model_card.DEFAULT_THEME) or ""
+                ),
+            )
+        except Exception:
+            return None
+
     def footer_of(self, data: dict[str, Any]) -> str:
         """卡片底部提示：能切就说怎么切，只读就说为什么切不了。
 
@@ -540,18 +584,24 @@ class ModelSwitcher:
             return {"ok": False, "message": f"{reason}，这次没有切换。"}
         options = list(item.get("options") or [])
         scene = str(item.get("scene") or "private")
-        uid = str(subject.sender_id or "")
-        if not uid:
-            return {"ok": False, "message": "无法识别你的账号，切换失败。"}
+        # 切换写的是「专属模型」这一把键（v1.3.12）：
+        # 私聊 = policy(user, feature=model)、群聊 = policy(group, feature=model)。
+        # 与控制台的「专属模型」是同一份数据，手动切换与指令切换互相看得见；
+        # 也因为群聊切的是**全群**的模型，群里才只放管理员切。
+        is_group = scene == "group"
+        scope_type = "group" if is_group else "user"
+        sid = str(subject.group_id or "") if is_group else str(subject.sender_id or "")
+        if not sid:
+            return {"ok": False, "message": "无法识别会话对象，切换失败。"}
 
         if index == 0:
             await plugin.store.set_policy(
-                "user", uid, "inherit", feature=MODEL_CHOICE_FEATURE, scene=scene
+                scope_type, sid, "inherit", feature=MODEL_FEATURE
             )
             await plugin.reload_rules()
             self.clear(subject)
             await plugin.store.log_audit(
-                "chat", "model_switch_reset", f"{uid} scene={scene}"
+                "chat", "model_switch_reset", f"{scope_type}:{sid} scene={scene}"
             )
             return {"ok": True, "message": "已恢复为分组配置的模型，从下一条消息起生效。"}
 
@@ -566,17 +616,24 @@ class ModelSwitcher:
             return {"ok": False, "message": "该选项不可用，请重新发送 /切换模型。"}
 
         await plugin.store.set_policy(
-            "user", uid, pid, feature=MODEL_CHOICE_FEATURE, scene=scene
+            scope_type,
+            sid,
+            pid,
+            feature=MODEL_FEATURE,
+            note="群专属模型（对全群生效）" if is_group else "好友专属模型（仅私聊生效）",
         )
         await plugin.reload_rules()
         self.clear(subject)
         label = str(picked.get("label") or pid)
-        await plugin.store.log_audit("chat", "model_switch", f"{uid} scene={scene} → {pid}")
+        await plugin.store.log_audit(
+            "chat", "model_switch", f"{scope_type}:{sid} scene={scene} → {pid}"
+        )
         note = "" if not picked.get("unavailable") else "（该模型当前未加载，等它可用后才会生效）"
+        scope_note = "，本群已生效" if is_group else ""
         return {
             "ok": True,
             "provider_id": pid,
-            "message": f"已切换为：{label}{note}\n从下一条消息起生效。",
+            "message": f"已切换为：{label}{note}\n从下一条消息起生效{scope_note}。",
         }
 
     # ------------------------------------------------------------------ #
@@ -629,6 +686,11 @@ class ModelSwitcher:
                     reason="",
                 )
                 res = await self.apply(subject, index)
+                if res.get("ok"):
+                    # 成功回执默认用图片（只讲「现在用哪个」的小卡片），画不出再退文字
+                    card = await self.build_success_card(subject, res)
+                    if card is not None and await plugin._send_image(event, card):
+                        return
                 await plugin._send(event, res.get("message", ""))
                 return
             await plugin._send(event, "参数要填序号（如 /切换模型 2），或直接发 /切换模型 看列表。")
@@ -673,5 +735,13 @@ class ModelSwitcher:
         except Exception:
             logger.exception("[UserGateway] 处理模型切换序号失败（忽略）")
             return False
+        if res.get("ok"):
+            # 成功回执默认用图片（只讲「现在用哪个」的小卡片），画不出再退文字
+            try:
+                card = await self.build_success_card(subject, res)
+            except Exception:
+                card = None
+            if card is not None and await plugin._send_image(event, card):
+                return True
         await plugin._send(event, str(res.get("message") or ""))
         return True

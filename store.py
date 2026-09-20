@@ -35,14 +35,14 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
 SCHEMA_VERSION = 10
 
 # policy 表的 feature 维度补充：
-#   model        → 好友专属模型（effect 存提供商 id；'' / 不存在 = 跟随等级配置）
-#   model_choice → **用户自己**用 /切换模型 选的模型（effect 存提供商 id，按场景分开存）
-#
-# 为什么「专属模型」与「用户切换」要分成两个 feature：
-#   model 是**管理员**给某个人钉死的模型（私聊生效，优先级高于等级路由）；
-#   model_choice 是**用户自己**的选择，会覆盖前两者（切了不生效等于没切）。
-#   两者混在一个 feature 里就无法回答「这个模型是管理员钉的，还是他自己挑的」，
-#   控制台也没法分开展示，所以分两把键。
+#   model        → 专属模型（effect 存提供商 id；'' / 不存在 = 跟随等级配置）。
+#                  v1.3.12 起**私聊（user 层）与群聊（group 层）共用这一个 feature**：
+#                  user = 好友专属（仅私聊生效）、group = 群专属（对全群生效），
+#                  /切换模型 改的也是它（私聊切自己的、群里管理员切这个群的）。
+#   model_choice → 【已废弃】旧版「用户自己切换的模型」（按场景分开存）。
+#                  它按**用户**存群场景的选择，导致「在 A 群切换 → 这个人在所有群都换了」
+#                  （跨群串号）。启动时由 migrate_model_choice 迁到 model 后清空；
+#                  常量与导入白名单保留，是为了旧备份文件还能原样导入（导入后同样闲置）。
 MODEL_FEATURE = "model"
 MODEL_CHOICE_FEATURE = "model_choice"
 
@@ -801,6 +801,53 @@ class Store:
         for r in rows:
             out.setdefault(str(r["scope_id"]), {})[str(r.get("scene") or "")] = str(r["effect"])
         return out
+
+    async def migrate_model_choice(self) -> int:
+        """v1.3.12 一次性迁移：「用户自己切换的模型」并入「专属模型」。
+
+        背景：旧版把 ``/切换模型`` 的结果按**用户**存（``model_choice``，群/私聊各一份），
+        于是「在 A 群切换 → 这个人在**所有**群里都换了模型」—— 用户反馈的跨群串号。
+        新语义：切换 = 改**专属模型**（私聊 = 用户的、群聊 = 群的），见 ``model_switch``。
+
+        - 私聊场景的旧选择 → 迁成该用户的专属模型（**他还没有专属模型时才迁**，
+          不覆盖管理员显式钉的值）；
+        - 群聊场景的旧选择 → 直接删：旧语义是「按人、跨所有群生效」，本来就不对，
+          没有可迁移的对象语义（用户在群里重发一次 /切换模型 即可）。
+        - 幂等：跑完 ``model_choice`` 表为空，再跑一遍是 no-op。
+
+        Returns:
+            实际迁成专属模型的条数（纯删除不计入）。
+        """
+        db = self._conn()
+        rows = await self.list_policies(feature=MODEL_CHOICE_FEATURE)
+        moved = 0
+        for r in rows:
+            scope_type = str(r["scope_type"])
+            scope_id = str(r["scope_id"])
+            scene = str(r.get("scene") or "")
+            effect = str(r["effect"])
+            if (
+                scope_type == "user"
+                and scene in ("", SCENE_ANY, "private")
+                and effect not in ("", "inherit")
+            ):
+                got = await self.get_effect("user", scope_id, MODEL_FEATURE, SCENE_ANY)
+                if not got:
+                    await self.set_policy(
+                        "user",
+                        scope_id,
+                        effect,
+                        feature=MODEL_FEATURE,
+                        note="由旧版「用户切换」迁移",
+                        scene=SCENE_ANY,
+                    )
+                    moved += 1
+            await db.execute(
+                "DELETE FROM policy WHERE scope_type = ? AND scope_id = ? AND feature = ? AND scene = ?",
+                (scope_type, scope_id, MODEL_CHOICE_FEATURE, scene),
+            )
+        await db.commit()
+        return moved
 
     async def command_policies(
         self,
@@ -2025,13 +2072,14 @@ class Store:
                     stats["skipped"] += 1
                     continue
                 if feature in PROVIDER_FEATURES:
-                    # 模型类规则只挂在「好友」这一层（与 /subject/model 接口一致）
+                    # 模型类规则挂「好友 / 群」两层（v1.3.12 起群也有专属模型，
+                    # 与 /subject/model 接口的 type 参数一致）；member / global 不收。
                     raw_effect = str(row.get("effect") or "").strip()
-                    if scope_type != "user" or not raw_effect or raw_effect == "inherit":
+                    if scope_type not in ("user", "group") or not raw_effect or raw_effect == "inherit":
                         stats["skipped"] += 1
                         continue
                     await self.set_policy(
-                        "user", scope_id, raw_effect, feature=feature,
+                        scope_type, scope_id, raw_effect, feature=feature,
                         note=str(row.get("note") or ""), scene=scene,
                     )
                     stats["policies"] += 1
