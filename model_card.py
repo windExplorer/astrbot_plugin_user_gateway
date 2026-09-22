@@ -156,6 +156,15 @@ DEFAULT_THEME = "indigo"
 COLOR_OWN = (178, 112, 10)  # 专属模型（琥珀）
 COLOR_WARN = (150, 156, 172)  # 暂不可用（灰）
 
+# 模型健康色（行首小圆点）：只有「不健康」才值得被一眼看到，所以 healthy 用浅绿、
+# degraded 琥珀、down 红、unknown 灰 —— 与 model_panel 面板同一套语义色。
+HEALTH_COLORS = {
+    "healthy": (34, 150, 102),
+    "degraded": (206, 128, 12),
+    "down": (212, 60, 84),
+    "unknown": (150, 156, 172),
+}
+
 # ---------------------------------------------------------------------- 字号
 F_LABEL = 20  # 顶部小标签「模型切换」
 F_CURRENT = 38  # 当前模型（主角）
@@ -165,6 +174,10 @@ F_NAME = 29
 F_NOTE = 20
 F_TAG = 19
 F_FOOTER = 20
+# 行内指标（延迟 / 成功率）：**比模型名小一档** ——
+# 它们是参考数字，不该和「我该切哪个模型」这件事抢注意力（用户原话：「字可以小一点」）。
+F_METRIC = 19
+METRIC_GAP = 18
 
 # 断行优先在这些字符处断开（模型名基本是「供应商 · 模型-版本」结构）
 _BREAK_CHARS = " ·-/_,|:：，、"
@@ -358,6 +371,25 @@ def _pill(draw: Any, fonts: _Fonts, text: str, right: int, cy: int, color: tuple
     return x0
 
 
+def _health_dot(draw: Any, cx: int, cy: int, color: tuple) -> None:
+    """行首那颗健康小圆点（外圈一层淡色晕，单个小点在浅底上太弱）。
+
+    注意：往 RGBA 图上画带 alpha 的颜色是**替换像素**而不是叠加，
+    直接用半透明色会在白底上挖出一个窟窿，所以淡色先跟白底混成不透明色。
+    """
+    r = 5
+    halo = r + 4
+    draw.ellipse([cx - halo, cy - halo, cx + halo, cy + halo], fill=_mix(color, CARD_BG, 0.75))
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+
+
+def _metrics_width(font: Any, texts: list[str]) -> int:
+    """一组指标（延迟 / 成功率）总共占多宽（含它们之间的间距）。"""
+    if not texts:
+        return 0
+    return sum(int(font.getlength(t)) for t in texts) + METRIC_GAP * (len(texts) - 1)
+
+
 def _header_lines(fonts: _Fonts, current: str, limit: float) -> list[str]:
     """当前模型那一行（最多两行）。空字符串 → 空列表（调用方不画这一行）。"""
     text = " ".join(str(current or "").split())
@@ -382,8 +414,10 @@ def render_model_card(
 
     Args:
         title: 顶部小标签（如「模型切换」）。
-        rows: 每行 ``{index, label, note, current, own, unavailable}``：
-            序号 / 模型名 / 次文案 / 是否当前使用 / 是否专属模型 / 是否暂不可用。
+        rows: 每行 ``{index, label, note, current, own, unavailable, latency, rate, health}``：
+            序号 / 模型名 / 次文案 / 是否当前使用 / 是否专属模型 / 是否暂不可用 /
+            延迟文本 / 成功率文本 / 健康态（``healthy``/``degraded``/``down``/``unknown``）。
+            后三项**可选**：拿不到 model_panel 的数据时整组不画（见 ``detect.py``）。
         current: **当前使用的模型名**（头部的主角，最多两行，不截断）；空则不画这一行。
         meta: 头部下方一行小字（如「VIP（好友等级）· 今日 12.3K tokens · 8 次对话」）。
         footer: 底部提示（如「回复序号切换 · 60 秒内有效 · 0 = 恢复默认」）。
@@ -526,7 +560,25 @@ def render_model_card(
             for text, color, filled in tags:
                 right = _pill(draw, fonts, text, right, cy, color, filled) - 10
 
+            # 指标（延迟 / 成功率）：右对齐排在标签左边，字号比模型名小一档。
+            # 没数据时**整组消失**（而不是显示「-ms / -%」）：一列占位符比空着更难看，
+            # 而且「这一行没数据」本身由 note 里的时间说明。
+            metrics = [t for t in (str(row.get("latency") or ""), str(row.get("rate") or "")) if t]
+            f_metric = fonts.get(F_METRIC)
+            if metrics:
+                mw = _metrics_width(f_metric, metrics)
+                mx = right - mw
+                for text in metrics:
+                    draw.text((mx, cy), text, font=f_metric,
+                              fill=TEXT_MUTED + (255,), anchor="lm")
+                    mx += int(f_metric.getlength(text)) + METRIC_GAP
+                right -= mw + 24
+
             label_x = bx + BADGE + 18
+            health = str(row.get("health") or "")
+            if health:
+                _health_dot(draw, label_x + 6, cy, HEALTH_COLORS.get(health, HEALTH_COLORS["unknown"]))
+                label_x += 22
             limit = right - label_x - 16
             note = str(row.get("note") or "")
             label = _fit(str(row.get("label") or ""), name_font, limit)

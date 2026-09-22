@@ -184,6 +184,7 @@ const levelForm = ref<
   provider_id: "",
   fallback_provider_id: "",
   switch_enabled: false,
+  detect_enabled: false,
   switch_providers: [],
   quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
 });
@@ -203,6 +204,7 @@ const levelForm = ref<
   provider_id: row.provider_id || "",
   fallback_provider_id: row.fallback_provider_id || "",
   switch_enabled: !!row.switch_enabled,
+  detect_enabled: !!row.detect_enabled,
   switch_providers: [...(row.switch_providers || [])],
       quotas: {
         day: row.quotas?.day ? { limit: row.quotas.day.limit_tokens, mode: row.quotas.day.mode as "enforce" | "observe" } : { limit: null, mode: "enforce" },
@@ -222,6 +224,7 @@ const levelForm = ref<
       provider_id: "",
       fallback_provider_id: "",
       switch_enabled: false,
+      detect_enabled: false,
       switch_providers: [],
       quotas: { day: { limit: null, mode: "enforce" }, month: { limit: null, mode: "enforce" }, total: { limit: null, mode: "enforce" } },
     };
@@ -255,6 +258,7 @@ async function saveLevel() {
       provider_id: f.provider_id || "",
       fallback_provider_id: f.fallback_provider_id || "",
       switch_enabled: !!f.switch_enabled,
+      detect_enabled: !!f.detect_enabled,
       switch_providers: f.switch_providers || [],
       quotas,
     });
@@ -400,45 +404,66 @@ const levelColumns: DataTableColumns<LevelRow> = [
     },
   },
   {
-    // 自助切换（v9/v10）：开关 + 该等级的用户发 /切换模型 时能挑的范围
+    // 自助切换（v9/v10）+ 检测（v11）：开关 + 该等级的用户发 /切换模型 时能挑的范围
     title: "自助切换",
     key: "switch_providers",
     minWidth: 180,
     render: (row) => {
       const list = row.switch_providers || [];
-      if (!row.switch_enabled) {
-        return h(
-          NTooltip,
-          { trigger: "hover" },
-          {
-            trigger: () =>
-              h(NTag, { size: "small", bordered: false }, { default: () => "只读（默认）" }),
-            default: () =>
-              "该等级的用户发 /切换模型 只能查看「当前使用 / 系统默认 / 备用」，不能切换",
-          },
-        );
-      }
       const names = list.length
         ? list.map((id) => providerLabel(id))
         : ["当前使用的模型", "系统默认模型", "备用模型"];
-      return h(
+      // 切换：只读 / 允许（带可挑范围）
+      const switchNode = row.switch_enabled
+        ? h(
+            NTooltip,
+            { trigger: "hover" },
+            {
+              trigger: () =>
+                h("div", { style: "line-height:1.35;cursor:default" }, [
+                  h(
+                    NTag,
+                    { size: "small", bordered: false, type: "success" },
+                    { default: () => (list.length ? `允许 · ${list.length} 个` : "允许 · 兜底三项") },
+                  ),
+                  h("div", { style: "font-size:12px;opacity:.65" }, names.join("、")),
+                ]),
+              default: () =>
+                (list.length ? "用户发 /切换模型 时可选：\n" : "未配名单，用户可在兜底三项里选：\n") +
+                names.map((n, i) => `${i + 1}. ${n}`).join("\n"),
+            },
+          )
+        : h(
+            NTooltip,
+            { trigger: "hover" },
+            {
+              trigger: () =>
+                h(NTag, { size: "small", bordered: false }, { default: () => "只读（默认）" }),
+              default: () =>
+                "该等级的用户发 /切换模型 只能查看「当前使用 / 系统默认 / 备用」，不能切换",
+            },
+          );
+      // 检测（v11）：与上面独立 —— 它是花钱的，所以单独一个标签
+      const detectNode = h(
         NTooltip,
         { trigger: "hover" },
         {
           trigger: () =>
-            h("div", { style: "line-height:1.35;cursor:default" }, [
-              h(
-                NTag,
-                { size: "small", bordered: false, type: "success" },
-                { default: () => (list.length ? `允许 · ${list.length} 个` : "允许 · 兜底三项") },
-              ),
-              h("div", { style: "font-size:12px;opacity:.65" }, names.join("、")),
-            ]),
+            h(
+              NTag,
+              { size: "small", bordered: false, type: row.detect_enabled ? "info" : "default" },
+              { default: () => (row.detect_enabled ? "可用检测" : "检测关闭") },
+            ),
           default: () =>
-            (list.length ? "用户发 /切换模型 时可选：\n" : "未配名单，用户可在兜底三项里选：\n") +
-            names.map((n, i) => `${i + 1}. ${n}`).join("\n"),
+            row.detect_enabled
+              ? "该等级的用户可以发 /切换模型检测（真打模型、会花额度；需要装萌萌模型控制台）"
+              : "该等级的用户不能用 /切换模型检测（默认关；打开要在这个等级的编辑里勾）",
         },
       );
+      return h("div", { style: "line-height:1.35" }, [
+        switchNode,
+        h("div", { style: "margin-top:4px" }, [detectNode]),
+      ]);
     },
   },
   { title: "额度模板", key: "quotas", minWidth: 200, render: (row) => levelQuotaText(row) },
@@ -859,6 +884,29 @@ onMounted(load);
               用户的选择存在他自己身上（私聊 / 群聊各一份），不覆盖这里的<b>主模型</b>配置：
               这里配的是「默认走哪个」，名单是「允许他自己换成哪些」；
               用户随时可以发「/切换模型 0」回到这里配的主模型。
+            </span>
+          </n-space>
+        </n-form-item>
+        <n-form-item label="允许检测模型">
+          <n-space vertical :size="4" style="width: 100%">
+            <n-space align="center" :size="10">
+              <n-switch v-model:value="levelForm.detect_enabled" size="small" />
+              <n-tag
+                size="small"
+                :bordered="false"
+                :type="levelForm.detect_enabled ? 'success' : 'default'"
+              >
+                {{ levelForm.detect_enabled ? "可用 /切换模型检测" : "不可用（默认）" }}
+              </n-tag>
+            </n-space>
+            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
+              打开后该等级的用户可以发 <b>/切换模型检测</b>：真打一遍本分组允许使用的模型，
+              然后把<b>延迟 / 成功率 / 数据时间</b>标在「切换模型」卡片上。<br />
+              它<b>会真花额度</b>（每个模型打一次，通常是免费额度或极少量），所以与上面的
+              「允许切换模型」<b>分开两个开关</b>：能看不等于愿意花钱测。<br />
+              需要先安装「<b>萌萌模型控制台</b>」（astrbot_plugin_model_panel）：检测由它执行、
+              结果也存在它那边；没装时这条指令会直接提示去装。<br />
+              <b>管理员不受限制</b>；非管理员另有冷却（配置页「模型检测」分区可调）。
             </span>
           </n-space>
         </n-form-item>

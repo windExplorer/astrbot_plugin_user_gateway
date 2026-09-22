@@ -32,7 +32,7 @@ except ImportError as e:  # pragma: no cover - AstrBot 启动时按 requirements
     ) from e
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # policy 表的 feature 维度补充：
 #   model        → 专属模型（effect 存提供商 id；'' / 不存在 = 跟随等级配置）。
@@ -269,6 +269,9 @@ CREATE INDEX IF NOT EXISTS idx_quota_scope ON llm_quota(scope_type, scope_id);
 -- switch_enabled（v10）→ 该等级**是否允许切换**（0 = 只读，只能看不能切；**默认关**）。
 --   与名单分开两列是有意的：先「开不开」再「能挑哪些」；
 --   只读时名单仍然要展示（用户得知道自己现在用的是哪个），所以不能只靠名单空不空来表达。
+-- detect_enabled（v11）→ 该等级**是否允许用 `/切换模型检测`**（0 = 不允许；**默认关**）。
+--   它花的是真额度（检测要真打一次模型），所以与「能不能切换」分开两个开关：
+--   「允许看看有哪些模型」和「允许花钱去打一遍」不是一回事。
 CREATE TABLE IF NOT EXISTS quota_level (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     kind                 TEXT    NOT NULL,
@@ -283,6 +286,7 @@ CREATE TABLE IF NOT EXISTS quota_level (
     fallback_provider_id TEXT    NOT NULL DEFAULT '',
     switch_providers     TEXT    NOT NULL DEFAULT '',
     switch_enabled       INTEGER NOT NULL DEFAULT 0,
+    detect_enabled       INTEGER NOT NULL DEFAULT 0,
     updated_at           INTEGER NOT NULL,
     UNIQUE (kind, name)
 );
@@ -443,8 +447,24 @@ class Store:
             await cls._migrate_v8_to_v9(db)
         if old_version < 10:
             await cls._migrate_v9_to_v10(db)
+        if old_version < 11:
+            await cls._migrate_v10_to_v11(db)
         # v6 → v7 只新增了一张空表（group_member），上面的 SCHEMA_SQL 已经建好，
         # 没有数据要搬，所以不需要单独的迁移步骤 —— 这里留个说明避免以后误以为漏了。
+
+    @staticmethod
+    async def _migrate_v10_to_v11(db: aiosqlite.Connection) -> None:
+        """v10 → v11：等级新增「是否允许用 /切换模型检测」开关（``detect_enabled``）。
+
+        **默认 0（关）**：这条指令会真打模型、花真额度，所以新功能一律不改变既有行为 ——
+        升级后所有分组都是「不允许」，要放开就在控制台对应等级上显式打开。
+        按列是否存在判断，可重入。
+        """
+        if "detect_enabled" in await Store._table_columns(db, "quota_level"):
+            return
+        await db.execute(
+            "ALTER TABLE quota_level ADD COLUMN detect_enabled INTEGER NOT NULL DEFAULT 0"
+        )
 
     @staticmethod
     async def _migrate_v9_to_v10(db: aiosqlite.Connection) -> None:
@@ -1065,6 +1085,7 @@ class Store:
         command_effect_group: str = "inherit",
         switch_providers: Any = "",
         switch_enabled: Any = False,
+        detect_enabled: Any = False,
     ) -> int:
         """新建 / 更新等级，返回等级 id（``level_id`` 为空则按 ``(kind, name)`` 新建）。
 
@@ -1075,17 +1096,21 @@ class Store:
           走指定提供商，主提供商不可用（未加载 / 熔断）时用备用那个；
         - ``switch_providers``：该等级**允许用户自助切换**的提供商 id 列表
           （v9，收 list 或 JSON 文本；空 = 用兜底三项：当前 / 系统默认 / 备用）；
-        - ``switch_enabled``：该等级**是否允许切换**（v10，默认假 = 只读）。
+        - ``switch_enabled``：该等级**是否允许切换**（v10，默认假 = 只读）；
+        - ``detect_enabled``：该等级**是否允许用 ``/切换模型检测``**（v11，默认假）。
+          它与 ``switch_enabled`` 是两件事：检测要真花钱打模型，只看不切的分组未必愿意掏这笔钱。
         """
         db = self._conn()
         switch_json = dump_provider_list(switch_providers)
         switch_flag = _as_flag(switch_enabled)
+        detect_flag = _as_flag(detect_enabled)
         if level_id:
             await db.execute(
                 "UPDATE quota_level SET kind = ?, name = ?, description = ?, effect = ?, "
                 "command_effect = ?, effect_group = ?, command_effect_group = ?, "
                 "sort_order = ?, provider_id = ?, fallback_provider_id = ?, "
-                "switch_providers = ?, switch_enabled = ?, updated_at = ? WHERE id = ?",
+                "switch_providers = ?, switch_enabled = ?, detect_enabled = ?, "
+                "updated_at = ? WHERE id = ?",
                 (
                     kind,
                     name,
@@ -1099,6 +1124,7 @@ class Store:
                     str(fallback_provider_id or ""),
                     switch_json,
                     switch_flag,
+                    detect_flag,
                     now_ts(),
                     int(level_id),
                 ),
@@ -1108,8 +1134,9 @@ class Store:
         await db.execute(
             "INSERT INTO quota_level(kind, name, description, effect, command_effect, "
             "effect_group, command_effect_group, sort_order, "
-            "provider_id, fallback_provider_id, switch_providers, switch_enabled, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "provider_id, fallback_provider_id, switch_providers, switch_enabled, "
+            "detect_enabled, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, name) DO UPDATE SET "
             "description = excluded.description, effect = excluded.effect, "
             "command_effect = excluded.command_effect, "
@@ -1119,6 +1146,7 @@ class Store:
             "fallback_provider_id = excluded.fallback_provider_id, "
             "switch_providers = excluded.switch_providers, "
             "switch_enabled = excluded.switch_enabled, "
+            "detect_enabled = excluded.detect_enabled, "
             "updated_at = excluded.updated_at",
             (
                 kind,
@@ -1133,6 +1161,7 @@ class Store:
                 str(fallback_provider_id or ""),
                 switch_json,
                 switch_flag,
+                detect_flag,
                 now_ts(),
             ),
         )

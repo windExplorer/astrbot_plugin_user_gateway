@@ -43,7 +43,7 @@ async def main() -> int:
         check(Path(db_path).exists(), "数据库文件已创建")
 
         print("\n[2] settings")
-        check(await st.get_setting("schema_version") == "10", "schema_version 已写入 10")
+        check(await st.get_setting("schema_version") == "11", "schema_version 已写入 11")
         check(await st.get_setting("nope", "d") == "d", "缺省值回退")
         await st.set_setting("sync_last_at", "123")
         check(await st.get_setting("sync_last_at") == "123", "写入后可读")
@@ -445,6 +445,18 @@ async def main() -> int:
             switch_providers=["prov-a", "prov-b"], switch_enabled=True,
         )
         check(int((await st.get_level(lv_vip))["switch_enabled"]) == 1, "开关与名单可以一起写")
+        # 允许检测指令的开关（v11）：同样默认关，且与 switch_enabled **互相独立**
+        # （能看不等于愿意花钱测：检测会真打模型）
+        lv = await st.get_level(lv_vip)
+        check(int(lv["detect_enabled"]) == 0, "不传 detect_enabled → 默认 0（不允许检测）")
+        await st.upsert_level("user", "VIP改名", level_id=lv_vip, switch_enabled=False,
+                              detect_enabled=True)
+        lv = await st.get_level(lv_vip)
+        check(int(lv["detect_enabled"]) == 1 and int(lv["switch_enabled"]) == 0,
+              "检测开关与切换开关互不影响（只读也能开检测）")
+        await st.upsert_level("user", "VIP改名", level_id=lv_vip, detect_enabled="0")
+        check(int((await st.get_level(lv_vip))["detect_enabled"]) == 0,
+              "字符串 \"0\" 收口成 0（走 _as_flag，与 switch_enabled 同一套）")
 
         # 用户切换（model_choice，v9）已废弃：迁移进专属模型（v1.3.12）。
         # 私聊选择 → 专属模型（没有专属的才迁）；群聊选择（旧语义跨群串号）→ 直接删。
@@ -541,7 +553,7 @@ async def main() -> int:
 
         st3 = Store(v1_path)
         await st3.open()
-        check(await st3.get_setting("schema_version") == "10", "版本号直接升到最新（v1 → v10 连续迁移）")
+        check(await st3.get_setting("schema_version") == "11", "版本号直接升到最新（v1 → v11 连续迁移）")
         q = await st3.get_quota("user", "10001", "day")
         check(q is not None and q["limit_tokens"] == 1000 and "used_tokens" not in q,
               "限额保留、用量的列已移除")
@@ -587,7 +599,7 @@ async def main() -> int:
 
         st5 = Store(v2_path)
         await st5.open()
-        check(await st5.get_setting("schema_version") == "10", "版本号升到 10（v2 → v3 → … → v9 → v10 连续迁移）")
+        check(await st5.get_setting("schema_version") == "11", "版本号升到 11（v2 → v3 → … → v10 → v11 连续迁移）")
         lv = await st5.get_level(1)
         check(lv is not None and lv["name"] == "老等级", "v2 的等级数据保留")
         check(
@@ -597,6 +609,8 @@ async def main() -> int:
         check(lv.get("switch_providers") == "", "v9 新增的「可切换模型」列默认为空")
         check(int(lv.get("switch_enabled") or 0) == 0,
               "v10 新增的「允许切换」开关默认为 0（只读：升级后不会凭空放开自助切换）")
+        check(int(lv.get("detect_enabled") or 0) == 0,
+              "v11 新增的「允许检测」开关默认为 0（要花钱的指令，升级后不会凭空放开）")
         check(lv.get("command_effect") == "inherit", "v5 新增的 level.command_effect 默认为 inherit")
         await st5.upsert_level("user", "老等级", level_id=1, provider_id="p1", fallback_provider_id="p2")
         lv = await st5.get_level(1)
@@ -663,7 +677,7 @@ async def main() -> int:
 
         st8 = Store(v5_path)
         await st8.open()
-        check(await st8.get_setting("schema_version") == "10", "版本号升到 10")
+        check(await st8.get_setting("schema_version") == "11", "版本号升到 11")
         em = await st8.effect_map("user")
         check(em == {"10001": {"": "deny"}}, f"旧规则落到「通用」场景（实得 {em}）")
         check(await st8.resolve_policy("user", "10001", "llm", "group") == "deny",
@@ -685,7 +699,7 @@ async def main() -> int:
         await st8.close()
         st9 = Store(v5_path)
         await st9.open()
-        check(await st9.get_setting("schema_version") == "10", "重开不会重复迁移")
+        check(await st9.get_setting("schema_version") == "11", "重开不会重复迁移")
         check(await st9.resolve_policy("user", "10001", "llm", "private") == "allow", "重开后规则仍在")
         await st9.close()
 

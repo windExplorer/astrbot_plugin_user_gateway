@@ -151,6 +151,11 @@ class Rules:
     """``{level_id: 是否允许切换}``（v10，**默认假 = 只读**）。
 
     只读时用户仍然能看（当前用的是哪个、有哪些候选），但回序号不生效、``/切换模型 N`` 被拒。"""
+    level_detect_enabled: Mapping[Any, bool] = field(default_factory=dict)
+    """``{level_id: 是否允许用 /切换模型检测}``（v11，**默认假**）。
+
+    与 :attr:`level_switch_enabled` 分开两个开关：检测要真打模型、花真额度，
+    「允许看看有哪些模型」和「允许花钱去打一遍」不是一回事。"""
     command_policy: Mapping[str, Mapping[str, Mapping[str, Mapping[str, str]]]] = field(
         default_factory=dict
     )
@@ -575,6 +580,20 @@ class Gate:
             return False
         try:
             return bool(rules.level_switch_enabled.get(int(level_id)))
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def detect_enabled(rules: Rules, level_id: Any) -> bool:
+        """该等级**是否允许用 ``/切换模型检测``**（v11，没归级 / 没配一律视为不允许）。
+
+        与 :meth:`switch_enabled` 同样的取舍：「显式打开才允许」。
+        检测会真打模型、花真额度，默认放开的代价比默认关掉大得多。
+        """
+        if level_id is None:
+            return False
+        try:
+            return bool(rules.level_detect_enabled.get(int(level_id)))
         except (TypeError, ValueError):
             return False
 

@@ -278,7 +278,9 @@ class ModelSwitcher:
             is_own = bool(own) and pid == own
             note = ""
             if is_current:
-                note = f"当前使用 · {current_source}"
+                # 只写「来源」不写「当前使用」：后者已经由行右侧那个实心标签表达了，
+                # 重复一遍反而把第二行占满 —— 那一行现在要留给「数据是什么时候的」。
+                note = str(current_source or "")
             elif is_own:
                 note = "这个群的专属模型" if scene == "group" else "你的专属模型"
             options.append(
@@ -459,8 +461,22 @@ class ModelSwitcher:
             }
         return _logo_bytes()
 
-    async def build_card(self, subject: Subject, data: dict[str, Any]) -> Optional[bytes]:
-        """渲染卡片；渲染不出来返回 None（调用方退回文本列表）。"""
+    async def build_card(
+        self,
+        subject: Subject,
+        data: dict[str, Any],
+        *,
+        title: str = "模型切换",
+        rows: Optional[list[dict[str, Any]]] = None,
+        footer: Optional[str] = None,
+        meta_extra: str = "",
+    ) -> Optional[bytes]:
+        """渲染卡片；渲染不出来返回 None（调用方退回文本列表）。
+
+        ``title`` / ``rows`` / ``footer`` 三个参数是给 `/切换模型检测` 复用的：
+        它要发同一张卡的两种形态（「正在检测…」无候选行、「检测完成」带最新数字），
+        所以头部（当前模型 + 分组 + 今日用量）与样式只在这里拼一次。
+        """
         plugin = self._plugin
         avatar = await self.avatar_for(subject)
 
@@ -479,13 +495,15 @@ class ModelSwitcher:
                 f"今日 {_fmt_num(today.get('tokens'))} tokens · "
                 f"{_as_int(today.get('calls'), 0)} 次对话"
             )
+        if meta_extra:
+            meta_parts.append(str(meta_extra))
 
         return model_card.render_model_card(
-            title="模型切换",
+            title=title,
             current=current_label,
             meta=" · ".join(meta_parts),
-            rows=data.get("options") or [],
-            footer=self.footer_of(data),
+            rows=list(rows) if rows is not None else (data.get("options") or []),
+            footer=self.footer_of(data) if footer is None else str(footer),
             avatar=avatar,
             font_path=str(plugin._cfg("model_card_font", "") or ""),
             theme=str(plugin._cfg("model_card_theme", model_card.DEFAULT_THEME) or ""),
@@ -648,6 +666,12 @@ class ModelSwitcher:
             return
 
         data = await self.describe(subject)
+        # 给候选行补上「健康点 / 延迟 / 成功率 / 数据时间」（检测数据来自 model_panel）。
+        # 拿不到那边就安静跳过：这张卡本身不依赖它，缺另一个插件不该让 /切换模型 变成报错。
+        try:
+            await plugin.detector.annotate(data)
+        except Exception as e:
+            logger.warning(f"[UserGateway] 补充模型检测指标失败（忽略）: {e}")
         if data.get("group_restricted") and not data.get("is_admin"):
             # 群聊仅管理员可用：不发卡片（需求就是「群里只有管理员能用」），
             # 但要说清去哪儿用，别让用户以为是插件坏了。

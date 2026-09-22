@@ -1297,6 +1297,8 @@ async def h_levels(plugin) -> dict:
                 "switch_providers": parse_provider_list(lv.get("switch_providers")),
                 # v10：是否允许切换（false = 只读，能看不能切；**默认 false**）
                 "switch_enabled": bool(int(lv.get("switch_enabled") or 0)),
+                # v11：是否允许用 /切换模型检测（会真打模型花钱，**默认 false**）
+                "detect_enabled": bool(int(lv.get("detect_enabled") or 0)),
                 "members": int(counts.get(lid, 0)),
                 "quotas": limits.get(str(lid), {}),
             },
@@ -1350,6 +1352,7 @@ async def h_set_level(plugin) -> dict:
     - ``effect``：等级默认 **LLM** 权限；``effect_command``：等级默认 **指令** 权限
       （``deny`` 即该等级不能用任何指令）；
     - ``switch_enabled``（v10）：该等级**是否允许**用户用 ``/切换模型`` 自助切换（默认假 = 只读）；
+    - ``detect_enabled``（v11）：该等级**是否允许**用户用 ``/切换模型检测``（默认假；会真花钱）；
     - ``switch_providers``：可切换的模型名单（v9，空 = 展示兜底三项：当前 / 系统默认 / 备用）；
     - ``quotas`` 里 ``limit_tokens=0`` 表示「明确不限」，``null`` / ``delete=true`` 表示删掉该周期。
     """
@@ -1408,6 +1411,11 @@ async def h_set_level(plugin) -> dict:
         switch_enabled = _as_bool(body.get("switch_enabled"), default=False)
     else:
         switch_enabled = bool(int((old or {}).get("switch_enabled") or 0))
+    # 是否允许检测指令（v11）：与 switch_enabled 同一套写法 —— 缺省沿用原值、默认关
+    if "detect_enabled" in body:
+        detect_enabled = _as_bool(body.get("detect_enabled"), default=False)
+    else:
+        detect_enabled = bool(int((old or {}).get("detect_enabled") or 0))
 
     new_id = await plugin.store.upsert_level(
         kind,
@@ -1423,6 +1431,7 @@ async def h_set_level(plugin) -> dict:
         command_effect_group=cmd_eff_group,
         switch_providers=switch_providers,
         switch_enabled=switch_enabled,
+        detect_enabled=detect_enabled,
     )
     if not new_id:
         return err("等级写入失败")

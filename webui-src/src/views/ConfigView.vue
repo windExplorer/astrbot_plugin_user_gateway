@@ -161,6 +161,7 @@ const GROUPS: { name: string; hint: string; keys: string[] }[] = [
   { name: "同步", hint: "好友 / 群列表的同步与头像", keys: ["sync_interval_min", "sync_timeout_sec", "sync_group_members", "load_avatars", "avatar_source", "avatar_cache_days", "avatar_timeout_sec"] },
   { name: "最后回复", hint: "记录 bot 在每个好友 / 群里的最后一条回复", keys: ["track_bot_messages"] },
   { name: "模型路由", hint: "按等级给会话指定主 / 备用模型；用户也能用「/切换模型」在等级圈定的名单里自助换", keys: ["model_route_enabled", "model_route_failure_threshold", "model_route_circuit_sec", "model_switch_enabled", "model_switch_timeout_sec", "model_card_recall", "model_card_theme", "model_card_font"] },
+  { name: "模型检测", hint: "「/切换模型检测」的总开关与两道冷却（检测由「萌萌模型控制台」执行，需要先装它；能不能用还取决于各个等级的「允许检测」开关）", keys: ["detect_command_enabled", "detect_command_cooldown_min", "detect_model_cooldown_min", "detect_max_models"] },
   { name: "统计", hint: "用量明细的保留策略", keys: ["retention_days"] },
   { name: "高级", hint: "排查问题时才需要改", keys: ["guard_priority", "debug_log"] },
 ];

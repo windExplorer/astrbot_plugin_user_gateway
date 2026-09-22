@@ -347,6 +347,8 @@ export interface LevelRow {
   fallback_provider_id: string;
   /** 是否允许该等级的用户用 /切换模型 自助切换（false = 只读：能看不能切） */
   switch_enabled: boolean;
+  /** 是否允许该等级的用户用 /切换模型检测（false = 不允许；会真打模型、消耗额度） */
+  detect_enabled: boolean;
   /** 可切换的模型名单（空数组 = 展示兜底三项：当前 / 系统默认 / 备用） */
   switch_providers: string[];
   members: number;
@@ -368,6 +370,8 @@ export interface LevelPayload {
   fallback_provider_id?: string;
   /** 是否允许自助切换（缺省 = 沿用原值；默认关 = 只读） */
   switch_enabled?: boolean;
+  /** 是否允许检测指令（缺省 = 沿用原值；默认关） */
+  detect_enabled?: boolean;
   /** 可切换模型名单（缺省 = 沿用原值；传空数组 = 用兜底三项） */
   switch_providers?: string[];
   quotas?: { period: string; limit_tokens: number | null; mode?: string; delete?: boolean }[];

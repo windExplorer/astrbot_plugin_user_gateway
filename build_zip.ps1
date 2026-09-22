@@ -72,6 +72,7 @@ $includeList = @(
     "model_switch.py",   # /switch-model command flow (v1.3.3)
     "model_card.py",     # Pillow card renderer (v1.3.3)
     "recall.py",         # auto-recall temporary messages (v1.3.9)
+    "detect.py",         # /switch-model-detect: proxies model_panel detection (v1.3.18)
     "_conf_schema.json",
     "metadata.yaml",
     "requirements.txt",

@@ -64,6 +64,7 @@ def _reload_sibling_modules() -> None:
         "sync",
         "model_card",
         "recall",
+        "detect",
         "model_switch",
         "webui_api",
     ):
@@ -90,6 +91,7 @@ try:  # 包内相对导入（AstrBot 正常加载路径）
         effect_in_scene,
         layer_label,
     )
+    from .detect import ModelDetector
     from .model_switch import ModelSwitcher
     from .recall import Recaller
     from .store import (
@@ -120,6 +122,7 @@ except ImportError as _rel_err:
             effect_in_scene,
             layer_label,
         )
+        from detect import ModelDetector  # type: ignore
         from model_switch import ModelSwitcher  # type: ignore
         from recall import Recaller  # type: ignore
         from store import (  # type: ignore
@@ -136,7 +139,7 @@ except ImportError as _rel_err:
         raise ImportError(
             "萌萌权限控制台：子模块导入失败。"
             f"相对导入报错 {_rel_err!r}；平铺导入报错 {_flat_err!r}。"
-            "若报错是 No module named 'gate' / 'quota' / 'sync' / 'avatar' / 'model_switch' / 'model_card' / 'recall'，"
+            "若报错是 No module named 'gate' / 'quota' / 'sync' / 'avatar' / 'model_switch' / 'model_card' / 'recall' / 'detect'，"
             "说明**安装包少了文件**（打包脚本 build_zip.ps1 的 $includeList 未同步新增模块），"
             "请用仓库里最新的 zip 重新安装，或把缺失的 .py 补进插件目录。"
         ) from _flat_err
@@ -203,6 +206,8 @@ class UserGatewayPlugin(Star):
         self._level_switch: dict[int, tuple[str, ...]] = {}
         # 等级**是否允许**切换（v10，默认关 = 只读）：{level_id: bool}
         self._level_switch_enabled: dict[int, bool] = {}
+        # 等级**是否允许**用 /切换模型检测（v11，默认关）：{level_id: bool}
+        self._level_detect_enabled: dict[int, bool] = {}
         # 限额规则：{scope_type(user|group|level|global): {scope_id: {period: row}}}
         self._limits: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
         # 用量计数：{scope_type(user|group|member): {scope_id: {period: row}}}
@@ -232,6 +237,9 @@ class UserGatewayPlugin(Star):
         self.scheduler = SyncScheduler(self)
         # M12：用户自助切换模型（/切换模型 + 回序号），状态全在内存（见 model_switch.py）
         self.switcher = ModelSwitcher(self)
+        # M14：切换模型检测（/切换模型检测）—— 检测逻辑走 model_panel，见 detect.py
+        # 两道冷却（指令级 + 模型级）都在 detector 里，因为它读的配置与判定对象都是指令侧的
+        self.detector = ModelDetector(self)
         # M13：临时消息（卡片）到点自动撤回（见 recall.py；只有 QQ 能真撤）
         self.recaller = Recaller(self)
         # 会话 → 本次 LLM 请求的起始信息（用于估算 token 与统计延迟）
@@ -437,6 +445,10 @@ class UserGatewayPlugin(Star):
             self._level_switch_enabled = {
                 int(lv["id"]): bool(int(lv.get("switch_enabled") or 0)) for lv in levels
             }
+            # 是否允许 /切换模型检测（v11）：同样是「显式打开才允许」
+            self._level_detect_enabled = {
+                int(lv["id"]): bool(int(lv.get("detect_enabled") or 0)) for lv in levels
+            }
             self._subject_level_user = await self.store.subject_level_map("user")
             self._subject_level_group = await self.store.subject_level_map("group")
             # 好友的「群聊专属」等级（v8：私聊等级与群聊等级分开配）
@@ -522,6 +534,7 @@ class UserGatewayPlugin(Star):
             level_model=self._level_route,
             level_switch=self._level_switch,
             level_switch_enabled=self._level_switch_enabled,
+            level_detect_enabled=self._level_detect_enabled,
             command_policy=self._cmd_policy,
             command_master=self._cmd_master,
             level_command_effect=self._level_cmd_effect,
@@ -1090,6 +1103,28 @@ class UserGatewayPlugin(Star):
                 event.stop_event()
         except Exception:
             logger.exception("[UserGateway] 模型切换序号处理异常（忽略）")
+
+    # ------------------------------------------------------------------ #
+    # M14：切换模型检测（检测走 model_panel，见 detect.py）
+    # ------------------------------------------------------------------ #
+    @astr_filter.command("切换模型检测")
+    async def cmd_switch_detect(self, event: AstrMessageEvent) -> None:
+        """给本分组允许使用的模型做一次体检（存活 / 延迟 / 成功率），然后发最新的切换卡。
+
+        为什么指令名是「切换模型检测」而不是「模型检测」：**不与 model_panel 抢名字**。
+        那个插件已经有 ``/模型检测``（管理员限定、可在聊天里直接打单个模型），
+        两个插件注册同一个指令名会让一条消息触发两次回复 —— 用户只会觉得 bot 抽了。
+        名字带「切换模型」也是刻意的：它检测的就是 ``/切换模型`` 卡片上那份名单。
+
+        会真打模型、消耗额度，所以：分组开关默认关、非管理员有指令冷却、
+        同一模型还有探测冷却（都可在配置里调）。
+        """
+        try:
+            subject = self._subject_of(event)
+            await self.detector.handle_command(self, event, subject)
+        except Exception:
+            logger.exception("[UserGateway] /切换模型检测 处理异常（忽略）")
+            await self._send(event, "检测失败，请稍后再试。")
 
     # ------------------------------------------------------------------ #
     # 闸门辅助
