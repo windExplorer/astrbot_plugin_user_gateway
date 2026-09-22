@@ -545,6 +545,30 @@ class ModelSwitcher:
         except Exception:
             return None
 
+    async def build_notice_card(self, subject: Subject, *, message: str, footer: str,
+                               title: str = "切换模型检测") -> Optional[bytes]:
+        """一张**只有头 + 脚**的提示卡（没有候选行）：用来回复「不是结果」的那类话。
+
+        为什么这些提示也得是卡片：它们往往紧跟在另一张卡片后面出现（比如
+        「检测中…」之后紧跟「其实有一轮在跑了」），一张图配一段字看起来像两件事；
+        而用户刚点完指令，视觉上等的本来就是一张卡。
+        注意头部的大字留给 ``message``（不是模型名）：这张卡没有「主角模型」，
+        要读的就是这一句话。渲染失败返回 None，调用方退回纯文本。
+        """
+        try:
+            return model_card.render_model_card(
+                title=title,
+                current=str(message or ""),  # 头部大字：这张卡的主角就是这句话
+                meta="",
+                rows=[],
+                footer=str(footer or ""),
+                avatar=await self.avatar_for(subject),
+                font_path=str(self._plugin._cfg("model_card_font", "") or ""),
+                theme=str(self._plugin._cfg("model_card_theme", model_card.DEFAULT_THEME) or ""),
+            )
+        except Exception:
+            return None
+
     def footer_of(self, data: dict[str, Any]) -> str:
         """卡片底部提示：能切就说怎么切，只读就说为什么切不了。
 

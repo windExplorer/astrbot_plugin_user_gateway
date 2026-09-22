@@ -66,11 +66,13 @@ class Subject:
 
 
 class FakePanel:
-    """对方插件实例：只实现联动用到的两个接口，并把调用记下来。"""
+    """对方插件实例：只实现联动用到的几个接口，并把调用记下来。"""
 
-    def __init__(self, snapshot=None, detect_res=None):
+    def __init__(self, snapshot=None, detect_res=None, busy=None, old_api=False):
         self.snapshot = snapshot or {}
         self.detect_res = detect_res or {"ok": True, "results": []}
+        self.busy = busy
+        self.old_api = old_api  # True = 旧版，不报 busy 字段
         self.snapshot_calls: list = []
         self.detect_calls: list = []
 
@@ -85,8 +87,11 @@ class FakePanel:
         return self.detect_res
 
     def external_available(self):
-        return {"plugin": "astrbot_plugin_model_panel", "api": 2, "trigger": "gateway",
+        info = {"plugin": "astrbot_plugin_model_panel", "api": 3, "trigger": "gateway",
                 "probe_concurrency": 3, "probe_timeout": 45}
+        if not self.old_api:
+            info["busy"] = bool(self.busy)
+        return info
 
 
 class OldPanel:
@@ -103,7 +108,14 @@ class FakeSwitcher:
         self.data = data
         self.built: list[dict] = []
         self.remembered: list = []
+        self.notices: list[tuple[str, str]] = []
         self.ttl_calls = 0
+
+    async def build_notice_card(self, subject, *, message, footer, title="切换模型检测"):
+        """提示卡：头部大字就是那句话（没有候选行）。"""
+        self.notices.append((str(message), str(footer)))
+        return MC.render_model_card(title=title, current=str(message), rows=[],
+                                    footer=str(footer), font_path=MC.find_font_path())
 
     async def describe(self, subject):
         return dict(self.data)
@@ -395,14 +407,17 @@ def main() -> int:
     }), data=base_data())
     p7b._rules_obj = G.Rules(level_detect_enabled={1: True})
     eq(flow(p7b, Subject()), 0, "全在模型冷却内 → 不排任务")
-    check(p7b.sent and "刚测过" in p7b.sent[0], "说明「刚测过、不重复打」（省额度）")
-    check(not p7b.images, "不花钱时也不发卡片")
+    check(any("刚测过" in m for m, _f in p7b.switcher.notices),
+          "用卡片说明「刚测过、不重复打」（省额度）")
+    eq(len(p7b.images), 1, "只发那张提示卡，没有「检测中」")
 
     print("[_run：对方说忙 / 失败时，别把「没测成」说成「测完了」]")
     busy = FakePanel(detect_res={"ok": False, "busy": True, "items": {}, "results": []})
     p8 = FakePlugin(panel=busy, data=base_data())
     run(p8.detector._run(p8, object(), Subject(), pids=["p-a"]))
-    check(p8.sent and "在跑" in p8.sent[0], "对方忙 → 让用户稍后再试（不排队）")
+    check(any("在跑" in m for m, _f in p8.switcher.notices),
+          f"对方忙 → 用卡片让用户稍后再试（实得 {p8.switcher.notices!r}）")
+    check(not any("检测失败" in s for s in p8.sent), "忙不是「失败」")
     bad = FakePanel(detect_res={"ok": False, "error": "数据库炸了", "results": []})
     p9 = FakePlugin(panel=bad, data=base_data())
     run(p9.detector._run(p9, object(), Subject(), pids=["p-a"]))
@@ -464,6 +479,52 @@ def main() -> int:
               f"无数据那行底色是冷灰（{t['unknown']}）")
     except ImportError as e:  # pragma: no cover - 没装 Pillow 的环境
         print(f"  skip  没装 Pillow（{e}），跳过版面像素自检")
+
+    print("[撞车：先探忙，别发「检测中」再自我否认]")
+    eq(FakePlugin(panel=None).detector.panel_busy(), None, "没装对面 → 不知道（不是 False）")
+    eq(FakePlugin(panel=FakePanel(old_api=True)).detector.panel_busy(), None,
+       "对面版本旧、没报 busy → 不知道（不能当成「忙」把功能整个拒掉）")
+    eq(FakePlugin(panel=FakePanel(busy=False)).detector.panel_busy(), False, "对面空闲")
+    eq(FakePlugin(panel=FakePanel(busy=True)).detector.panel_busy(), True, "对面在跑")
+
+    busy_panel = FakePanel(snapshot={}, busy=True)
+    p12 = FakePlugin(cfg={"detect_command_cooldown_min": 30}, panel=busy_panel,
+                     data=base_data())
+    p12._rules_obj = G.Rules(level_detect_enabled={1: True})
+    sub12 = Subject()
+    eq(flow(p12, sub12), 0, "忙时不排后台任务")
+    eq(len(p12.images), 1, "只发一张卡（提示卡），没有「检测中」那张")
+    eq(busy_panel.detect_calls, [], "一个模型都没打")
+    check(p12.switcher.notices and "已经有一轮" in p12.switcher.notices[0][0],
+          f"提示卡的内容（实得 {p12.switcher.notices!r}）")
+    eq(p12.detector.cooldown_left(sub12), 0, "★没跑就不该扣用户的冷却")
+
+    print("[撞车兜底：开跑后才撞上（快照过期 / 恰好同时点）]")
+    race_panel = FakePanel(busy=False, detect_res={"ok": False, "busy": True, "results": []})
+    p13 = FakePlugin(cfg={"detect_command_cooldown_min": 30}, panel=race_panel,
+                     data=base_data())
+    p13._rules_obj = G.Rules(level_detect_enabled={1: True})
+    sub13 = Subject()
+    flow(p13, sub13)
+    eq(len(race_panel.detect_calls), 1, "先照常开跑（前探那一刻还不忙）")
+    check(any("已经有一轮" in m for m, _f in p13.switcher.notices),
+          f"撞上后仍用卡片说（实得 {p13.switcher.notices!r}）")
+    check(all("本次检测" not in str(k.get("meta_extra") or "") for k in p13.switcher.built),
+          "撞车后不再发「检测完成」的结果卡")
+    check(not p13.sent or not any("检测失败" in s for s in p13.sent),
+          "撞车不当成「检测失败」")
+    eq(p13.detector.cooldown_left(sub13), 0, "★这一轮没打模型 → 冷却撤回")
+
+    print("[全都刚测过 → 也用卡片说，别再回一段裸文字]")
+    cold_panel = FakePanel(snapshot={
+        str(o["provider_id"]): {"last_probe_ts": int(time.time() - 30)} for o in options_rows()
+    })
+    p14 = FakePlugin(panel=cold_panel, data=base_data())
+    p14._rules_obj = G.Rules(level_detect_enabled={1: True})
+    flow(p14, Subject())
+    eq(len(p14.images), 1, "发了一张提示卡")
+    check(p14.switcher.notices and "刚测过" in p14.switcher.notices[0][0],
+          f"卡片内容说明为什么没测（实得 {p14.switcher.notices!r}）")
 
     print("[整组一起测：默认不截断，配了上限才截断且必须写明]")
     many = base_data(options=[

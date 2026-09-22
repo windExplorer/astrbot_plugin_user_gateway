@@ -205,6 +205,23 @@ class ModelDetector:
     # ------------------------------------------------------------------ #
     # 与 model_panel 的桥
     # ------------------------------------------------------------------ #
+    def panel_busy(self) -> Optional[bool]:
+        """对面此刻是否有检测在跑。``None`` = **不知道**（对面版本旧、没报这个字段）。
+
+        三态而不是 bool：不知道时不能当成「不忙」也不能当成「忙」——
+        前者会照旧发出「检测中」卡片（老行为，可接受），后者会把功能整个拒掉。
+        """
+        panel = self.panel()
+        if panel is None:
+            return None
+        try:
+            info = panel.external_available()
+        except Exception:
+            return None
+        if not isinstance(info, dict) or "busy" not in info:
+            return None
+        return bool(info.get("busy"))
+
     def panel(self) -> Optional[Any]:
         """取 model_panel 的插件实例；没装 / 被禁用 / 版本太老都返回 ``None``。
 
@@ -323,6 +340,15 @@ class ModelDetector:
         self._purge(now)
         self._last[self._key(subject)] = now if now is not None else time.time()
 
+    def unmark(self, subject: Any) -> None:
+        """撤销一次已经记下的冷却。
+
+        给「撞车」用：开跑前记了冷却，结果对面说已经有一轮在跑 ——
+        那一轮**压根没打模型**，把冷却扣在用户头上就是冤枉他
+        （别人触发的一轮检测不该让下一个人白等 30 分钟）。
+        """
+        self._last.pop(self._key(subject), None)
+
     def _purge(self, now: Optional[float] = None) -> None:
         """清掉已过期的冷却记录，防止长期运行内存只增不减。"""
         cd = self.command_cooldown_sec()
@@ -360,6 +386,23 @@ class ModelDetector:
     # ------------------------------------------------------------------ #
     # 指令入口
     # ------------------------------------------------------------------ #
+    async def _notice(self, plugin: Any, event: Any, subject: Any, message: str,
+                      footer: str) -> None:
+        """发一张提示卡（只有头 + 脚）；渲染不出来退回纯文本。
+
+        「不是结果」的那些话（撞车 / 冷却里被跳过前的提醒）也走卡片：
+        它们紧跟在别的卡片前后出现，图文混排看起来像两件事。
+        """
+        card = None
+        try:
+            card = await plugin.switcher.build_notice_card(
+                subject, message=message, footer=footer)
+        except Exception as e:
+            logger.warning(f"[UserGateway] 提示卡渲染失败（退回文本）: {e}")
+        if card is not None and await plugin._send_image(event, card):
+            return
+        await plugin._send(event, f"{message}\n{footer}")
+
     async def handle_command(self, plugin: Any, event: Any, subject: Any) -> None:
         """``/切换模型检测``：先回一张「检测中」提示卡，跑完再发最新的切换卡。"""
         if not self.enabled():
@@ -412,11 +455,25 @@ class ModelDetector:
                 f"本次待测 {len(todo) + truncated} 个）"
             )
         if not todo:
-            names = "、".join(str(o.get("label") or o.get("provider_id")) for o in skipped[:6])
-            await plugin._send(
-                event,
-                f"这些模型 {self.model_cooldown_sec() // 60} 分钟内刚测过，不重复打（省额度）：\n"
-                f"{names}\n直接发 /切换模型 看它们现在的状态就好。",
+            # 卡片脚部只有一行，名字列多了会被 _fit 截掉 —— 只点三个，其余报个数
+            names = "、".join(str(o.get("label") or o.get("provider_id")) for o in skipped[:3])
+            if len(skipped) > 3:
+                names += f" 等 {len(skipped)} 个"
+            await self._notice(
+                plugin, event, subject,
+                f"这些模型 {self.model_cooldown_sec() // 60} 分钟内刚测过，不重复打（省额度）",
+                f"{names} · 直接发 /切换模型 看它们现在的状态就好",
+            )
+            return
+
+        # 对面已经有一轮在跑时**先别发「检测中」**：发了之后紧接着又说「其实没跑」，
+        # 两句自相矛盾（用户就是这么反馈的）。能提前知道是因为对面把锁状态报给了我们；
+        # 万一这只是瞬时快照、真正开跑时还是撞上了，_run 里还有一道兜底。
+        if self.panel_busy() is True:
+            await self._notice(
+                plugin, event, subject,
+                "模型控制台那边已经有一轮检测在跑了",
+                "等那一轮跑完再发一次 /切换模型检测（同一时间只跑一轮，避免两边互相拖超时）",
             )
             return
 
@@ -462,12 +519,17 @@ class ModelDetector:
             logger.warning(f"[UserGateway] 调用 model_panel 检测失败: {e}")
             res = {"ok": False, "error": str(e)}
         if not isinstance(res, dict) or not res.get("ok"):
-            reason = (
-                "模型控制台那边已经有一轮检测在跑了，稍后再试～"
-                if isinstance(res, dict) and res.get("busy")
-                else f"检测失败：{(res or {}).get('error') or '未知原因'}"
-            )
-            await plugin._send(event, reason)
+            if isinstance(res, dict) and res.get("busy"):
+                # 开跑前没探到忙、真正开跑时撞上了（快照过期 / 恰好同时点）。
+                # 这一轮一个模型都没打，所以**把冷却撤回来**：别人触发的那轮不该让这个人白等。
+                self.unmark(subject)
+                await self._notice(
+                    plugin, event, subject,
+                    "模型控制台那边已经有一轮检测在跑了",
+                    "这一轮没有检测任何模型 · 等它跑完再发一次 /切换模型检测",
+                )
+                return
+            await plugin._send(event, f"检测失败：{(res or {}).get('error') or '未知原因'}")
             return
 
         results = [r for r in (res.get("results") or []) if isinstance(r, dict)]
