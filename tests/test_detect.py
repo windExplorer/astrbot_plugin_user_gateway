@@ -263,7 +263,7 @@ def main() -> int:
     o = data["options"]
     eq(o[0]["latency"], "812ms", "延迟落到选项上")
     eq(o[0]["rate"], "99.2%", "成功率落到选项上")
-    eq(o[0]["health"], "healthy", "健康态落到选项上（决定行首色点）")
+    eq(o[0]["health"], "healthy", "健康态落到选项上（决定那行的行底渐变）")
     check(o[0]["note"].startswith("5 分钟前"), f"数据时间**前置**在 note 里（实得 {o[0]['note']!r}）")
     eq(o[1]["latency"], "", "对方拿不到延迟 → 空串，卡片整组不画指标")
     check(o[1]["note"].startswith("2 小时前"), "失败过的模型同样标出数据时间")
@@ -372,6 +372,47 @@ def main() -> int:
     png2 = MC.render_model_card(title="模型切换", current="OpenAI · gpt-4o", meta="分组：VIP",
                                 rows=rows, footer="回复序号切换")
     check(bool(png2), "指标整组缺失时也渲染得出来（没装对面插件的情形）")
+
+    print("[卡片：状态靠行底渐变表达（v1.3.14 去掉了行首小圆点）]")
+    try:
+        import io as _io
+
+        from PIL import Image as _Image
+
+        def _render(health: str):
+            row = {"index": 1, "label": "x"}
+            if health:
+                row["health"] = health
+            return MC.render_model_card(title="t", rows=[row], footer="f",
+                                        font_path=MC.find_font_path())
+
+        # 与「不带 health」的同一张卡逐像素求差：差异最大的那个像素就是行底色，
+        # 不用去猜行画在第几行（头部是渐变，直接扫一列会把头像/头部颜色也扫进来）。
+        base_img = _Image.open(_io.BytesIO(_render(""))).convert("RGB")
+        base_px = base_img.load()
+        x = MC.SHADOW_PAD + MC.PAD + 8  # 行内左侧留白（序号方块还要再往右 10px）
+
+        def tint(health: str):
+            im = _Image.open(_io.BytesIO(_render(health))).convert("RGB")
+            px = im.load()
+            best, best_d = None, -1
+            for y in range(im.size[1]):
+                d = sum(abs(base_px[x, y][i] - px[x, y][i]) for i in range(3))
+                if d > best_d:
+                    best_d, best = d, px[x, y]
+            check(best_d >= 24, f"「{health}」的行底确实被染色了（与无状态相比差 {best_d}）")
+            return best
+
+        t = {h: tint(h) for h in ("healthy", "degraded", "down", "unknown")}
+        check(t["healthy"][1] >= t["healthy"][0] + 3, f"正常那行底色偏绿（{t['healthy']}）")
+        check(t["degraded"][0] >= t["degraded"][1] + 20,
+              f"降级那行底色偏琥珀（{t['degraded']}）")
+        check(t["down"][0] >= t["down"][1] + 45, f"故障那行底色偏红（{t['down']}）")
+        # 无数据那档是冷灰（蓝 ≥ 绿 ≥ 红），不该跟「正常」混成一个颜色
+        check(t["unknown"][2] >= t["unknown"][1] >= t["unknown"][0],
+              f"无数据那行底色是冷灰（{t['unknown']}）")
+    except ImportError as e:  # pragma: no cover - 没装 Pillow 的环境
+        print(f"  skip  没装 Pillow（{e}），跳过版面像素自检")
 
     print()
     if _failures:

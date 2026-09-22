@@ -82,7 +82,7 @@ SYSTEM_FONT_CANDIDATES: tuple[str, ...] = (
 )
 
 # ---------------------------------------------------------------------- 版面
-WIDTH = 880  # 卡片本体宽度（不含下面的阴影留白）
+WIDTH = 1080  # 卡片本体宽度（不含下面的阴影留白）
 PAD = 40  # 卡片内左右边距
 RADIUS = 30  # 外轮廓圆角（只有最外侧四角用它）
 AVATAR = 120  # 头像直径（v1.3.9 从 92 调大：小头像在群里一眼认不出来）
@@ -156,7 +156,7 @@ DEFAULT_THEME = "indigo"
 COLOR_OWN = (178, 112, 10)  # 专属模型（琥珀）
 COLOR_WARN = (150, 156, 172)  # 暂不可用（灰）
 
-# 模型健康色（行首小圆点）：只有「不健康」才值得被一眼看到，所以 healthy 用浅绿、
+# 模型健康色（行底渐变用）：只有「不健康」才值得被一眼看到，所以 healthy 掺得极淡、
 # degraded 琥珀、down 红、unknown 灰 —— 与 model_panel 面板同一套语义色。
 HEALTH_COLORS = {
     "healthy": (34, 150, 102),
@@ -164,6 +164,16 @@ HEALTH_COLORS = {
     "down": (212, 60, 84),
     "unknown": (150, 156, 172),
 }
+
+# 行底渐变的「左端浓度」：健康色掺进底色的比例（1.0 = 完全等于底色，看不见）。
+# 健康那档故意只掺一点 —— 一屏都是彩条等于没有重点，异常的几行才该跳出来。
+HEALTH_TINT = {
+    "healthy": 0.90,
+    "degraded": 0.58,
+    "down": 0.52,
+    "unknown": 0.86,
+}
+DEFAULT_TINT = 0.90
 
 # ---------------------------------------------------------------------- 字号
 F_LABEL = 20  # 顶部小标签「模型切换」
@@ -371,16 +381,42 @@ def _pill(draw: Any, fonts: _Fonts, text: str, right: int, cy: int, color: tuple
     return x0
 
 
-def _health_dot(draw: Any, cx: int, cy: int, color: tuple) -> None:
-    """行首那颗健康小圆点（外圈一层淡色晕，单个小点在浅底上太弱）。
+def _hgradient(size: tuple[int, int], left: tuple, right: tuple) -> Any:
+    """横向渐变图层（``left`` → ``right``）。
 
-    注意：往 RGBA 图上画带 alpha 的颜色是**替换像素**而不是叠加，
-    直接用半透明色会在白底上挖出一个窟窿，所以淡色先跟白底混成不透明色。
+    只铺 96 个色阶再放大：逐列画竖线（一行 1020 次 ``line``）在一张卡上要跑几十次，
+    而过渡早就在视觉上平滑了 —— 多铺的色阶纯属浪费（放大用 BILINEAR，不会有色带）。
     """
-    r = 5
-    halo = r + 4
-    draw.ellipse([cx - halo, cy - halo, cx + halo, cy + halo], fill=_mix(color, CARD_BG, 0.75))
-    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+    w, h = size
+    steps = max(2, min(96, max(2, int(w))))
+    strip = Image.new("RGBA", (steps, 1))
+    d = ImageDraw.Draw(strip)
+    for i in range(steps):
+        d.point((i, 0), fill=_mix(left, right, i / (steps - 1)) + (255,))
+    return strip.resize((max(1, w), max(1, h)), Image.BILINEAR)
+
+
+def _row_left(health: str, base: tuple) -> tuple:
+    """健康色按 :data:`HEALTH_TINT` 掺进底色 → 渐变的左端色。"""
+    key = str(health or "")
+    color = HEALTH_COLORS.get(key, HEALTH_COLORS["unknown"])
+    return _mix(color, base, HEALTH_TINT.get(key, DEFAULT_TINT))
+
+
+def _row_bg(w: int, h: int, radius: int, left: tuple, right: tuple) -> Any:
+    """一行行底：**左端健康色 → 右端中性底**的横向渐变，四角圆。
+
+    为什么不再用行首那颗小圆点：点只有 10px，扫一眼分不出「正常 / 降级」，
+    用户得逐个去读；**整行**带一点淡色时，异常的几行在滚动里直接跳出来 ——
+    这正是这张卡最该做到的事（用户原话：「状态不要用点展示」）。
+    左深右浅是为了让右边（模型名 / 延迟 / 成功率）保持干净。
+
+    贴图必须用 ``alpha_composite``（不是 ``draw.rounded_rectangle``）——
+    圆角处的透明要参与混合，直接画会在白底上留下四个直角。
+    """
+    layer = Image.new("RGBA", (max(1, w), max(1, h)), (0, 0, 0, 0))
+    layer.paste(_hgradient((w, h), left, right), (0, 0), _card_mask((w, h), radius))
+    return layer
 
 
 def _metrics_width(font: Any, texts: list[str]) -> int:
@@ -527,11 +563,14 @@ def render_model_card(
         for i, row in enumerate(items):
             is_current = bool(row.get("current"))
             dead = bool(row.get("unavailable"))
-            draw.rounded_rectangle(
-                [ox + PAD, y, ox + PAD + row_w, y + ROW_H],
-                ROW_RADIUS,
-                fill=(soft if is_current else ROW_BG) + (255,),
-            )
+            # 行底 = 「左端健康色 → 右端中性底」的横向渐变（状态不再用小圆点表达）。
+            # 当前使用的那行右端仍停在主题的浅色上，所以「我在用哪个」照样一眼可见。
+            base = soft if is_current else ROW_BG
+            health = str(row.get("health") or "")
+            img.alpha_composite(
+                _row_bg(row_w, ROW_H, ROW_RADIUS,
+                        _row_left(health, base) if health else base, base),
+                (ox + PAD, y))
             cy = y + ROW_H // 2
 
             # 序号方块（当前用强调色实心，其余浅灰）—— 比一串裸数字好认得多
@@ -575,10 +614,6 @@ def render_model_card(
                 right -= mw + 24
 
             label_x = bx + BADGE + 18
-            health = str(row.get("health") or "")
-            if health:
-                _health_dot(draw, label_x + 6, cy, HEALTH_COLORS.get(health, HEALTH_COLORS["unknown"]))
-                label_x += 22
             limit = right - label_x - 16
             note = str(row.get("note") or "")
             label = _fit(str(row.get("label") or ""), name_font, limit)
