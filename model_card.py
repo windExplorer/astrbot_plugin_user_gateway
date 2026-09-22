@@ -155,6 +155,8 @@ DEFAULT_THEME = "indigo"
 # 与主题无关的语义色（标签用）
 COLOR_OWN = (178, 112, 10)  # 专属模型（琥珀）
 COLOR_WARN = (150, 156, 172)  # 暂不可用（灰）
+COLOR_PROBE_OK = (30, 140, 96)  # 本次探测通过（绿）
+COLOR_PROBE_BAD = (206, 52, 76)  # 本次探测失败（红）
 
 # 模型健康色（行底渐变用）：只有「不健康」才值得被一眼看到，所以 healthy 掺得极淡、
 # degraded 琥珀、down 红、unknown 灰 —— 与 model_panel 面板同一套语义色。
@@ -450,10 +452,13 @@ def render_model_card(
 
     Args:
         title: 顶部小标签（如「模型切换」）。
-        rows: 每行 ``{index, label, note, current, own, unavailable, latency, rate, health}``：
-            序号 / 模型名 / 次文案 / 是否当前使用 / 是否专属模型 / 是否暂不可用 /
-            延迟文本 / 成功率文本 / 健康态（``healthy``/``degraded``/``down``/``unknown``）。
-            后三项**可选**：拿不到 model_panel 的数据时整组不画（见 ``detect.py``）。
+        rows: 每行 ``{index, label, note, current, own, unavailable, latency, rate, health,
+            probe_ok, probe_label}``：序号 / 模型名 / 次文案 / 是否当前使用 / 是否专属模型 /
+            是否暂不可用 / 延迟文本 / 成功率文本 / 健康态
+            （``healthy``/``degraded``/``down``/``unknown``）/ 本次探测是否通过 / 本次结论标签。
+            除 ``index`` / ``label`` 外全部**可选**：拿不到 model_panel 的数据时整组不画
+            （见 ``detect.py``）。``probe_ok`` 只在「刚跑完一次检测」的卡片上有值 ——
+            它回答的是「刚才打的这一次过没过」，与 ``latency`` / ``rate``（历史记录）不是一回事。
         current: **当前使用的模型名**（头部的主角，最多两行，不截断）；空则不画这一行。
         meta: 头部下方一行小字（如「VIP（好友等级）· 今日 12.3K tokens · 8 次对话」）。
         footer: 底部提示（如「回复序号切换 · 60 秒内有效 · 0 = 恢复默认」）。
@@ -587,8 +592,17 @@ def render_model_card(
                 anchor="mm",
             )
 
-            # 右侧标签（从右往左排）：「当前使用」实心，其余描边
+            # 右侧标签（从右往左排）。
+            # **本次探测的结论放最右**（视觉第一落点）：刚点完检测的人，第一句话就是
+            # 「刚才那个到底过没通过」，而这一行同时还挂着历史延迟与今日成功率 ——
+            # 不把本次结论单独标出来，就成了「红的却显示 800ms、成功率 2.3%」那种读不懂的行。
+            # 只有**失败**才实心：一行里该喊的只有真出事的那几行。
             tags: list[tuple[str, tuple, bool]] = []
+            probe_ok = row.get("probe_ok")
+            if probe_ok is not None:
+                tags.append((str(row.get("probe_label") or ("本次通过" if probe_ok else "本次失败")),
+                             COLOR_PROBE_OK if probe_ok else COLOR_PROBE_BAD,
+                             not bool(probe_ok)))
             if is_current:
                 tags.append(("当前使用", accent, True))
             if row.get("own"):

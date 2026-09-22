@@ -94,6 +94,28 @@ def _fmt_ago(ts: Any, now: Optional[float] = None) -> str:
     return time.strftime("%m-%d", time.localtime(t))
 
 
+# 错误码 → 人话。与 model_panel 的 _ERROR_LABELS 保持同一套说法：
+# 同一个故障在两个插件的卡片上叫两个名字，读的人会以为是两件事。
+_ERROR_LABELS = {
+    "timeout": "超时",
+    "refused": "拒绝连接",
+    "connect": "连接失败",
+    "auth": "鉴权失败",
+    "rate_limit": "请求受限",
+    "not_found": "模型不存在",
+    "server": "服务异常",
+    "unknown": "未知异常",
+}
+
+
+def _error_label(code: Any) -> str:
+    """内部错误码 → 卡片上的说法。空码返回空串（不编「未知异常」骗人）。"""
+    key = str(code or "").strip()
+    if not key:
+        return ""
+    return _ERROR_LABELS.get(key, "异常")
+
+
 class ModelDetector:
     """``/切换模型检测`` 的状态机 + 与 model_panel 的桥（一个插件实例一个）。"""
 
@@ -127,12 +149,54 @@ class ModelDetector:
         return max(0, mins) * 60
 
     def max_models(self) -> int:
-        """单次最多检测几个模型（真花钱，必须有个上限）。"""
+        """单次最多检测几个模型。``0`` = **不限**（默认），一次测完分组里的全部可用模型。
+
+        为什么默认改成不限：限制的初衷是防成本失控，但实际效果是「分组里 15 个模型、
+        只测了前 8 个」，而用户要的恰恰是**一眼看完这一组到底谁不健康** ——
+        剩下的 7 个还得再等下一个冷却周期才能看到，等于把一次体检拆成两次。
+        真正管住成本的是那两道冷却（人 30 分钟、模型 5 分钟），不是这个截断。
+        真要限量时配一个正整数即可（上限 100，纯属防御性）。
+        """
         try:
-            n = int(self._plugin._cfg("detect_max_models", 8) or 8)
+            n = int(self._plugin._cfg("detect_max_models", 0) or 0)
         except (TypeError, ValueError):
-            n = 8
-        return max(1, min(30, n))
+            n = 0
+        return 0 if n <= 0 else min(100, n)
+
+    def probe_plan(self) -> tuple[int, float]:
+        """对面的探测并发数与单模型超时，用来估「最坏要等多久」。
+
+        并发由 model_panel 定（它的 ``external_available()`` 会报），拿不到就按 3 估 ——
+        估算可以保守（说「≤5 分钟」实际 2 分钟），但不能反过来。
+        """
+        conc, timeout = 3, 45.0
+        panel = self.panel()
+        info = None
+        if panel is not None:
+            try:
+                info = panel.external_available()
+            except Exception:
+                info = None
+        if isinstance(info, dict):
+            try:
+                conc = max(1, int(info.get("probe_concurrency") or conc))
+            except (TypeError, ValueError):
+                pass
+            try:
+                timeout = max(1.0, float(info.get("probe_timeout") or timeout))
+            except (TypeError, ValueError):
+                pass
+        return conc, timeout
+
+    def eta_text(self, n: int) -> str:
+        """``n`` 个模型最坏要等多久（并发跑，所以按轮数算，不是 n × 超时）。"""
+        if n <= 0:
+            return ""
+        conc, timeout = self.probe_plan()
+        secs = max(1.0, float(-(-n // conc)) * timeout)
+        if secs < 90:
+            return f"约 {int(secs)} 秒"
+        return f"约 {int(round(secs / 60))} 分钟"
 
     def admin_exempt(self) -> bool:
         """管理员是否豁免「分组开关 + 指令冷却」（与既有的 admin_exempt 同一个键）。"""
@@ -175,32 +239,64 @@ class ModelDetector:
             return {}
         return (res.get("items") or {}) if isinstance(res, dict) and res.get("ok") else {}
 
-    async def annotate(self, data: dict[str, Any]) -> None:
-        """给候选行补上「健康点 / 延迟 / 成功率 / 数据时间」。
+    async def annotate(self, data: dict[str, Any],
+                       probe_of: Optional[dict[str, dict]] = None) -> None:
+        """给候选行补上「状态 / 延迟 / 成功率 / 数据时间」，有本次探测结果时再补「本次结论」。
 
-        **拿不到数据就整组不画**（而不是画一排「-」）：一列占位符比空着更难看，
-        而「这一行没有数据」这件事由 note 里的时间说明。
+        两套数字必须分清，这是用户提过的问题：「测出来是红的，却有毫秒显示、成功率 2.3%，
+        不知道最新那次到底是报错还是通过」——
+        ``latency`` / ``rate`` 来自**已有记录**（可能是几小时前那次成功、和今天一整天窗口的
+        成功率），跟「我刚刚打的这一次」不是一回事。所以：
+
+        - 有本次结果时，延迟改用**本次探测**的那个数（失败就一个数字都不画）；
+        - 另给 ``probe_ok`` / ``probe_label``，卡片在行尾画一颗「本次通过 / 本次失败」的标签 ——
+          这是用户第一眼要找的答案；
+        - 失败的原因（超时 / 鉴权失败…）写进副标题；
+        - 成功率一律标注**统计范围**（``今日 2.3%``），不再是一个孤零零的百分数。
+
+        **拿不到数据就整组不画**（而不是画一排「-」）：一列占位符比空着更难看。
         没装 model_panel 时这里安静跳过 —— 缺另一个插件不该让 /切换模型 变成一个报错。
         """
         options = [o for o in (data.get("options") or []) if o.get("provider_id")]
         if not options:
             return
+        probe_of = probe_of or {}
         items = await self.snapshot([str(o["provider_id"]) for o in options])
-        if not items:
+        if not items and not probe_of:
             return
         for opt in options:
-            it = items.get(str(opt.get("provider_id") or ""))
-            if not it:
+            pid = str(opt.get("provider_id") or "")
+            it = items.get(pid) or {}
+            probe = probe_of.get(pid)
+            if not it and probe is None:
                 continue
+            # 状态用对面**写回状态机之后**的值：本次失败的模型在这一步已经是 down，
+            # 所以行底会跟着变红（这正是「测完就看得见」的意思）。
             opt["health"] = str(it.get("state") or "")
-            opt["latency"] = _fmt_ms(it.get("latency_ms"))
-            opt["rate"] = _fmt_rate(it.get("success_rate"))
-            stamp = _fmt_ago(it.get("last_ts"))
-            if stamp:
-                # 时间放**最前**：它是「后面这些数字有多新」的限定语，
-                # 放末尾会被 _fit 先截掉（note 过长时），那就等于没写。
-                note = str(opt.get("note") or "")
-                opt["note"] = f"{stamp} · {note}" if note else stamp
+            rate = _fmt_rate(it.get("success_rate"))
+            opt["rate"] = f"今日 {rate}" if rate else ""
+            note = str(opt.get("note") or "")
+            if probe is None:
+                opt["latency"] = _fmt_ms(it.get("latency_ms"))
+                stamp = _fmt_ago(it.get("last_ts"))
+                if stamp:
+                    # 时间放**最前**：它是「后面这些数字有多新」的限定语，
+                    # 放末尾会被 _fit 先截掉（note 过长时），那就等于没写。
+                    opt["note"] = f"{stamp} · {note}" if note else stamp
+                continue
+            ok = bool(probe.get("ok"))
+            opt["probe_ok"] = ok
+            opt["probe_label"] = "本次通过" if ok else "本次失败"
+            if ok:
+                # 通过：显示**本次**的延迟（和标签挨着，读起来就是「本次通过、耗时 812ms」）
+                opt["latency"] = _fmt_ms(probe.get("latency_ms"))
+            else:
+                # 失败：一个延迟都不画。留着上一次成功的毫秒数，
+                # 正是「红的却显示 400ms」那种把人绕晕的根源。
+                opt["latency"] = ""
+                label = _error_label(probe.get("error_code"))
+                if label:
+                    opt["note"] = f"{label} · {note}" if note else label
         data["metrics_available"] = True
 
     # ------------------------------------------------------------------ #
@@ -305,9 +401,16 @@ class ModelDetector:
         options = [o for o in (data.get("options") or []) if o.get("provider_id")]
         items = await self.snapshot([str(o["provider_id"]) for o in options])
         todo, skipped = self._split(options, items)
+        # cap = 0（默认）= 不限：一次把分组里的可用模型测完（见 max_models 的说明）。
+        # 截断只在用户**明确配了上限**时发生，且必须在头部说明 —— 否则会被当成「漏测」。
         cap = self.max_models()
-        if len(todo) > cap:
+        truncated = len(todo) - cap if cap and len(todo) > cap else 0
+        if truncated:
             todo = todo[:cap]
+            logger.info(
+                f"[UserGateway] 检测按配置上限 {cap} 截断（分组可选 {len(options)} 个，"
+                f"本次待测 {len(todo) + truncated} 个）"
+            )
         if not todo:
             names = "、".join(str(o.get("label") or o.get("provider_id")) for o in skipped[:6])
             await plugin._send(
@@ -320,11 +423,17 @@ class ModelDetector:
         if not (is_admin and self.admin_exempt()):
             self.mark(subject)
 
-        # ① 立刻回一张「检测中」提示卡：检测是后台跑的，不回一句用户会以为 bot 没反应
+        # ① 立刻回一张「检测中」提示卡：检测是后台跑的，不回一句用户会以为 bot 没反应。
+        #    带上「最坏要等多久」：默认不限量之后，一次就是分组里全部模型，没有 ETA 会像卡死。
+        n = len(todo)
+        eta = self.eta_text(n)
+        meta_extra = f"正在检测 {n} 个模型" + (f" · 最坏 {eta}" if eta else "")
+        if truncated:
+            meta_extra += f"（按配置只测前 {cap} 个，还有 {truncated} 个没测）"
         progress = await plugin.switcher.build_card(
             subject, data, title="切换模型检测", rows=[],
             footer="检测中…结果出来后会自动发一张最新的卡片",
-            meta_extra=f"正在检测 {len(todo)} 个模型",
+            meta_extra=meta_extra,
         )
         if progress is None or not await plugin._send_image(event, progress):
             await plugin._send(event, f"正在检测 {len(todo)} 个模型，稍等…")
@@ -361,7 +470,11 @@ class ModelDetector:
             await plugin._send(event, reason)
             return
 
-        bad = [r for r in (res.get("results") or []) if not r.get("ok")]
+        results = [r for r in (res.get("results") or []) if isinstance(r, dict)]
+        bad = [r for r in results if not r.get("ok")]
+        # 本次每一行的结论：卡片要把它画成「本次通过 / 本次失败」，
+        # 并与库里那些历史数字区分开（用户提过：红的行上还挂着毫秒和成功率，看不出到底过没过）。
+        probe_of = {str(r.get("id")): r for r in results if r.get("id")}
         logger.info(
             f"[UserGateway] 切换模型检测完成：{len(pids)} 个模型，"
             f"失败 {len(bad)}（{subject.group_id or subject.sender_id}）"
@@ -370,7 +483,7 @@ class ModelDetector:
         # 重新 describe + 注解：此刻的数字才是刚打出来的（而不是发卡片前那一刻的快照）
         try:
             fresh = await plugin.switcher.describe(subject)
-            await self.annotate(fresh)
+            await self.annotate(fresh, probe_of)
         except Exception as e:
             logger.warning(f"[UserGateway] 检测后刷新卡片数据失败: {e}")
             await plugin._send(event, f"检测已经跑完了，但取最新数据失败了：{e}")
@@ -381,9 +494,9 @@ class ModelDetector:
                 subject, fresh.get("options") or [], str(fresh.get("scene") or "private"),
                 can_switch=True, reason="",
             )
-        summary = f"检测完成：{len(pids) - len(bad)} 正常"
+        summary = f"本次检测：{len(results) - len(bad)} 通过"
         if bad:
-            summary += f" / {len(bad)} 异常"
+            summary += f" / {len(bad)} 失败"
         if skip_n:
             # 跳过的也写在头部：否则用户会觉得「我分组里有 5 个，怎么只测了 3 个」
             summary += f"（跳过 {skip_n} 个刚测过的）"

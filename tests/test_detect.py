@@ -84,6 +84,10 @@ class FakePanel:
         self.detect_calls.append(list(provider_ids or []))
         return self.detect_res
 
+    def external_available(self):
+        return {"plugin": "astrbot_plugin_model_panel", "api": 2, "trigger": "gateway",
+                "probe_concurrency": 3, "probe_timeout": 45}
+
 
 class OldPanel:
     """旧版 model_panel：装是装了，但没有 external_detect（联动必须判成不可用）。"""
@@ -262,7 +266,7 @@ def main() -> int:
     run(pl.detector.annotate(data))
     o = data["options"]
     eq(o[0]["latency"], "812ms", "延迟落到选项上")
-    eq(o[0]["rate"], "99.2%", "成功率落到选项上")
+    eq(o[0]["rate"], "今日 99.2%", "成功率带统计范围（否则读不出 2.3% 是哪段时间的）")
     eq(o[0]["health"], "healthy", "健康态落到选项上（决定那行的行底渐变）")
     check(o[0]["note"].startswith("5 分钟前"), f"数据时间**前置**在 note 里（实得 {o[0]['note']!r}）")
     eq(o[1]["latency"], "", "对方拿不到延迟 → 空串，卡片整组不画指标")
@@ -275,6 +279,53 @@ def main() -> int:
     run(pl2.detector.annotate(data2))
     check(all("latency" not in opt for opt in data2["options"]),
           "拿不到数据时不写指标（卡片照常出，只是少一列数字）")
+
+    print("[annotate(probe_of)：本次结论必须与历史数字分开]")
+    # 用户原话：「测出来是红的，但是有毫秒显示，成功率 2.3%，我也不知道最新检测出的是报错还是通过了」
+    panel2 = FakePanel(snapshot={
+        "p-a": {"state": "down", "latency_ms": 1180.0, "success_rate": 0.023,
+                "last_ts": int(now - 600), "last_probe_ts": int(now)},
+        "p-b": {"state": "healthy", "latency_ms": 3000.0, "success_rate": 0.99,
+                "last_ts": int(now - 600), "last_probe_ts": int(now)},
+        "p-c": {"state": "healthy", "latency_ms": 4300.0, "success_rate": 0.75,
+                "last_ts": int(now - 7200)},
+    })
+    pl4 = FakePlugin(panel=panel2)
+    data4 = base_data()
+    run(pl4.detector.annotate(data4, {
+        "p-a": {"id": "p-a", "ok": False, "latency_ms": None, "error_code": "timeout"},
+        "p-b": {"id": "p-b", "ok": True, "latency_ms": 812.0, "error_code": ""},
+    }))
+    a, b, c = data4["options"]
+    eq(a["probe_ok"], False, "失败的模型标成本次失败")
+    eq(a["probe_label"], "本次失败", "标签文案（卡片用实心红）")
+    eq(a["latency"], "", "★失败的行不留毫秒（旧版会显示上一次成功的 1180ms，正是绕晕人的地方）")
+    check(a["note"].startswith("超时"), f"失败原因顶到副标题最前（实得 {a['note']!r}）")
+    eq(a["rate"], "今日 2.3%", "成功率照旧给，但标明是今天的窗口")
+    eq(a["health"], "down", "状态用对面写回后的值 → 行底变红")
+    eq(b["probe_ok"], True, "通过的模型标成本次通过")
+    eq(b["latency"], "812ms", "★通过的行显示**本次**延迟（812ms 而不是库里的 3000ms）")
+    check(not b["note"].startswith("1 分钟前") and not b["note"].startswith("刚刚"),
+          f"本次通过的行不写时间戳（标签已经说明是本次，实得 {b['note']!r}）")
+    check("probe_ok" not in c, "这次没测的模型不带本次结论")
+    eq(c["latency"], "4300ms", "没测的模型照旧用库里的延迟")
+    check(c["note"].startswith("2 小时前"), "没测的模型照旧标数据时间")
+
+    print("[单次上限：默认不限（分组里有多少就测多少）]")
+    pl5 = FakePlugin(panel=FakePanel())
+    eq(pl5.detector.max_models(), 0, "默认 0 = 不限")
+    pl5._settings["detect_max_models"] = 5
+    eq(pl5.detector.max_models(), 5, "配了正整数才截断")
+    pl5._settings["detect_max_models"] = -3
+    eq(pl5.detector.max_models(), 0, "填负数当「不限」，不静默变成只测 1 个")
+
+    print("[估时：按并发轮数算，不是 个数 × 超时]")
+    pl6 = FakePlugin(panel=FakePanel())
+    eq(pl6.detector.probe_plan(), (3, 45.0), "并发与超时取自对面报的值")
+    eq(pl6.detector.eta_text(2), "约 45 秒", "2 个模型 1 轮")
+    eq(pl6.detector.eta_text(9), "约 2 分钟", "9 个模型 3 轮（不是 9 × 45s）")
+    eq(FakePlugin(panel=None).detector.probe_plan(), (3, 45.0),
+       "对面没报（旧版）时用保守默认值，估时间宁可偏大")
 
     print("[模型级冷却：按对方的 last_probe_ts 切分]")
     det = pl.detector
@@ -413,6 +464,28 @@ def main() -> int:
               f"无数据那行底色是冷灰（{t['unknown']}）")
     except ImportError as e:  # pragma: no cover - 没装 Pillow 的环境
         print(f"  skip  没装 Pillow（{e}），跳过版面像素自检")
+
+    print("[整组一起测：默认不截断，配了上限才截断且必须写明]")
+    many = base_data(options=[
+        {"index": i + 1, "provider_id": f"m{i}", "label": f"模型{i}", "note": ""}
+        for i in range(12)
+    ])
+    p10 = FakePlugin(panel=FakePanel(snapshot={}), data=many)
+    p10._rules_obj = G.Rules(level_detect_enabled={1: True})
+    flow(p10, Subject())
+    eq(len(p10._panel.detect_calls[0]), 12, "12 个模型一次全测（不再被默认 8 截断）")
+    meta = " ".join(str(k.get("meta_extra") or "") for k in p10.switcher.built)
+    check("正在检测 12 个模型" in meta, f"进度卡报出真实数量（实得 {meta!r}）")
+    check("最坏 约 3 分钟" in meta or "最坏 约 2 分钟" in meta,
+          f"进度卡带上「最坏等多久」（12 个 / 3 并发 / 超时 45s → 4 轮，实得 {meta!r}）")
+
+    p11 = FakePlugin(cfg={"detect_max_models": 5}, panel=FakePanel(snapshot={}), data=many)
+    p11._rules_obj = G.Rules(level_detect_enabled={1: True})
+    flow(p11, Subject())
+    eq(len(p11._panel.detect_calls[0]), 5, "配了上限就只测前 5 个")
+    meta11 = " ".join(str(k.get("meta_extra") or "") for k in p11.switcher.built)
+    check("只测前 5 个" in meta11 and "还有 7 个没测" in meta11,
+          f"被截断时卡片必须写明（否则会被当成漏测，实得 {meta11!r}）")
 
     print()
     if _failures:
