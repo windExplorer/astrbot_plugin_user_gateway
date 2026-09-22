@@ -111,9 +111,10 @@ class FakeSwitcher:
         self.notices: list[tuple[str, str]] = []
         self.ttl_calls = 0
 
-    async def build_notice_card(self, subject, *, message, footer, title="切换模型检测"):
-        """提示卡：头部大字就是那句话（没有候选行）。"""
-        self.notices.append((str(message), str(footer)))
+    async def build_notice_card(self, subject, *, message, footer, title="切换模型检测",
+                                tone="alert"):
+        """提示卡：头部大字就是那句话（没有候选行）。``tone`` 是固定主题（alert/error）。"""
+        self.notices.append((str(message), str(footer), str(tone)))
         return MC.render_model_card(title=title, current=str(message), rows=[],
                                     footer=str(footer), font_path=MC.find_font_path())
 
@@ -407,7 +408,7 @@ def main() -> int:
     }), data=base_data())
     p7b._rules_obj = G.Rules(level_detect_enabled={1: True})
     eq(flow(p7b, Subject()), 0, "全在模型冷却内 → 不排任务")
-    check(any("刚测过" in m for m, _f in p7b.switcher.notices),
+    check(any("刚测过" in m for m, *_rest in p7b.switcher.notices),
           "用卡片说明「刚测过、不重复打」（省额度）")
     eq(len(p7b.images), 1, "只发那张提示卡，没有「检测中」")
 
@@ -415,13 +416,16 @@ def main() -> int:
     busy = FakePanel(detect_res={"ok": False, "busy": True, "items": {}, "results": []})
     p8 = FakePlugin(panel=busy, data=base_data())
     run(p8.detector._run(p8, object(), Subject(), pids=["p-a"]))
-    check(any("在跑" in m for m, _f in p8.switcher.notices),
+    check(any("在跑" in m for m, *_rest in p8.switcher.notices),
           f"对方忙 → 用卡片让用户稍后再试（实得 {p8.switcher.notices!r}）")
     check(not any("检测失败" in s for s in p8.sent), "忙不是「失败」")
     bad = FakePanel(detect_res={"ok": False, "error": "数据库炸了", "results": []})
     p9 = FakePlugin(panel=bad, data=base_data())
     run(p9.detector._run(p9, object(), Subject(), pids=["p-a"]))
-    check(p9.sent and "数据库炸了" in p9.sent[0], "对方报错 → 把原因原样带出来")
+    check(p9.switcher.notices and "数据库炸了" in str(p9.switcher.notices[0][1]),
+          f"对方报错 → 把原因原样带出来（实得 {p9.switcher.notices!r}）")
+    check(p9.switcher.notices[0][0] == "检测失败" and p9.switcher.notices[0][2] == "error",
+          "★报错是**红卡**：标题「检测失败」+ tone=error（与撞车那条橙卡区分开）")
 
     print("[卡片：指标与健康点的版面]")
     rows = [
@@ -497,6 +501,7 @@ def main() -> int:
     eq(busy_panel.detect_calls, [], "一个模型都没打")
     check(p12.switcher.notices and "已经有一轮" in p12.switcher.notices[0][0],
           f"提示卡的内容（实得 {p12.switcher.notices!r}）")
+    eq(p12.switcher.notices[0][2], "alert", "撞车是**橙卡**（提醒：等一会儿就好）")
     eq(p12.detector.cooldown_left(sub12), 0, "★没跑就不该扣用户的冷却")
 
     print("[撞车兜底：开跑后才撞上（快照过期 / 恰好同时点）]")
@@ -507,7 +512,7 @@ def main() -> int:
     sub13 = Subject()
     flow(p13, sub13)
     eq(len(race_panel.detect_calls), 1, "先照常开跑（前探那一刻还不忙）")
-    check(any("已经有一轮" in m for m, _f in p13.switcher.notices),
+    check(any("已经有一轮" in m for m, *_rest in p13.switcher.notices),
           f"撞上后仍用卡片说（实得 {p13.switcher.notices!r}）")
     check(all("本次检测" not in str(k.get("meta_extra") or "") for k in p13.switcher.built),
           "撞车后不再发「检测完成」的结果卡")

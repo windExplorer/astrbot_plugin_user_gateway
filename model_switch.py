@@ -461,6 +461,18 @@ class ModelSwitcher:
             }
         return _logo_bytes()
 
+    def theme_for(self, tone: str = "") -> str:
+        """卡片主题：给了**性质**（``error`` / ``alert`` / ``ok``）就强制用固定主题。
+
+        固定的那几套与用户的主题偏好无关 —— 一张卡的第一眼信息该是「它是什么性质」
+        （红的=报错、橙的=告警），而不是「我今天喜欢什么颜色」。
+        没给性质就回落配置里的 ``model_card_theme``。
+        """
+        forced = model_card.TONE_THEMES.get(str(tone or "").strip().lower())
+        if forced:
+            return forced
+        return str(self._plugin._cfg("model_card_theme", model_card.DEFAULT_THEME) or "")
+
     async def build_card(
         self,
         subject: Subject,
@@ -470,6 +482,7 @@ class ModelSwitcher:
         rows: Optional[list[dict[str, Any]]] = None,
         footer: Optional[str] = None,
         meta_extra: str = "",
+        tone: str = "",
     ) -> Optional[bytes]:
         """渲染卡片；渲染不出来返回 None（调用方退回文本列表）。
 
@@ -506,7 +519,7 @@ class ModelSwitcher:
             footer=self.footer_of(data) if footer is None else str(footer),
             avatar=avatar,
             font_path=str(plugin._cfg("model_card_font", "") or ""),
-            theme=str(plugin._cfg("model_card_theme", model_card.DEFAULT_THEME) or ""),
+            theme=self.theme_for(tone),
         )
 
     async def build_success_card(self, subject: Subject, res: dict[str, Any]) -> Optional[bytes]:
@@ -546,7 +559,8 @@ class ModelSwitcher:
             return None
 
     async def build_notice_card(self, subject: Subject, *, message: str, footer: str,
-                               title: str = "切换模型检测") -> Optional[bytes]:
+                                title: str = "切换模型检测",
+                                tone: str = "alert") -> Optional[bytes]:
         """一张**只有头 + 脚**的提示卡（没有候选行）：用来回复「不是结果」的那类话。
 
         为什么这些提示也得是卡片：它们往往紧跟在另一张卡片后面出现（比如
@@ -564,7 +578,8 @@ class ModelSwitcher:
                 footer=str(footer or ""),
                 avatar=await self.avatar_for(subject),
                 font_path=str(self._plugin._cfg("model_card_font", "") or ""),
-                theme=str(self._plugin._cfg("model_card_theme", model_card.DEFAULT_THEME) or ""),
+                # 提示卡**强制**用性质色：告警橙 / 报错红，与用户的主题偏好无关
+                theme=self.theme_for(tone),
             )
         except Exception:
             return None

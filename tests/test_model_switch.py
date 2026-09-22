@@ -786,7 +786,14 @@ async def main() -> int:
 
     print("\n[15] 配色主题与版面（当前模型在标题区折行，不截断）")
     rows_one = [{"index": 1, "label": "OpenAI · gpt-4o", "current": True}]
-    check(set(model_card.THEMES) == {"indigo", "teal", "amber", "rose"}, "内置四套主题")
+    # v1.3.17 起 8 套：靛蓝（真蓝）与紫罗兰（旧靛蓝的紫）分开，
+    # 另加朱红（报错固定色）与落日橙 / 石墨灰（与 model_panel 对齐）。
+    check(set(model_card.THEMES) ==
+          {"indigo", "violet", "teal", "amber", "sunset", "crimson", "rose", "graphite"},
+          "内置八套主题")
+    check(model_card.TONE_THEMES["error"] == "crimson"
+          and model_card.TONE_THEMES["alert"] == "amber",
+          "报错红 / 告警橙是固定的（不跟用户偏好走）")
     check(model_card.theme_colors("teal") is model_card.THEMES["teal"], "主题按名字取到")
     check(model_card.theme_colors("不存在的主题") is model_card.THEMES[model_card.DEFAULT_THEME],
           "主题名写错 → 回落默认（配置坏了也要能出图）")

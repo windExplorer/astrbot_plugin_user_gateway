@@ -187,6 +187,15 @@ function labelOf(key: string): string {
   return String(s.description || key);
 }
 
+/** 枚举下拉的候选：优先用 schema 里的 labels（与 options 一一对应），没有才退回原值。
+    原值都是英文标识（allow / observe / indigo…），直接显示等于让人猜。 */
+function optionListOf(key: string) {
+  const s = specOf(key);
+  const opts: string[] = Array.isArray(s.options) ? s.options : [];
+  const labels: string[] = Array.isArray(s.labels) ? s.labels : [];
+  return opts.map((o, i) => ({ label: labels[i] || o, value: o }));
+}
+
 async function load() {
   loading.value = true;
   try {
@@ -263,12 +272,12 @@ onMounted(load);
             :step="specOf(key).type === 'float' ? 0.1 : 1"
             style="width: 220px"
           />
-          <!-- 枚举 -->
+          <!-- 枚举（label 走 schema 的 labels，中文） -->
           <n-select
             v-else-if="specOf(key).options"
             v-model:value="items[key]"
-            :options="specOf(key).options.map((o: string) => ({ label: o, value: o }))"
-            style="width: 220px"
+            :options="optionListOf(key)"
+            style="width: 260px"
           />
           <!-- 长文本 -->
           <n-input

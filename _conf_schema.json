@@ -28,6 +28,7 @@
     "hint": "未单独配置的对象采用的策略。allow=默认放行（推荐，先放行再逐个限制）；deny=默认禁止（白名单模式，只有显式放行的对象能用）。",
     "type": "string",
     "options": ["allow", "deny"],
+    "labels": ["默认放行（推荐）", "默认禁止（白名单模式）"],
     "default": "allow"
   },
   "command_guard_enabled": {
@@ -41,6 +42,7 @@
     "hint": "没有为某条指令配任何规则时的兜底：allow=默认可用（推荐）；deny=默认禁用（白名单模式，只有显式放行的对象能用该指令）。注意与 LLM 的「全局默认策略」相互独立。",
     "type": "string",
     "options": ["allow", "deny"],
+    "labels": ["默认可用（推荐）", "默认禁用（白名单模式）"],
     "default": "allow"
   },
   "command_deny_notice": {
@@ -102,6 +104,7 @@
     "hint": "observe=只记账不拦截（推荐首次安装先用它跑一周，看清用量再切 enforce）；enforce=超过额度直接拦截。",
     "type": "string",
     "options": ["observe", "enforce"],
+    "labels": ["只记账（观察，建议先跑一周）", "超限拦截"],
     "default": "observe"
   },
   "count_cached_tokens": {
@@ -139,6 +142,7 @@
     "hint": "backend=后端抓取并缓存到插件数据目录（推荐，离线/内网可用，支持「更新头像」）；cdn=让浏览器直接请求腾讯 CDN（旧行为，需要访问电脑能上外网）；off=等同关闭头像。",
     "type": "string",
     "options": ["backend", "cdn", "off"],
+    "labels": ["后端抓取并缓存（推荐）", "腾讯 CDN 直链", "关闭头像"],
     "default": "backend"
   },
   "avatar_cache_days": {
@@ -197,10 +201,11 @@
   },
   "model_card_theme": {
     "description": "卡片配色主题",
-    "hint": "换的是整张卡的头 / 脚配色（头部是主题色渐变，不是一层几乎看不见的淡色）：indigo = 靛蓝（默认）/ teal = 青绿 / amber = 琥珀 / rose = 玫红。改完让用户重新发一次 /切换模型 就能看到。",
+    "hint": "换的是整张卡的头 / 脚配色（头部是主题色渐变，不是一层几乎看不见的淡色）。默认「靛蓝」是**蓝色**；喜欢以前那套偏紫的靛蓝就选「紫罗兰」。报错卡（红）/ 告警卡（橙）/ 恢复（绿）是**固定色**，不受这一项影响 —— 那是卡片性质，不该跟着偏好走。改完让用户重新发一次 /切换模型 就能看到。",
     "type": "string",
     "default": "indigo",
-    "options": ["indigo", "teal", "amber", "rose"]
+    "options": ["indigo", "violet", "teal", "amber", "sunset", "crimson", "rose", "graphite"],
+    "labels": ["靛蓝（蓝，默认）", "紫罗兰（旧靛蓝的紫）", "青碧", "琥珀橙", "落日橙", "朱红", "樱粉", "石墨灰"]
   },
   "detect_command_enabled": {
     "description": "允许用户使用「/切换模型检测」",

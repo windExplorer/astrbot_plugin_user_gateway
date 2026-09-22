@@ -387,16 +387,20 @@ class ModelDetector:
     # 指令入口
     # ------------------------------------------------------------------ #
     async def _notice(self, plugin: Any, event: Any, subject: Any, message: str,
-                      footer: str) -> None:
+                      footer: str, tone: str = "alert") -> None:
         """发一张提示卡（只有头 + 脚）；渲染不出来退回纯文本。
 
         「不是结果」的那些话（撞车 / 冷却里被跳过前的提醒）也走卡片：
         它们紧跟在别的卡片前后出现，图文混排看起来像两件事。
+
+        ``tone`` 决定**固定主题**：``alert``（默认，橙）= 需要你处理的通知，
+        ``error``（红）= 真的出错了。两种都不是用户主题偏好能改的 ——
+        看的人要能一眼分清「这是提醒」还是「这是报错」。
         """
         card = None
         try:
             card = await plugin.switcher.build_notice_card(
-                subject, message=message, footer=footer)
+                subject, message=message, footer=footer, tone=tone)
         except Exception as e:
             logger.warning(f"[UserGateway] 提示卡渲染失败（退回文本）: {e}")
         if card is not None and await plugin._send_image(event, card):
@@ -529,7 +533,13 @@ class ModelDetector:
                     "这一轮没有检测任何模型 · 等它跑完再发一次 /切换模型检测",
                 )
                 return
-            await plugin._send(event, f"检测失败：{(res or {}).get('error') or '未知原因'}")
+            # 真出错才用**红卡**：红色在两张卡上是同一个意思 —— 「这不是提醒，是出问题了」。
+            # 与「撞车」那条橙卡的区分就在这里：橙 = 等一会儿就好，红 = 得看看为什么。
+            await self._notice(
+                plugin, event, subject, "检测失败",
+                f"{(res or {}).get('error') or '未知原因'} · 这一轮没有结果，可稍后再试",
+                tone="error",
+            )
             return
 
         results = [r for r in (res.get("results") or []) if isinstance(r, dict)]
@@ -548,7 +558,11 @@ class ModelDetector:
             await self.annotate(fresh, probe_of)
         except Exception as e:
             logger.warning(f"[UserGateway] 检测后刷新卡片数据失败: {e}")
-            await plugin._send(event, f"检测已经跑完了，但取最新数据失败了：{e}")
+            await self._notice(
+                plugin, event, subject, "检测跑完了，但取最新数据失败",
+                f"{e} · 模型本身已经测过（结果在模型控制台里），只是这张卡没生成出来",
+                tone="error",
+            )
             return
         if fresh.get("can_switch"):
             # 让用户看完就能直接回序号切换（否则刚测完还得再发一次 /切换模型）
