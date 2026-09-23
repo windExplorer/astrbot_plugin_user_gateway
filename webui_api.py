@@ -989,7 +989,8 @@ async def h_set_quota(plugin) -> dict:
     """写入限额。body: ``{scope_type, scope_id, period, limit_tokens, mode?}`` 或 ``{items: [...]}``。
 
     ``scope_type`` 支持 ``user`` / ``group``（对象专属）、``level``（等级模板，
-    ``scope_id`` 传等级 id）、``global``（全局模板，``scope_id`` 固定 ``*``）。
+    ``scope_id`` 传等级 id）、``global``（全局模板，``scope_id`` 为 ``private`` / ``group``
+    —— v1.4.0 起私聊与群聊各一份；旧版固定 ``*`` 的写法不再收）。
 
     ⚠️ ``limit_tokens`` 的语义（见 ``gate.check_quota`` 的说明）：
 
@@ -1018,7 +1019,9 @@ async def h_set_quota(plugin) -> dict:
         if scope_type not in ("user", "group", "member", "level", "global"):
             return err("scope_type 必须是 user / group / member / level / global")
         if scope_type == "global":
-            scope_id = "*"
+            # v1.4.0：全局默认额度分私聊 / 群聊两份（scope_id = private / group）
+            if scope_id not in ("private", "group"):
+                return err("全局额度的 scope_id 必须是 private / group")
         if scope_type == "member":
             # 按成员设额度：scope_id 是「群号:QQ」，判定时用的是他在这个群里的用量
             gid, uid = parse_member_scope_id(scope_id)

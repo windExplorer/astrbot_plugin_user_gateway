@@ -869,6 +869,43 @@ class Store:
         await db.commit()
         return moved
 
+    async def migrate_global_quota_scene(self) -> int:
+        """v1.4.0 一次性迁移：「全局默认额度」从单一 ``global:*`` 拆成私聊 / 群聊两份。
+
+        背景：旧版全局默认额度只有一份（``scope_type='global', scope_id='*'``），
+        私聊和群聊共用同一组上限；但群聊按「群」记账、私聊按「人」记账，口径不同，
+        用户要求能分开配。新版闸门（``gate.layers_for``）在全局层按场景取
+        ``global:private`` / ``global:group``，所以旧 ``*`` 行必须迁走，否则永远读不到。
+
+        - ``*`` 行复制成 ``private`` 与 ``group`` 两行（目标已存在时以目标为准，不覆盖
+          —— 只可能在「迁移过一次后又导入了旧备份」这种混合状态下出现）；
+        - 然后删掉全部 ``*`` 行；
+        - 幂等：库里没有 ``global:*`` 时是 no-op。
+
+        Returns:
+            迁移（复制）出的额度行数。
+        """
+        db = self._conn()
+        async with db.execute(
+            "SELECT id, period, limit_tokens, mode, reset_at, updated_at "
+            "FROM llm_quota WHERE scope_type = 'global' AND scope_id = '*'"
+        ) as cur:
+            rows = await cur.fetchall()
+        moved = 0
+        for r in rows:
+            for scene in ("private", "group"):
+                got = await self.get_quota("global", scene, str(r["period"]))
+                if got is None:
+                    await db.execute(
+                        "INSERT INTO llm_quota(scope_type, scope_id, period, limit_tokens, mode, reset_at, updated_at) "
+                        "VALUES('global', ?, ?, ?, ?, ?, ?)",
+                        (scene, str(r["period"]), int(r["limit_tokens"]), str(r["mode"]), r["reset_at"], int(r["updated_at"])),
+                    )
+                    moved += 1
+        await db.execute("DELETE FROM llm_quota WHERE scope_type = 'global' AND scope_id = '*'")
+        await db.commit()
+        return moved
+
     async def command_policies(
         self,
     ) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
@@ -2049,7 +2086,16 @@ class Store:
                         continue
                     scope_id = str(mapped)
                 elif scope_type == "global":
-                    scope_id = "*"
+                    # v1.4.0：全局额度分私聊 / 群聊（scope_id = private / group）。
+                    # 旧备份是 '*'（或空）→ 展开成两份都写入，旧备份导入后行为不变。
+                    scene_id = str(row.get("scope_id") or "*").strip()
+                    if scene_id in ("", "*"):
+                        global_scenes: tuple[str, ...] = ("private", "group")
+                    elif scene_id in ("private", "group"):
+                        global_scenes = (scene_id,)
+                    else:
+                        stats["skipped"] += 1
+                        continue
                 elif not scope_id:
                     stats["skipped"] += 1
                     continue
@@ -2064,15 +2110,18 @@ class Store:
                     )
                 except (TypeError, ValueError):
                     reset_at = None
-                await self.upsert_quota(
-                    scope_type,
-                    scope_id,
-                    period,
-                    _as_int(row.get("limit_tokens"), 0),
-                    mode=q_mode,
-                    reset_at=reset_at,
-                )
-                stats["quotas"] += 1
+                # 全局额度按迁移出的场景列表写（'*' → private + group 两行）
+                target_scenes = global_scenes if scope_type == "global" else (scope_id,)
+                for sid in target_scenes:
+                    await self.upsert_quota(
+                        scope_type,
+                        sid,
+                        period,
+                        _as_int(row.get("limit_tokens"), 0),
+                        mode=q_mode,
+                        reset_at=reset_at,
+                    )
+                    stats["quotas"] += 1
 
             # 4) 权限规则（LLM / 指令 / 群成员 / 模型类；scene 一并带上）
             # 校验口径与 /policy 接口对齐（v1.0.0）：feature 白名单、member 的 scope_id

@@ -9,6 +9,8 @@ import {
   NEmpty,
   NForm,
   NFormItem,
+  NGrid,
+  NGridItem,
   NInput,
   NInputNumber,
   NModal,
@@ -18,6 +20,8 @@ import {
   NSelect,
   NSpace,
   NSwitch,
+  NTabPane,
+  NTabs,
   NTag,
   NTooltip,
   useMessage,
@@ -85,10 +89,6 @@ function fmtNum(n: number | null | undefined): string {
   return String(v);
 }
 
-function rowOf(rows: QuotaRow[], period: string): QuotaRow | undefined {
-  return rows.find((r) => r.period === period);
-}
-
 async function load() {
   loading.value = true;
   try {
@@ -115,35 +115,62 @@ async function load() {
 }
 
 // ------------------------------------------------------------------ //
-// 全局默认额度
+// 全局默认额度（v1.4.0：私聊 / 群聊各一份）
 // ------------------------------------------------------------------ //
+type GlobalQuotaForm = Record<string, { limit: number | null; mode: "enforce" | "observe" }>;
+
 // 表单值：null = 不配置（该周期没有额度）；0 = 明确不限
-const gForm = ref<Record<string, { limit: number | null; mode: "enforce" | "observe" }>>({
-  day: { limit: null, mode: "enforce" },
-  month: { limit: null, mode: "enforce" },
-  total: { limit: null, mode: "enforce" },
+function blankSceneForm(): GlobalQuotaForm {
+  return {
+    day: { limit: null, mode: "enforce" },
+    month: { limit: null, mode: "enforce" },
+    total: { limit: null, mode: "enforce" },
+  };
+}
+
+const SCENES: { value: "private" | "group"; label: string; hint: string }[] = [
+  { value: "private", label: "私聊默认", hint: "按「人」记账：每个好友自己的用量" },
+  { value: "group", label: "群聊默认", hint: "按「群」记账：每个群自己的用量（含群成员级额度兜底）" },
+];
+
+const gForm = ref<{ private: GlobalQuotaForm; group: GlobalQuotaForm }>({
+  private: blankSceneForm(),
+  group: blankSceneForm(),
 });
 
+/** 某个场景的全局额度行（scope_id = private / group；迁移前的旧 '*' 行闸门已不认） */
+function rowsOfScene(scene: string): QuotaRow[] {
+  return globalRows.value.filter((r) => (r.scope_id || "private") === scene);
+}
+
+function rowOfScenePeriod(scene: string, period: string): QuotaRow | undefined {
+  return rowsOfScene(scene).find((r) => r.period === period);
+}
+
 function fillGlobalForm() {
-  for (const p of PERIODS) {
-    const row = rowOf(globalRows.value, p.value);
-    gForm.value[p.value] = row
-      ? { limit: row.limit_tokens, mode: row.mode }
-      : { limit: null, mode: "enforce" };
+  for (const s of SCENES) {
+    const fresh = blankSceneForm();
+    for (const p of PERIODS) {
+      const row = rowOfScenePeriod(s.value, p.value);
+      fresh[p.value] = row
+        ? { limit: row.limit_tokens, mode: row.mode as "enforce" | "observe" }
+        : { limit: null, mode: "enforce" };
+    }
+    gForm.value[s.value] = fresh;
   }
 }
 
-async function saveGlobal() {
+async function saveGlobal(scene: "private" | "group") {
   const items: Record<string, unknown>[] = [];
   for (const p of PERIODS) {
-    const cur = rowOf(globalRows.value, p.value);
-    const want = gForm.value[p.value];
+    const cur = rowOfScenePeriod(scene, p.value);
+    const want = gForm.value[scene][p.value];
     if (want.limit == null) {
-      if (cur) items.push({ scope_type: "global", scope_id: "*", period: p.value, limit_tokens: null });
+      if (cur) items.push({ scope_type: "global", scope_id: scene, period: p.value, limit_tokens: null });
       continue;
     }
     if (!cur || cur.limit_tokens !== want.limit || cur.mode !== want.mode) {
-      items.push({ scope_type: "global", scope_id: "*", period: p.value, limit_tokens: want.limit, mode: want.mode });
+      items.push({ scope_type: "global", scope_id: scene, period: p.value, limit_tokens: want.limit, mode: want.mode });
     }
   }
   if (!items.length) {
@@ -308,8 +335,18 @@ const levelColumns: DataTableColumns<LevelRow> = [
   {
     title: "适用",
     key: "kind",
-    width: 80,
-    render: (row) => h(NTag, { size: "small", bordered: false }, { default: () => (row.kind === "group" ? "群聊" : "好友") }),
+    width: 86,
+    render: (row) =>
+      h(
+        NTag,
+        {
+          size: "small",
+          bordered: false,
+          type: row.kind === "group" ? "success" : "info",
+          style: "font-weight:500",
+        },
+        { default: () => (row.kind === "group" ? "群聊" : "私聊") },
+      ),
   },
   {
     title: "默认权限",
@@ -628,12 +665,10 @@ const quotaColumns: DataTableColumns<QuotaRow> = [
   },
 ];
 
-// 等级筛选：全部 / 好友（私聊）/ 群（群聊）；数据一次拉全，这里只是前端过滤
-const levelKindFilter = ref<"" | "user" | "group">("");
-const filteredLevels = computed(() =>
-  levelKindFilter.value ? levels.value.filter((l) => l.kind === levelKindFilter.value) : levels.value,
-);
-const levelCount = computed(() => filteredLevels.value.length);
+// 等级按 kind 拆成两张表（私聊 / 群聊），数据一次拉全，这里只是前端分组
+const userLevels = computed(() => levels.value.filter((l) => l.kind === "user"));
+const groupLevels = computed(() => levels.value.filter((l) => l.kind === "group"));
+const levelCount = computed(() => levels.value.length);
 
 onMounted(load);
 </script>
@@ -643,6 +678,10 @@ onMounted(load);
     <n-card size="small" title="额度说明">
       <n-space vertical :size="4" style="font-size: 13px; opacity: 0.82">
         <span>· 额度口径 = 输入 token + 缓存 token + 输出 token（「缓存计入」开关在配置页）。</span>
+        <span>
+          · <b>全局默认额度分「私聊默认」与「群聊默认」两份</b>（v1.4.0）：
+          私聊按「人」记账、群聊按「群」记账，互不影响，都在「额度模板」之上的最后一层兜底。
+        </span>
         <span>
           · 解析优先级：<b>好友专属 → 好友等级 → 群专属 → 群等级 → 全局</b>，
           <b>命中最具体的一层即止</b>——所以「VIP 等级 50 万」不会被「全局 5 万」反手拦掉。
@@ -665,48 +704,56 @@ onMounted(load);
       </n-space>
     </n-card>
 
-    <!-- 全局默认额度 -->
-    <n-card size="small">
-      <template #header>
-        <n-space align="center" :size="10">
-          <span>全局默认额度</span>
-          <n-tag size="small" :bordered="false">没有专属额度、也没有等级的对象按这份算</n-tag>
-        </n-space>
-      </template>
-      <n-space vertical :size="10">
-        <n-space v-for="p in PERIODS" :key="p.value" align="center" :size="10">
-          <span style="width: 56px; font-size: 13px">{{ p.label }}</span>
-          <n-input-number
-            v-model:value="gForm[p.value].limit"
-            size="small"
-            :step="10000"
-            placeholder="留空 = 不配置"
-            style="width: 190px"
-          />
-          <n-radio-group v-model:value="gForm[p.value].mode" size="small">
-            <n-radio-button value="enforce">拦截</n-radio-button>
-            <n-radio-button value="observe">观察</n-radio-button>
-          </n-radio-group>
-          <n-tag
-            v-if="rowOf(globalRows, p.value)"
-            size="small"
-            :bordered="false"
-            :type="rowOf(globalRows, p.value)!.limit_tokens === 0 ? 'default' : 'info'"
-          >
-            当前：{{ rowOf(globalRows, p.value)!.limit_tokens === 0 ? "不限" : fmtNum(rowOf(globalRows, p.value)!.limit_tokens) }}
-          </n-tag>
-          <n-tag v-else size="small" :bordered="false">未配置</n-tag>
-        </n-space>
-        <n-space>
-          <n-button size="small" type="primary" :loading="saving" @click="saveGlobal">保存全局额度</n-button>
-          <span style="font-size: 12px; opacity: 0.6; align-self: center">
-            群聊按「群」的用量算，私聊按「人」的用量算。
-          </span>
-        </n-space>
-      </n-space>
-    </n-card>
+    <!-- 全局默认额度：私聊 / 群聊各一份（v1.4.0） -->
+    <n-grid cols="1 m:2" responsive="screen" :x-gap="14" :y-gap="14">
+      <n-grid-item v-for="s in SCENES" :key="s.value">
+        <n-card size="small">
+          <template #header>
+            <n-space align="center" :size="10">
+              <n-tag size="small" :bordered="false" :type="s.value === 'group' ? 'success' : 'info'" style="font-weight: 500">
+                {{ s.label }}
+              </n-tag>
+              <span style="font-size: 12.5px; opacity: 0.65">{{ s.hint }}</span>
+            </n-space>
+          </template>
+          <n-space vertical :size="10">
+            <n-space v-for="p in PERIODS" :key="p.value" align="center" :size="10">
+              <span style="width: 56px; font-size: 13px">{{ p.label }}</span>
+              <n-input-number
+                v-model:value="gForm[s.value][p.value].limit"
+                size="small"
+                :step="10000"
+                placeholder="留空 = 不配置"
+                style="width: 190px"
+              />
+              <n-radio-group v-model:value="gForm[s.value][p.value].mode" size="small">
+                <n-radio-button value="enforce">拦截</n-radio-button>
+                <n-radio-button value="observe">观察</n-radio-button>
+              </n-radio-group>
+              <n-tag
+                v-if="rowOfScenePeriod(s.value, p.value)"
+                size="small"
+                :bordered="false"
+                :type="rowOfScenePeriod(s.value, p.value)!.limit_tokens === 0 ? 'default' : 'info'"
+              >
+                当前：{{ rowOfScenePeriod(s.value, p.value)!.limit_tokens === 0 ? "不限" : fmtNum(rowOfScenePeriod(s.value, p.value)!.limit_tokens) }}
+              </n-tag>
+              <n-tag v-else size="small" :bordered="false">未配置</n-tag>
+            </n-space>
+            <n-space align="center">
+              <n-button size="small" type="primary" :loading="saving" @click="saveGlobal(s.value)">
+                保存{{ s.label }}额度
+              </n-button>
+              <span style="font-size: 12px; opacity: 0.6">
+                没有专属额度、也没有等级的对象按这份算
+              </span>
+            </n-space>
+          </n-space>
+        </n-card>
+      </n-grid-item>
+    </n-grid>
 
-    <!-- 等级管理 -->
+    <!-- 等级管理：私聊 / 群聊两段，颜色区分 -->
     <n-card size="small">
       <template #header>
         <n-space align="center" :size="10">
@@ -715,25 +762,40 @@ onMounted(load);
         </n-space>
       </template>
       <template #header-extra>
-        <n-space :size="8" align="center">
-          <n-radio-group v-model:value="levelKindFilter" size="small">
-            <n-radio-button value="">全部</n-radio-button>
-            <n-radio-button value="user">好友（私聊）</n-radio-button>
-            <n-radio-button value="group">群（群聊）</n-radio-button>
-          </n-radio-group>
-          <n-button size="small" @click="load">刷新</n-button>
-          <n-button size="small" @click="openLevelEditor()">新增好友等级</n-button>
-          <n-button size="small" @click="openLevelEditor({ id: 0, kind: 'group', name: '', description: '', effect: 'inherit', sort_order: 0, members: 0, quotas: {} } as any)">
-            新增群聊等级
-          </n-button>
-        </n-space>
+        <n-button size="small" quaternary @click="load">刷新</n-button>
       </template>
-      <n-empty
-        v-if="!loading && !filteredLevels.length"
-        :description="levels.length ? '该类型下还没有等级' : '还没有等级 —— 可以先建「普通 / VIP」两档试试'"
-        style="padding: 30px 0"
-      />
-      <n-data-table v-else :columns="levelColumns" :data="filteredLevels" :loading="loading" :bordered="false" size="small" :scroll-x="1000" />
+
+      <!-- 私聊等级 -->
+      <div class="level-section">
+        <div class="level-section-head level-section--user">
+          <span class="level-section-title">私聊等级</span>
+          <span class="level-section-sub">作用于好友私聊（蓝）</span>
+          <n-button size="tiny" class="level-section-add" @click="openLevelEditor()">+ 新增私聊等级</n-button>
+        </div>
+        <n-empty
+          v-if="!loading && !userLevels.length"
+          description="还没有私聊等级 —— 可以先建「普通 / VIP」两档试试"
+          style="padding: 22px 0"
+        />
+        <n-data-table v-else :columns="levelColumns" :data="userLevels" :loading="loading" :bordered="false" size="small" :scroll-x="960" />
+      </div>
+
+      <!-- 群聊等级 -->
+      <div class="level-section" style="margin-top: 18px">
+        <div class="level-section-head level-section--group">
+          <span class="level-section-title">群聊等级</span>
+          <span class="level-section-sub">作用于群聊（绿），只看群不看人</span>
+          <n-button size="tiny" class="level-section-add" @click="openLevelEditor({ id: 0, kind: 'group', name: '', description: '', effect: 'inherit', sort_order: 0, members: 0, quotas: {} } as any)">
+            + 新增群聊等级
+          </n-button>
+        </div>
+        <n-empty
+          v-if="!loading && !groupLevels.length"
+          description="还没有群聊等级"
+          style="padding: 22px 0"
+        />
+        <n-data-table v-else :columns="levelColumns" :data="groupLevels" :loading="loading" :bordered="false" size="small" :scroll-x="960" />
+      </div>
     </n-card>
 
     <!-- 对象专属额度 -->
@@ -751,187 +813,194 @@ onMounted(load);
       <n-data-table v-else :columns="quotaColumns" :data="specificRows" :loading="loading" :bordered="false" size="small" :scroll-x="520" />
     </n-card>
 
-    <!-- 等级编辑弹窗 -->
-    <n-modal v-model:show="showLevelEditor" preset="card" :title="levelForm.id ? '编辑等级' : '新增等级'" style="width: 560px; max-width: 94vw">
-      <n-form label-placement="left" label-width="110">
-        <n-form-item label="适用">
-          <n-radio-group v-model:value="levelForm.kind" :disabled="!!levelForm.id">
-            <n-radio-button value="user">好友（私聊）</n-radio-button>
-            <n-radio-button value="group">群聊</n-radio-button>
-          </n-radio-group>
-        </n-form-item>
-        <n-form-item label="等级名称">
-          <n-input v-model:value="levelForm.name" placeholder="如：普通 / VIP / 黑名单" />
-        </n-form-item>
-        <n-form-item label="说明">
-          <n-input v-model:value="levelForm.description" placeholder="可选，给自己看的备注" />
-        </n-form-item>
-        <n-form-item :label="levelForm.kind === 'user' ? '私聊默认 LLM 权限' : '默认 LLM 权限'">
-          <n-radio-group v-model:value="levelForm.effect">
-            <n-radio-button value="inherit">继承</n-radio-button>
-            <n-radio-button value="allow">放行</n-radio-button>
-            <n-radio-button value="deny">禁止</n-radio-button>
-          </n-radio-group>
-          <span style="font-size: 12px; opacity: 0.6; margin-left: 8px">
-            「继承」= 该等级不管 LLM 对话权限
-          </span>
-        </n-form-item>
-        <n-form-item :label="levelForm.kind === 'user' ? '私聊默认指令权限' : '默认指令权限'">
-          <n-space vertical :size="4" style="width: 100%">
-            <n-radio-group v-model:value="levelForm.effect_command">
-              <n-radio-button value="inherit">继承</n-radio-button>
-              <n-radio-button value="allow">放行</n-radio-button>
-              <n-radio-button value="deny">禁止</n-radio-button>
-            </n-radio-group>
-            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
-              与上面的 LLM 权限<b>相互独立</b>：设成「禁止」= 该等级下的好友 / 群<b>不能用任何指令</b>；<br />
-              要给个别人开白名单，去「私聊 / 群聊」页把那个人的指令权限设为「放行」。
-            </span>
-          </n-space>
-        </n-form-item>
-        <n-form-item v-if="levelForm.kind === 'user'" label="群聊默认权限">
-          <n-space vertical :size="6" style="width: 100%">
-            <n-space align="center" :size="8">
-              <span style="font-size: 12.5px; width: 34px">LLM</span>
-              <n-radio-group v-model:value="levelForm.effect_group">
-                <n-radio-button value="inherit">跟随私聊</n-radio-button>
-                <n-radio-button value="allow">放行</n-radio-button>
-                <n-radio-button value="deny">禁止</n-radio-button>
-              </n-radio-group>
-            </n-space>
-            <n-space align="center" :size="8">
-              <span style="font-size: 12.5px; width: 34px">指令</span>
-              <n-radio-group v-model:value="levelForm.command_effect_group">
-                <n-radio-button value="inherit">跟随私聊</n-radio-button>
-                <n-radio-button value="allow">放行</n-radio-button>
-                <n-radio-button value="deny">禁止</n-radio-button>
-              </n-radio-group>
-            </n-space>
-            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
-              好友等级在群里同样生效，所以能单独说「私聊禁止、群里照用」：
-              这里设「禁止」只影响该等级的人在<b>群聊</b>里的行为；<br />
-              「跟随私聊」= 用上面私聊那一套（升级前的旧数据就是这个状态，行为不变）。
-            </span>
-          </n-space>
-        </n-form-item>
-        <n-form-item label="排序值">
-          <n-input-number v-model:value="levelForm.sort_order" size="small" style="width: 140px" />
-        </n-form-item>
-        <n-form-item label="主模型">
-          <n-select
-            v-model:value="levelForm.provider_id"
-            size="small"
-            style="width: 360px; max-width: 100%"
-            clearable
-            filterable
-            placeholder="搜索并选择模型（留空 = 跟随 AstrBot 默认）"
-            :options="providerOptions"
-          />
-        </n-form-item>
-        <n-form-item label="备用模型">
-          <n-space vertical :size="4" style="width: 100%">
-            <n-select
-              v-model:value="levelForm.fallback_provider_id"
-              size="small"
-              style="width: 360px; max-width: 100%"
-              clearable
-              filterable
-              placeholder="主模型不可用时改用它（可选）"
-              :options="providerOptions"
-            />
-            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
-              选项就是「供应商 · 模型」（一项对应 AstrBot 里的一个模型提供商）。<br />
-              私聊按「好友等级」、群聊按「群等级」决定模型（一个群一个模型，避免同群上下文串味）；
-              主模型未加载或连续失败（熔断）时自动落到备用。
-            </span>
-          </n-space>
-        </n-form-item>
-        <n-form-item label="允许切换模型">
-          <n-space vertical :size="4" style="width: 100%">
-            <n-space align="center" :size="10">
-              <n-switch v-model:value="levelForm.switch_enabled" size="small" />
-              <n-tag
+    <!-- 等级编辑弹窗：按「基本 / 权限 / 模型 / 额度」分四个标签页，避免长表单拥挤 -->
+    <n-modal v-model:show="showLevelEditor" preset="card" :title="levelForm.id ? '编辑等级' : '新增等级'" style="width: 860px; max-width: 94vw">
+      <n-tabs type="line" animated>
+        <n-tab-pane name="base" tab="基本信息">
+          <n-form label-placement="left" label-width="110" style="padding-top: 6px">
+            <n-form-item label="适用">
+              <n-space align="center" :size="10">
+                <n-radio-group v-model:value="levelForm.kind" :disabled="!!levelForm.id">
+                  <n-radio-button value="user">私聊（好友）</n-radio-button>
+                  <n-radio-button value="group">群聊（群）</n-radio-button>
+                </n-radio-group>
+                <span style="font-size: 12px; opacity: 0.6">创建后不可更改</span>
+              </n-space>
+            </n-form-item>
+            <n-form-item label="等级名称">
+              <n-input v-model:value="levelForm.name" placeholder="如：普通 / VIP / 黑名单" style="max-width: 380px" />
+            </n-form-item>
+            <n-form-item label="说明">
+              <n-input v-model:value="levelForm.description" placeholder="可选，给自己看的备注" style="max-width: 380px" />
+            </n-form-item>
+            <n-form-item label="排序值">
+              <n-space align="center" :size="10">
+                <n-input-number v-model:value="levelForm.sort_order" size="small" style="width: 160px" />
+                <span style="font-size: 12px; opacity: 0.6">仅决定控制台里的展示顺序</span>
+              </n-space>
+            </n-form-item>
+          </n-form>
+        </n-tab-pane>
+
+        <n-tab-pane name="permission" tab="默认权限">
+          <n-form label-placement="left" label-width="110" style="padding-top: 6px">
+            <n-form-item :label="levelForm.kind === 'user' ? '私聊 LLM 权限' : '默认 LLM 权限'">
+              <n-space align="center" :size="10">
+                <n-radio-group v-model:value="levelForm.effect">
+                  <n-radio-button value="inherit">继承</n-radio-button>
+                  <n-radio-button value="allow">放行</n-radio-button>
+                  <n-radio-button value="deny">禁止</n-radio-button>
+                </n-radio-group>
+                <span style="font-size: 12px; opacity: 0.6">「继承」= 该等级不管 LLM 对话权限</span>
+              </n-space>
+            </n-form-item>
+            <n-form-item :label="levelForm.kind === 'user' ? '私聊指令权限' : '默认指令权限'">
+              <n-space vertical :size="6" style="width: 100%">
+                <n-radio-group v-model:value="levelForm.effect_command">
+                  <n-radio-button value="inherit">继承</n-radio-button>
+                  <n-radio-button value="allow">放行</n-radio-button>
+                  <n-radio-button value="deny">禁止</n-radio-button>
+                </n-radio-group>
+                <span style="font-size: 12px; opacity: 0.6; line-height: 1.6">
+                  与 LLM 权限<b>相互独立</b>：设成「禁止」= 该等级下的好友 / 群<b>不能用任何指令</b>；
+                  要给个别人开白名单，去「私聊 / 群聊」页把那个人的指令权限设为「放行」。
+                </span>
+              </n-space>
+            </n-form-item>
+            <n-form-item v-if="levelForm.kind === 'user'" label="群聊默认权限">
+              <n-space vertical :size="8" style="width: 100%">
+                <n-space align="center" :size="8">
+                  <span style="font-size: 12.5px; width: 34px">LLM</span>
+                  <n-radio-group v-model:value="levelForm.effect_group">
+                    <n-radio-button value="inherit">跟随私聊</n-radio-button>
+                    <n-radio-button value="allow">放行</n-radio-button>
+                    <n-radio-button value="deny">禁止</n-radio-button>
+                  </n-radio-group>
+                </n-space>
+                <n-space align="center" :size="8">
+                  <span style="font-size: 12.5px; width: 34px">指令</span>
+                  <n-radio-group v-model:value="levelForm.command_effect_group">
+                    <n-radio-button value="inherit">跟随私聊</n-radio-button>
+                    <n-radio-button value="allow">放行</n-radio-button>
+                    <n-radio-button value="deny">禁止</n-radio-button>
+                  </n-radio-group>
+                </n-space>
+                <span style="font-size: 12px; opacity: 0.6; line-height: 1.6">
+                  好友等级在群里同样生效，所以能单独说「私聊禁止、群里照用」：
+                  这里设「禁止」只影响该等级的人在<b>群聊</b>里的行为；
+                  「跟随私聊」= 用上面私聊那一套（旧数据就是这个状态，行为不变）。
+                </span>
+              </n-space>
+            </n-form-item>
+          </n-form>
+        </n-tab-pane>
+
+        <n-tab-pane name="model" tab="模型与自助">
+          <n-form label-placement="left" label-width="110" style="padding-top: 6px">
+            <n-form-item label="主模型">
+              <n-select
+                v-model:value="levelForm.provider_id"
                 size="small"
-                :bordered="false"
-                :type="levelForm.switch_enabled ? 'success' : 'default'"
-              >
-                {{ levelForm.switch_enabled ? "用户可自助切换" : "只读（默认）：能看不能切" }}
-              </n-tag>
-            </n-space>
-            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
-              关掉时该等级的用户发 <b>/切换模型</b> 仍然能看到卡片（当前使用的模型 + 候选），
-              但<b>回序号不生效</b>：只读，避免「让人自己挑」变成「谁都能挑最贵的那个」。<br />
-              <b>管理员不受限制</b>（开关关着也能切，用于排查）；<b>群里只有管理员能切</b>，
-              普通成员在群里发这个指令会被直接拒绝（让他私聊用）。
-            </span>
-          </n-space>
-        </n-form-item>
-        <n-form-item label="可切换模型">
-          <n-space vertical :size="4" style="width: 100%">
-            <n-select
-              v-model:value="levelForm.switch_providers"
-              multiple
-              filterable
-              size="small"
-              style="width: 360px; max-width: 100%"
-              :disabled="!levelForm.switch_enabled"
-              placeholder="留空 = 用兜底三项（当前 / 系统默认 / 备用）"
-              :options="providerOptions"
-            />
-            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
-              只有上面打开了开关才有意义。填了就<b>只能从这份名单里挑</b>（外加他自己的专属模型）；
-              <b>留空</b> = 展示并允许在这三项里选：<b>当前使用的模型 / 系统默认模型 / 等级备用模型</b>。<br />
-              用户的选择存在他自己身上（私聊 / 群聊各一份），不覆盖这里的<b>主模型</b>配置：
-              这里配的是「默认走哪个」，名单是「允许他自己换成哪些」；
-              用户随时可以发「/切换模型 0」回到这里配的主模型。
-            </span>
-          </n-space>
-        </n-form-item>
-        <n-form-item label="允许检测模型">
-          <n-space vertical :size="4" style="width: 100%">
-            <n-space align="center" :size="10">
-              <n-switch v-model:value="levelForm.detect_enabled" size="small" />
-              <n-tag
-                size="small"
-                :bordered="false"
-                :type="levelForm.detect_enabled ? 'success' : 'default'"
-              >
-                {{ levelForm.detect_enabled ? "可用 /切换模型检测" : "不可用（默认）" }}
-              </n-tag>
-            </n-space>
-            <span style="font-size: 12px; opacity: 0.6; line-height: 1.5">
-              打开后该等级的用户可以发 <b>/切换模型检测</b>：真打一遍本分组允许使用的模型，
-              然后把<b>延迟 / 成功率 / 数据时间</b>标在「切换模型」卡片上。<br />
-              它<b>会真花额度</b>（每个模型打一次，通常是免费额度或极少量），所以与上面的
-              「允许切换模型」<b>分开两个开关</b>：能看不等于愿意花钱测。<br />
-              需要先安装「<b>萌萌模型控制台</b>」（astrbot_plugin_model_panel）：检测由它执行、
-              结果也存在它那边；没装时这条指令会直接提示去装。<br />
-              <b>管理员不受限制</b>；非管理员另有冷却（配置页「模型检测」分区可调）。
-            </span>
-          </n-space>
-        </n-form-item>
-        <n-form-item label="额度模板">
-          <n-space vertical :size="8" style="width: 100%">
-            <n-space v-for="p in PERIODS" :key="p.value" align="center" :size="8">
-              <span style="width: 44px; font-size: 13px">{{ p.label }}</span>
-              <n-input-number
-                v-model:value="levelForm.quotas[p.value].limit"
-                size="small"
-                :step="10000"
-                placeholder="留空 = 不配置"
-                style="width: 170px"
+                style="max-width: 420px"
+                clearable
+                filterable
+                placeholder="搜索并选择模型（留空 = 跟随 AstrBot 默认）"
+                :options="providerOptions"
               />
-              <n-radio-group v-model:value="levelForm.quotas[p.value].mode" size="small">
-                <n-radio-button value="enforce">拦截</n-radio-button>
-                <n-radio-button value="observe">观察</n-radio-button>
-              </n-radio-group>
-            </n-space>
-            <span style="font-size: 12px; opacity: 0.6">
-              每个属于该等级的对象各自一份额度（不是整组合计）；填 0 表示明确不限。
-            </span>
-          </n-space>
-        </n-form-item>
-      </n-form>
+            </n-form-item>
+            <n-form-item label="备用模型">
+              <n-space vertical :size="4" style="width: 100%">
+                <n-select
+                  v-model:value="levelForm.fallback_provider_id"
+                  size="small"
+                  style="max-width: 420px"
+                  clearable
+                  filterable
+                  placeholder="主模型不可用时改用它（可选）"
+                  :options="providerOptions"
+                />
+                <span style="font-size: 12px; opacity: 0.6; line-height: 1.6">
+                  选项就是「供应商 · 模型」。私聊按「好友等级」、群聊按「群等级」决定模型；
+                  主模型未加载或连续失败（熔断）时自动落到备用。
+                </span>
+              </n-space>
+            </n-form-item>
+            <n-form-item label="允许切换模型">
+              <n-space vertical :size="4" style="width: 100%">
+                <n-space align="center" :size="10">
+                  <n-switch v-model:value="levelForm.switch_enabled" size="small" />
+                  <n-tag size="small" :bordered="false" :type="levelForm.switch_enabled ? 'success' : 'default'">
+                    {{ levelForm.switch_enabled ? "用户可自助切换" : "只读（默认）：能看不能切" }}
+                  </n-tag>
+                </n-space>
+                <span style="font-size: 12px; opacity: 0.6; line-height: 1.6">
+                  关掉时该等级的用户发 <b>/切换模型</b> 仍然能看到卡片，但<b>回序号不生效</b>。
+                  <b>管理员不受限制</b>；<b>群里只有管理员能切</b>。
+                </span>
+              </n-space>
+            </n-form-item>
+            <n-form-item label="可切换模型">
+              <n-space vertical :size="4" style="width: 100%">
+                <n-select
+                  v-model:value="levelForm.switch_providers"
+                  multiple
+                  filterable
+                  size="small"
+                  style="max-width: 420px"
+                  :disabled="!levelForm.switch_enabled"
+                  placeholder="留空 = 用兜底三项（当前 / 系统默认 / 备用）"
+                  :options="providerOptions"
+                />
+                <span style="font-size: 12px; opacity: 0.6; line-height: 1.6">
+                  只有上面打开了开关才有意义。填了就<b>只能从这份名单里挑</b>（外加他自己的专属模型）；
+                  用户随时可以发「/切换模型 0」回到这里配的主模型。
+                </span>
+              </n-space>
+            </n-form-item>
+            <n-form-item label="允许检测模型">
+              <n-space vertical :size="4" style="width: 100%">
+                <n-space align="center" :size="10">
+                  <n-switch v-model:value="levelForm.detect_enabled" size="small" />
+                  <n-tag size="small" :bordered="false" :type="levelForm.detect_enabled ? 'success' : 'default'">
+                    {{ levelForm.detect_enabled ? "可用 /切换模型检测" : "不可用（默认）" }}
+                  </n-tag>
+                </n-space>
+                <span style="font-size: 12px; opacity: 0.6; line-height: 1.6">
+                  打开后该等级的用户可以发 <b>/切换模型检测</b>（真打模型、<b>会花额度</b>，
+                  与「允许切换模型」分开两个开关）。需要先安装「<b>萌萌模型控制台</b>」；
+                  <b>管理员不受限制</b>，非管理员另有冷却（配置页「模型检测」分区可调）。
+                </span>
+              </n-space>
+            </n-form-item>
+          </n-form>
+        </n-tab-pane>
+
+        <n-tab-pane name="quota" tab="额度模板">
+          <n-form label-placement="left" label-width="110" style="padding-top: 6px">
+            <n-form-item label="额度模板">
+              <n-space vertical :size="10" style="width: 100%">
+                <n-space v-for="p in PERIODS" :key="p.value" align="center" :size="8">
+                  <span style="width: 44px; font-size: 13px">{{ p.label }}</span>
+                  <n-input-number
+                    v-model:value="levelForm.quotas[p.value].limit"
+                    size="small"
+                    :step="10000"
+                    placeholder="留空 = 不配置"
+                    style="width: 190px"
+                  />
+                  <n-radio-group v-model:value="levelForm.quotas[p.value].mode" size="small">
+                    <n-radio-button value="enforce">拦截</n-radio-button>
+                    <n-radio-button value="observe">观察</n-radio-button>
+                  </n-radio-group>
+                </n-space>
+                <span style="font-size: 12px; opacity: 0.6; line-height: 1.6">
+                  每个属于该等级的对象各自一份额度（不是整组合计）；填 0 表示明确不限。
+                </span>
+              </n-space>
+            </n-form-item>
+          </n-form>
+        </n-tab-pane>
+      </n-tabs>
       <template #footer>
         <n-space justify="end">
           <n-button @click="showLevelEditor = false">取消</n-button>
@@ -986,3 +1055,40 @@ onMounted(load);
     </n-modal>
   </n-space>
 </template>
+
+<style scoped>
+/* 等级管理的私聊 / 群聊分区头：色条 + 标题 + 新增按钮，比一列灰 tag 更好认 */
+.level-section-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  margin-bottom: 10px;
+  border-radius: 4px;
+  border-left: 4px solid transparent;
+  background: var(--n-color-target, rgba(128, 128, 128, 0.08));
+}
+.level-section--user {
+  border-left-color: #4098fc;
+}
+.level-section--group {
+  border-left-color: #36ad6a;
+}
+.level-section-title {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.level-section--user .level-section-title {
+  color: #4098fc;
+}
+.level-section--group .level-section-title {
+  color: #36ad6a;
+}
+.level-section-sub {
+  font-size: 12px;
+  opacity: 0.6;
+}
+.level-section-add {
+  margin-left: auto;
+}
+</style>

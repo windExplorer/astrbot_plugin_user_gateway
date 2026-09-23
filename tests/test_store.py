@@ -342,6 +342,13 @@ async def main() -> int:
         glob = await st.list_quotas("global")
         await st.upsert_quota("global", "*", "day", 50000)
         check(len(await st.list_quotas("global")) == 1 and glob == [], "全局模板独立成一层")
+        # v1.4.0：旧 global:* 行由启动迁移拆成私聊 / 群聊两份
+        moved = await st.migrate_global_quota_scene()
+        check(moved == 2, f"全局 '*' 行迁移复制成两份（实得 {moved}）")
+        check((await st.get_quota("global", "private", "day"))["limit_tokens"] == 50000, "迁移后私聊全局额度存在")
+        check((await st.get_quota("global", "group", "day"))["limit_tokens"] == 50000, "迁移后群聊全局额度存在")
+        check(all(r["scope_id"] != "*" for r in await st.list_quotas("global")), "迁移后不再有 '*' 行")
+        check((await st.migrate_global_quota_scene()) == 0, "全局额度场景迁移幂等：再跑一遍是 no-op")
 
         await st.set_subject_level("user", "10001", lv_vip)
         check(await st.get_subject_level("user", "10001") == lv_vip, "归级写入")
@@ -849,7 +856,8 @@ async def main() -> int:
         await dst.upsert_level("user", "别的等级")
         stats = await dst.import_rules(dump, mode="merge")
         check(
-            stats["levels"] == 2 and stats["policies"] == 8 and stats["quotas"] == 4 and stats["skipped"] == 0,
+            # v1.4.0：旧格式的 global:* 行导入时展开成 private + group 两行（4 → 5）
+            stats["levels"] == 2 and stats["policies"] == 8 and stats["quotas"] == 5 and stats["skipped"] == 0,
             f"导入统计正确（实得 {stats}）",
         )
         lv_list = await dst.list_levels("user")
@@ -890,7 +898,9 @@ async def main() -> int:
         cmc = await dst.effect_map("member", feature="command")
         check(cmc["88888:10001"][""] == "allow", "群成员维度的指令规则导入")
         check((await dst.get_quota("member", "88888:10001", "day"))["limit_tokens"] == 500, "成员额度导入")
-        check((await dst.get_quota("global", "*", "month"))["limit_tokens"] == 9000000, "全局额度导入")
+        # v1.4.0：旧备份里的 global:* 导入时展开成私聊 / 群聊两行
+        check((await dst.get_quota("global", "private", "month"))["limit_tokens"] == 9000000, "全局额度导入（私聊）")
+        check((await dst.get_quota("global", "group", "month"))["limit_tokens"] == 9000000, "全局额度导入（群聊）")
 
         # 坏数据：跳过坏行，而不是整次导入失败
         bad = {

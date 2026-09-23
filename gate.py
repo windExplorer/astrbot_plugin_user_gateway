@@ -192,14 +192,25 @@ class Rules:
 
 @dataclass(frozen=True)
 class LayerRef:
-    """一个额度档位：去哪找限额、去哪找用量。"""
+    """一个额度档位：去哪找限额、去哪找用量。
+
+    ``scope_id`` 与 ``quota_id`` 的分工（v1.4.0）：同一个全局档位上挂着**两类**规则
+    —— 指令总权限存的是 ``global/*``，而全局默认额度自 v1.4.0 起分场景存
+    ``global/private`` / ``global/group``。所以 ``scope_id`` 恒为 ``*``（权限链用），
+    额度查找一律用 ``quota_id``（非全局层与 ``scope_id`` 相同）。
+    """
 
     layer: str
-    scope_type: str  # user | group | level | global（限额所在）
-    scope_id: str
+    scope_type: str  # user | group | level | global（限额与权限所在）
+    scope_id: str  # 权限链取规则的键（全局层恒为 ``*``）
     usage_type: str  # user | group（用量所在）
     usage_id: str
     scene: str = SCENE_ANY  # 本次会话的场景（private | group），取规则时按它回落通用
+    quota_id: str = ""  # 额度查找的键（v1.4.0；空 = 退回 scope_id）
+
+    @property
+    def quota_key(self) -> str:
+        return self.quota_id or self.scope_id
 
     @property
     def label(self) -> str:
@@ -332,9 +343,20 @@ class Gate:
             lv = rules.level_id_of("group", gid)
             if lv:
                 out.append(LayerRef(LAYER_GROUP_LEVEL, "level", str(lv), "group", gid, scene))
-        # 全局：群聊按群用量、私聊按人用量（与 v0.2 的记账口径一致）
+        # 全局：权限链的 scope_id 恒为 ``*``（指令总权限存的是 global/*）；
+        # 额度自 v1.4.0 起分私聊 / 群聊两份（global:private / global:group，
+        # 由 store 的启动迁移把旧 global:* 复制成两行），所以 quota_id 用场景名。
+        # 记账口径不变：群聊按群用量、私聊按人用量（与 v0.2 一致）。
         out.append(
-            LayerRef(LAYER_GLOBAL, "global", "*", "group" if gid else "user", gid or uid, scene)
+            LayerRef(
+                LAYER_GLOBAL,
+                "global",
+                "*",
+                "group" if gid else "user",
+                gid or uid,
+                scene,
+                scene or "*",
+            )
         )
         return out
 
@@ -708,7 +730,7 @@ class Gate:
         「当前生效的是哪个额度」。``mode=observe`` 超限仍然放行并标记 ``observed``。
         """
         for ref in Gate.layers_for(subject, rules):
-            limits = rules.limits_of(ref.scope_type, ref.scope_id)
+            limits = rules.limits_of(ref.scope_type, ref.quota_key)
             if not limits:
                 continue
             usage = rules.usage_of(ref.usage_type, ref.usage_id)
@@ -716,7 +738,8 @@ class Gate:
             base = {
                 "layer": ref.layer,
                 "scope_type": ref.scope_type,
-                "scope_id": ref.scope_id,
+                # 全局层报出 private / group，便于控制台说明「按哪份全局额度算」
+                "scope_id": ref.quota_key,
             }
             if not hit:
                 return Verdict(allow=True, **base, **self.compact_limit(limits, usage))

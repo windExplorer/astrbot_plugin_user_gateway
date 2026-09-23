@@ -212,7 +212,8 @@ def main() -> int:
     print("\n[5] 等级额度：更具体的层覆盖全局（等级的意义所在）")
     # 全局 5 万，VIP 等级 50 万 → VIP 用户用到 10 万仍然放行（全局不参与）
     two_layer = R(
-        limits={"level": {"2": {"day": lim(500000)}}, "global": {"*": {"day": lim(50000)}}},
+        # v1.4.0：全局额度按场景取（私聊 = global:private，群聊 = global:group）
+        limits={"level": {"2": {"day": lim(500000)}}, "global": {"private": {"day": lim(50000)}}},
         usage={"user": {"10001": {"day": used(100000)}}},
         subject_level={"user": {"10001": 2}},
     )
@@ -255,6 +256,12 @@ def main() -> int:
     check([r.layer for r in refs] == ["member", "user", "user_level", "group", "group_level", "global"],
           f"群聊档位链顺序正确（实得 {[r.layer for r in refs]}）")
     check(refs[0].scope_id == "88888:10001", "群成员层的 scope_id 是「群号:QQ」")
+    # v1.4.0：权限链的 scope_id 恒为 *（指令总权限存 global/*），额度键按场景拆分
+    check(refs[-1].scope_id == "*" and refs[-1].quota_key == "group",
+          "群聊全局层：权限键 * 不变，额度键是 group")
+    _p = G.Gate.layers_for(G.Subject(sender_id="10001"), R())[-1]
+    check(_p.scope_id == "*" and _p.quota_key == "private",
+          "私聊全局层：权限键 * 不变，额度键是 private")
     check([r.layer for r in G.Gate.layers_for(G.Subject(sender_id="10001"), R())] == ["user", "global"],
           "私聊档位链只有好友专属与全局（没有群成员层）")
 

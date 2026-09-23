@@ -285,6 +285,17 @@ class UserGatewayPlugin(Star):
         except Exception as e:
             logger.warning(f"[UserGateway] model_choice 迁移失败（跳过，不影响启动）: {e}")
 
+        # v1.4.0：全局默认额度拆私聊 / 群聊 —— 旧 global:* 行复制成两份再删掉，
+        # 同样必须在第一次 reload_rules 之前完成。
+        try:
+            migrated = await self.store.migrate_global_quota_scene()
+            if migrated:
+                logger.info(
+                    f"[UserGateway] 已把旧全局额度拆成私聊 / 群聊两份（{migrated} 行）"
+                )
+        except Exception as e:
+            logger.warning(f"[UserGateway] 全局额度场景迁移失败（跳过，不影响启动）: {e}")
+
         await self.reload_rules()
         await self._purge_old_usage()
 
@@ -1321,7 +1332,7 @@ class UserGatewayPlugin(Star):
         out: list[dict[str, Any]] = []
         taken = False  # 已经命中最具体的一层 → 更粗的层不再参与
         for ref in refs:
-            rows = dict(rules.limits_of(ref.scope_type, ref.scope_id))
+            rows = dict(rules.limits_of(ref.scope_type, ref.quota_key))
             raw_usage = rules.usage_of(ref.usage_type, ref.usage_id)
             limits = {
                 period: {
