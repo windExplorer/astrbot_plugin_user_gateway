@@ -75,9 +75,11 @@ onContext((ctx) => {
 const theme = computed(() => (themeDark.value ? darkTheme : null));
 const themeOverrides: GlobalThemeOverrides = {
   common: {
-    primaryColor: "#7c5cff",
-    primaryColorHover: "#8f73ff",
-    primaryColorPressed: "#6a49f2",
+    // 主色要与白字过 AA（≥4.5:1）：#7c5cff 只有 4.35:1，实心紫底上的白字发虚；
+    // 默认态压深到 #6a49f2（5.46:1），hover 用回原 #7c5cff（瞬时态可接受），pressed 更深。
+    primaryColor: "#6a49f2",
+    primaryColorHover: "#7c5cff",
+    primaryColorPressed: "#5b39d6",
     borderRadius: "8px",
   },
 };

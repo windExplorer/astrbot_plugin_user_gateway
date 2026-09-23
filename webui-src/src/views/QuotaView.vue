@@ -1057,7 +1057,8 @@ onMounted(load);
 </template>
 
 <style scoped>
-/* 等级管理的私聊 / 群聊分区头：色条 + 标题 + 新增按钮，比一列灰 tag 更好认 */
+/* 等级管理的私聊 / 群聊分区头：色条 + 标题 + 新增按钮，比一列灰 tag 更好认。
+   背景用显式的蓝/绿浅底（不引用 CSS 变量，明暗主题下都够读）。 */
 .level-section-head {
   display: flex;
   align-items: center;
@@ -1066,13 +1067,14 @@ onMounted(load);
   margin-bottom: 10px;
   border-radius: 4px;
   border-left: 4px solid transparent;
-  background: var(--n-color-target, rgba(128, 128, 128, 0.08));
 }
 .level-section--user {
   border-left-color: #4098fc;
+  background: rgba(64, 152, 252, 0.1);
 }
 .level-section--group {
   border-left-color: #36ad6a;
+  background: rgba(54, 173, 106, 0.1);
 }
 .level-section-title {
   font-size: 13.5px;
