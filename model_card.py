@@ -10,7 +10,9 @@
    权限插件不能因为一张图渲染失败就把用户的指令吃掉。
 2. **只依赖 Pillow**：它是 AstrBot 核心依赖（``requirements.txt`` 里的 ``pillow>=11.2.1``），
    随 AstrBot 一起装好，所以这里不新增任何第三方依赖。
-3. **字体优先级**：调用方指定（配置项）→ 插件自带 ``assets/fonts`` → 系统常见中文字体。
+3. **字体优先级**：调用方指定（配置项）→ 投放目录（``data/plugin_data/<插件名>/fonts``
+   与共享 ``data/fonts``）→ 插件自带 ``assets/fonts`` → 系统常见中文字体。
+   每一档都**真加载一次验货**，读不动就换下一份，而不是让整张卡降级成文字。
    全都找不到时**返回 None**——中文渲染成豆腐块比不发图更糟。
 
 版面（v1.3.8 重画，借 `astrbot_plugin_box` 的卡片风格）：**头 + 身体 + 脚**三段拼接。
@@ -59,6 +61,20 @@ except Exception:  # pragma: no cover - 仅在没有 Pillow 的环境
     ImageFont = None  # type: ignore
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+
+# 用户可以自己投放字体的目录（相对 AstrBot 的 ``data/``）：
+#   1) 本插件专属持久位（卸载时跟着一起清）；
+#   2) 共享 ``data/fonts`` —— 和「萌萌模型控制台」认的是同一个目录，丢一次两个插件都生效。
+# 排在**插件自带之前**：随包的圆体只是「开箱有中文」的兜底，不该盖掉用户明确放进来的字体。
+DROPIN_FONT_DIRS: tuple[tuple[str, ...], ...] = (
+    ("plugin_data", "astrbot_plugin_user_gateway", "fonts"),
+    ("fonts",),
+)
+# Pillow/FreeType 认这几类容器（woff2 实测能直接加载，不必先转成 ttf）
+FONT_SUFFIXES = (".ttc", ".otf", ".ttf", ".woff2", ".woff")
+# 目录里躺着好几个时按这个顺序挑（与 model_panel 的 card_render 用同一套偏好）
+FONT_NAME_HINTS = ("lxgw", "wenkai", "霞鹜", "hanrounded", "rounded", "圆",
+                   "noto", "sourcehan", "source-han", "pingfang", "msyh")
 
 # 系统字体候选（按「中文覆盖好 + 常见」排序）。Windows / macOS / Linux 各来几份，
 # 找不到就用插件自带字体；两者都没有才会走到「不渲染」。
@@ -254,26 +270,87 @@ def theme_colors(name: str = "") -> dict[str, tuple]:
     return THEMES.get(str(name or "").strip().lower() or DEFAULT_THEME) or THEMES[DEFAULT_THEME]
 
 
+_FONT_LOAD_OK: dict[str, bool] = {}
+
+
+def _loadable(path: Path) -> bool:
+    """这份字体 Pillow 到底读不读得动，**只缓存成功的**。
+
+    为什么要真加载一次：读不动的字体（扩展名对但文件损坏 / 这个 Pillow 构建不支持的容器）
+    如果只按存在性就选中，调用方只能整张卡降级成纯文本；提前验掉就能顺势换下一份候选。
+    为什么失败不进缓存：「先把路径填进配置、之后再往容器拷文件」是最正常的操作顺序，
+    把一次读不动记死就会永远跳过它 —— 用户放了字体却没效果，还以为插件坏了。
+    成功才缓存：每张卡都重新解析一遍几十 MB 的字体头纯属浪费。
+    """
+    key = str(path)
+    if _FONT_LOAD_OK.get(key):
+        return True
+    ok = False
+    try:
+        if ImageFont is not None and path.is_file():
+            ImageFont.truetype(key, 20)
+            ok = True
+    except Exception:
+        ok = False
+    if ok:
+        _FONT_LOAD_OK[key] = True
+    return ok
+
+
+def dropin_font_dirs() -> list[Path]:
+    """用户可投放字体的目录。拿不到 AstrBot 的 data 根目录时返回空列表。"""
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+        root = str(get_astrbot_data_path() or "")
+    except Exception:
+        root = ""
+    if not root:
+        return []
+    return [Path(root).joinpath(*parts) for parts in DROPIN_FONT_DIRS]
+
+
+def _fonts_in(directory: Path) -> list[Path]:
+    """列一个目录里的字体候选并按名字优先级排；目录不存在或不可读时返回空。"""
+    try:
+        files = [
+            p for p in directory.iterdir()
+            if p.is_file() and p.suffix.lower() in FONT_SUFFIXES
+        ]
+    except Exception:
+        return []
+
+    def rank(p: Path) -> tuple:
+        low = p.name.lower()
+        for i, hint in enumerate(FONT_NAME_HINTS):
+            if hint in low:
+                return (0, i, low)
+        return (1, 0, low)
+
+    return sorted(files, key=rank)
+
+
 def find_font_path(prefer: str = "") -> Optional[Path]:
-    """按「配置指定 → 插件自带 → 系统候选」找一份可用的字体文件；都没有返回 None。"""
+    """找一份**读得动**的中文字体：配置指定 → 投放目录 → 插件自带 → 系统候选；都没有返回 None。
+
+    投放目录排在自带之前是有意的：随包的圆体只是「开箱有中文」的兜底，
+    用户特意往 ``data/fonts`` 丢一份字体进来，就该是他的那份生效。
+    """
+    candidates: list[Path] = []
     want = str(prefer or "").strip()
     if want:
-        p = Path(want)
-        if p.is_file():
-            return p
-    bundled = sorted(ASSETS_DIR.glob("*.woff2")) + sorted(ASSETS_DIR.glob("*.ttf")) + sorted(
-        ASSETS_DIR.glob("*.otf")
+        candidates.append(Path(want))
+    for d in dropin_font_dirs():
+        candidates += _fonts_in(d)
+    candidates += (
+        sorted(ASSETS_DIR.glob("*.woff2"))
+        + sorted(ASSETS_DIR.glob("*.ttf"))
+        + sorted(ASSETS_DIR.glob("*.otf"))
     )
-    for p in bundled:
-        if p.is_file():
+    candidates += [Path(raw) for raw in SYSTEM_FONT_CANDIDATES]
+    for p in candidates:
+        if _loadable(p):
             return p
-    for raw in SYSTEM_FONT_CANDIDATES:
-        p = Path(raw)
-        try:
-            if p.is_file():
-                return p
-        except Exception:
-            continue
     return None
 
 

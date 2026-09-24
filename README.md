@@ -239,7 +239,7 @@ bot ：（先回一张「检测中」卡片）
 | `model_route_enabled` | 是否启用等级模型路由 |
 | `model_switch_enabled` / `model_switch_timeout_sec` | 是否允许用户自查自切模型 / 等他回序号的秒数（默认 60） |
 | `model_card_theme` | 卡片配色主题，共八套（下拉里都是中文）：**靛蓝（蓝，默认）** / 紫罗兰（旧靛蓝的紫）/ 青碧 / 琥珀橙 / 落日橙 / 朱红 / 樱粉 / 石墨灰。报错（红）/ 告警（橙）是固定色，不跟这一项走 |
-| `model_card_font` | 卡片字体文件路径（留空 = 用插件自带中文字体，再退到系统字体） |
+| `model_card_font` | 卡片字体文件路径（留空 = 自动：投放目录 `data/fonts` → 插件自带中文字体 → 系统字体） |
 | `model_card_recall` | 卡片到期后自动撤回（默认开；时间就是上面的 `model_switch_timeout_sec`，仅 QQ 平台生效） |
 | `detect_command_enabled` | 是否允许用户用 `/切换模型检测`（默认开；**能不能用还要看各等级的「允许检测模型」**，那个默认关） |
 | `detect_command_cooldown_min` / `detect_model_cooldown_min` | 指令冷却（默认 30 分钟，**仅非管理员**）/ 同一模型重复检测间隔（默认 5 分钟） |
@@ -257,8 +257,11 @@ bot ：（先回一张「检测中」卡片）
 - **换机器怎么搬？** 见上文「备份与迁移」。
 - **CSV 用 Excel 打开乱码？** 文件已带 UTF-8 BOM；若 WPS / 旧版 Excel 仍异常，用「数据 → 从文本导入」选 UTF-8。
 - **`/切换模型` 收到的是文字列表而不是卡片？** 说明这台机器上没找到可用的中文字体
-  （也不该发一屏豆腐块）。包内自带一份中文字体，正常不会发生；真发生了就在「配置 → 模型路由」
-  里把 `model_card_font` 指向一个中文字体文件（如 Windows 的 `C:\Windows\Fonts\msyh.ttc`）。
+  （也不该发一屏豆腐块）。包内自带一份圆体，正常不会发生；真发生了有两条路：
+  **Docker / Linux 推荐**把字体文件（`.ttc` / `.otf` / `.ttf` / `.woff2`）丢进挂载卷的
+  `data/fonts/`，插件会自动认（和「萌萌模型控制台」认同一个目录，放一次两个插件都生效，
+  不用重启、不用重装）；或者在「配置 → 模型路由」里把 `model_card_font` 指向一个具体文件
+  （如 Windows 的 `C:\Windows\Fonts\msyh.ttc`）。想换成霞鹜文楷之类的也是这一招。
   功能不受影响——文字列表里的序号一样能回。
 - **`/切换模型检测` 没反应 / 只回一句「请先安装」？** 这条指令**依赖另一个插件**
   （[萌萌模型控制台](https://github.com/windExplorer/astrbot_plugin_model_panel)）：检测与数据都在它那边，

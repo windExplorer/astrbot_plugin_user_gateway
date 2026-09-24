@@ -19,6 +19,9 @@ uv run --no-project python tests/test_gate.py
 # /切换模型 自检（名单组装 / 序号切换 / 卡片渲染）
 uv run --no-project --with aiosqlite --with pillow python tests/test_model_switch.py
 
+# 卡片字体查找顺序自检（投放目录盖过自带 / 读不动的要跳过 / 失败不缓存）
+uv run --no-project --with pillow python tests/test_model_card_font.py
+
 # 打包（要求 pages/permission-console/ 已构建；同名版本会拒绝覆盖，需先升版本）
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_zip.ps1
 ```
@@ -169,8 +172,15 @@ astrbot_plugin_user_gateway/
   没有待选会话时必须原样放行（不拦不答），有则切换并 `stop_event()`
   （否则数字还会被当聊天内容送给模型，用户收到两段回复）。
 - **卡片渲染是「尽力而为」**：`model_card.render_model_card()` 任何失败都返回 `None`，
-  调用方退化成纯文本列表；字体按「配置 → 插件自带 `assets/fonts` → 系统字体」找，
-  全都没有才退化。绝不允许「一张图渲染失败」把用户的指令吃掉。
+  调用方退化成纯文本列表；字体按「配置 → 投放目录（`data/plugin_data/<插件名>/fonts`、共享
+  `data/fonts`）→ 插件自带 `assets/fonts` → 系统字体」找，**每一档都真 `ImageFont.truetype`
+  加载一次验货**，读不动就换下一档（只缓存成功结果 —— 把失败记死的话，用户之后把字体
+  拷进容器也永远不生效，只能重启）。投放目录排在自带之前：随包的圆体只是「开箱有中文」的
+  兜底，不该盖掉用户特意放进来的那份。全都没有才退化。绝不允许「一张图渲染失败」把用户的指令吃掉。
+  - 写这类测试时的坑：**别拿真系统字体名当假样本的文件名**。本机实测出现过
+    临时目录里一个 0 字节的 `msyh.ttc` 被 FreeType 打开成真正的 Microsoft YaHei
+    （写句柄没关时字节还没落盘，文件名又正好撞系统字体）。要造「读不动的字体」
+    就起个不撞名的文件（如 `sample-broken.ttf`）并**写够垃圾内容后关闭句柄**。
   切换成功的**回执小卡片**（`build_success_card`）默认走图片、失败退文字 ——
   它 `rows=[]`（只有头 + 脚），所以 `render_model_card` 允许空候选行（但整卡全空仍返回 None）。
 - **卡片版面与配色**（v1.3.8 重画成 box 那套「头 + 身体 + 脚」，改之前先看这几条）：
